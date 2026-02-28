@@ -1,0 +1,6 @@
+# Capture files may contain customer/sensitive data — never commit them
+captures/**
+!captures/.gitkeep
+
+# Analysis output
+analysis/
