@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/kkfrosty/nettraceagentix/main/schemas/config.schema.json",
+  "tsharkPath": "",
+  "tokenBudget": {
+    "maxContextTokens": 900000,
+    "reserveForResponse": 100000
+  },
+  "defaultAgent": "general",
+  "defaultFilters": [],
+  "captureMapping": {}
+}

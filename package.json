@@ -1,0 +1,587 @@
+{
+  "name": "nettrace-agentix",
+  "displayName": "NetTrace Agentix",
+  "description": "AI-powered network trace analysis. Parses pcap/pcapng captures with tshark and provides intelligent, agentic diagnosis via GitHub Copilot.",
+  "version": "0.1.0",
+  "publisher": "CognitiveAgentics",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kkfrosty/nettraceagentix"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other",
+    "Data Science"
+  ],
+  "extensionDependencies": [
+    "github.copilot-chat"
+  ],
+  "keywords": [
+    "network",
+    "wireshark",
+    "pcap",
+    "diagnosis",
+    "copilot",
+    "tshark",
+    "nettrace",
+    "agentix",
+    "packet capture",
+    "network analysis"
+  ],
+  "activationEvents": [
+    "workspaceContains:.nettrace/config.json",
+    "workspaceContains:**/*.pcap",
+    "workspaceContains:**/*.pcapng",
+    "workspaceContains:**/*.cap",
+    "onCommand:nettrace.initWorkspace",
+    "onCommand:nettrace.importCapture",
+    "onCommand:nettrace.askAI",
+    "onCommand:nettrace.openCapture",
+    "onCustomEditor:nettrace.captureEditor"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "nettrace.participant",
+        "name": "nettrace",
+        "fullName": "Network Trace Analyzer",
+        "description": "Analyze the network capture open in the viewer. Just ask a question.",
+        "isSticky": false
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "nettrace-getStreamDetail",
+        "displayName": "Get TCP Stream Detail",
+        "description": "Retrieves full packet-level detail for a specific TCP stream index from a capture file",
+        "modelDescription": "Retrieves full packet-level detail (timestamps, flags, seq/ack numbers, payload) for a specific TCP stream index from a network capture file. Use this to inspect individual connections in depth.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "streamIndex": {
+              "type": "number",
+              "description": "The TCP stream index to retrieve"
+            },
+            "captureFile": {
+              "type": "string",
+              "description": "Optional: specific capture file path. Uses active capture if omitted."
+            }
+          },
+          "required": [
+            "streamIndex"
+          ]
+        }
+      },
+      {
+        "name": "nettrace-getPacketRange",
+        "displayName": "Get Packet Range",
+        "description": "Fetches packets by frame number range for paginating through large captures",
+        "modelDescription": "Fetches packets within a frame number range from a capture file. Use this to page through sections of a large capture, inspect packets around a specific event, or view packets in a time window. Returns up to 500 packets per call. Optionally apply a Wireshark display filter to narrow results within the range.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "startFrame": {
+              "type": "number",
+              "description": "First frame number to fetch (inclusive)"
+            },
+            "endFrame": {
+              "type": "number",
+              "description": "Last frame number to fetch (inclusive, clamped to 500 frames max)"
+            },
+            "filter": {
+              "type": "string",
+              "description": "Optional Wireshark display filter to apply within the range (e.g., 'tcp', 'dns')"
+            },
+            "captureFile": {
+              "type": "string",
+              "description": "Optional: specific capture file path. Uses active capture if omitted."
+            }
+          },
+          "required": [
+            "startFrame",
+            "endFrame"
+          ]
+        }
+      },
+      {
+        "name": "nettrace-getExpertInfo",
+        "displayName": "Get Expert Info",
+        "description": "Retrieves Wireshark expert information (errors, warnings, notes) from the capture",
+        "modelDescription": "Retrieves Wireshark expert information (errors, warnings, notes, chats) from the capture. Use this to find protocol-level issues like retransmissions, malformed packets, or connection problems. Optionally filter by severity.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "captureFile": {
+              "type": "string",
+              "description": "Optional: specific capture file path."
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "error",
+                "warning",
+                "note",
+                "chat",
+                "all"
+              ],
+              "description": "Filter by severity level. Defaults to 'all'."
+            }
+          }
+        }
+      },
+      {
+        "name": "nettrace-applyFilter",
+        "displayName": "Apply Display Filter",
+        "description": "Applies a Wireshark display filter and returns matching packets",
+        "modelDescription": "Applies a Wireshark display filter expression to a capture file and returns matching packets. Use any valid Wireshark display filter syntax (e.g., 'tcp.analysis.retransmission', 'dns', 'http.response.code == 500'). Returns up to maxPackets matching packets.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filter": {
+              "type": "string",
+              "description": "Wireshark display filter expression (e.g., 'tcp.analysis.retransmission')"
+            },
+            "captureFile": {
+              "type": "string",
+              "description": "Optional: specific capture file path."
+            },
+            "maxPackets": {
+              "type": "number",
+              "description": "Maximum number of packets to return. Defaults to 100."
+            }
+          },
+          "required": [
+            "filter"
+          ]
+        }
+      },
+      {
+        "name": "nettrace-getConversations",
+        "displayName": "Get Conversations",
+        "description": "Lists all TCP/UDP conversations with statistics (bytes, packets, duration)",
+        "modelDescription": "Lists all TCP, UDP, or IP conversations in a capture with statistics including byte counts, packet counts, duration, and anomaly indicators. Use this to get an overview of all network connections and identify suspicious ones.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "protocol": {
+              "type": "string",
+              "enum": [
+                "tcp",
+                "udp",
+                "ip"
+              ],
+              "description": "Protocol layer for conversations. Defaults to 'tcp'."
+            },
+            "captureFile": {
+              "type": "string",
+              "description": "Optional: specific capture file path."
+            }
+          }
+        }
+      },
+      {
+        "name": "nettrace-followStream",
+        "displayName": "Follow TCP Stream",
+        "description": "Reconstructs and returns the application-layer payload of a TCP stream (like Wireshark Follow Stream)",
+        "modelDescription": "Reconstructs and returns the application-layer payload data of a TCP stream, similar to Wireshark's 'Follow TCP Stream' feature. Shows the actual data exchanged between client and server in ascii, hex, or raw format. Use this to inspect HTTP requests/responses, TLS handshakes, or other application-layer protocols.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "streamIndex": {
+              "type": "number",
+              "description": "The TCP stream index to follow"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "ascii",
+                "hex",
+                "raw"
+              ],
+              "description": "Output format. Defaults to 'ascii'."
+            },
+            "captureFile": {
+              "type": "string",
+              "description": "Optional: specific capture file path."
+            }
+          },
+          "required": [
+            "streamIndex"
+          ]
+        }
+      },
+      {
+        "name": "nettrace-compareCaptures",
+        "displayName": "Compare Client/Server Captures",
+        "description": "Compares packets between matched client and server captures to find missing, delayed, or modified packets",
+        "modelDescription": "Compares network captures taken at client-side and server-side to find discrepancies: missing packets, stream count differences, and differing expert info. Use this when the user has simultaneous captures from both ends of a connection to identify where packets are being lost or modified in transit.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "clientCapture": {
+              "type": "string",
+              "description": "Path to client-side capture file"
+            },
+            "serverCapture": {
+              "type": "string",
+              "description": "Path to server-side capture file"
+            },
+            "filterExpression": {
+              "type": "string",
+              "description": "Optional display filter to narrow comparison"
+            }
+          },
+          "required": [
+            "clientCapture",
+            "serverCapture"
+          ]
+        }
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "nettrace.captureEditor",
+        "displayName": "NetTrace Capture Viewer",
+        "selector": [
+          { "filenamePattern": "*.pcap" },
+          { "filenamePattern": "*.pcapng" },
+          { "filenamePattern": "*.cap" }
+        ],
+        "priority": "default"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "nettrace-explorer",
+          "title": "NetTrace",
+          "icon": "media/nettrace-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "nettrace-explorer": [
+        {
+          "id": "nettrace.captures",
+          "name": "Captures"
+        },
+        {
+          "id": "nettrace.agents",
+          "name": "Analysis Agents",
+          "visibility": "collapsed"
+        },
+        {
+          "id": "nettrace.knowledge",
+          "name": "Analysis Knowledge",
+          "visibility": "visible"
+        },
+        {
+          "id": "nettrace.scenarioDetails",
+          "name": "Scenario Context",
+          "visibility": "collapsed"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "nettrace.captures",
+        "contents": "Load a network capture to get started.\n[Import Capture File](command:nettrace.importCapture)\nDrag .pcap/.pcapng files into the workspace, or click above to import.\n\nOnce loaded, click the 🔍 icon on a capture to analyze it with AI."
+      },
+      {
+        "view": "nettrace.agents",
+        "contents": "Analysis agents customize how the AI evaluates captures.\n[Create Agent](command:nettrace.createAgent)\nAgents have specialized prompts, filters, and tools. Create one to tune the analysis for your scenario."
+      },
+      {
+        "view": "nettrace.scenarioDetails",
+        "contents": "Optional: Add context about your scenario for better AI analysis.\n[Edit Scenario Context](command:nettrace.editScenarioDetails)\nDescribe the symptoms, IPs, and topology to help the AI provide more targeted diagnosis."
+      }
+    ],
+    "commands": [
+      {
+        "command": "nettrace.initWorkspace",
+        "title": "Initialize Workspace",
+        "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.importCapture",
+        "title": "Import Capture File",
+        "category": "NetTrace",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nettrace.parseCapture",
+        "title": "Parse Capture",
+        "category": "NetTrace",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "nettrace.analyzeCapture",
+        "title": "Analyze with AI",
+        "category": "NetTrace",
+        "icon": "$(search)"
+      },
+      {
+        "command": "nettrace.analyzeAll",
+        "title": "Analyze All Captures",
+        "category": "NetTrace",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "nettrace.openCapture",
+        "title": "Open Capture Viewer",
+        "category": "NetTrace",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "nettrace.askAI",
+        "title": "Chat with AI about Traces",
+        "category": "NetTrace",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "nettrace.editScenarioDetails",
+        "title": "Edit Scenario Context",
+        "category": "NetTrace",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nettrace.analyzeStream",
+        "title": "Analyze Stream with AI",
+        "category": "NetTrace",
+        "icon": "$(search)"
+      },
+      {
+        "command": "nettrace.excludeStream",
+        "title": "Exclude from Analysis",
+        "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.focusStream",
+        "title": "Focus on This Stream",
+        "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.selectAgent",
+        "title": "Select Analysis Agent",
+        "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.createAgent",
+        "title": "Create Analysis Agent",
+        "category": "NetTrace",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nettrace.editAgent",
+        "title": "Edit Agent Prompt",
+        "category": "NetTrace",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nettrace.duplicateAgent",
+        "title": "Duplicate Agent",
+        "category": "NetTrace",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "nettrace.deleteAgent",
+        "title": "Delete Agent",
+        "category": "NetTrace",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nettrace.editKnowledge",
+        "title": "Edit Knowledge File",
+        "category": "NetTrace",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nettrace.createKnowledge",
+        "title": "Add Knowledge File",
+        "category": "NetTrace",
+        "icon": "$(add)"
+      },
+      {
+        "command": "nettrace.closeCapture",
+        "title": "Close Capture",
+        "category": "NetTrace",
+        "icon": "$(close)"
+      },
+      {
+        "command": "nettrace.applyFilter",
+        "title": "Apply Display Filter",
+        "category": "NetTrace",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "nettrace.reloadConfig",
+        "title": "Reload Configuration",
+        "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.setClientCapture",
+        "title": "Set as Client Capture",
+        "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.setServerCapture",
+        "title": "Set as Server Capture",
+        "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.openInWireshark",
+        "title": "Open in Wireshark",
+        "category": "NetTrace",
+        "icon": "$(link-external)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "nettrace.askAI",
+          "when": "view == nettrace.captures",
+          "group": "navigation@0"
+        },
+        {
+          "command": "nettrace.analyzeAll",
+          "when": "view == nettrace.captures",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nettrace.importCapture",
+          "when": "view == nettrace.captures",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nettrace.editScenarioDetails",
+          "when": "view == nettrace.scenarioDetails",
+          "group": "navigation"
+        },
+        {
+          "command": "nettrace.createAgent",
+          "when": "view == nettrace.agents",
+          "group": "navigation"
+        },
+        {
+          "command": "nettrace.createKnowledge",
+          "when": "view == nettrace.knowledge",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "nettrace.analyzeCapture",
+          "when": "view == nettrace.captures && viewItem == captureFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "nettrace.openInWireshark",
+          "when": "view == nettrace.captures && viewItem == captureFile",
+          "group": "inline@2"
+        },
+        {
+          "command": "nettrace.parseCapture",
+          "when": "view == nettrace.captures && viewItem == captureFile",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "nettrace.setClientCapture",
+          "when": "view == nettrace.captures && viewItem == captureFile",
+          "group": "2_role@1"
+        },
+        {
+          "command": "nettrace.setServerCapture",
+          "when": "view == nettrace.captures && viewItem == captureFile",
+          "group": "2_role@2"
+        },
+        {
+          "command": "nettrace.editAgent",
+          "when": "view == nettrace.agents && viewItem == agent",
+          "group": "inline@1"
+        },
+        {
+          "command": "nettrace.duplicateAgent",
+          "when": "view == nettrace.agents && viewItem == agent",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nettrace.deleteAgent",
+          "when": "view == nettrace.agents && viewItem == userAgent",
+          "group": "1_manage@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Network Capture AI Diagnosis",
+      "properties": {
+        "nettrace.tsharkPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to tshark executable. Leave empty to auto-detect from PATH or standard install locations.",
+          "scope": "machine"
+        },
+        "nettrace.wiresharkPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Wireshark executable for 'Open in Wireshark' feature.",
+          "scope": "machine"
+        },
+        "nettrace.defaultAgent": {
+          "type": "string",
+          "default": "general",
+          "description": "Default analysis agent to use when none is specified.",
+          "scope": "resource"
+        },
+        "nettrace.autoParseOnAdd": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically parse capture files when added to the workspace.",
+          "scope": "resource"
+        },
+        "nettrace.maxPacketsPerStream": {
+          "type": "number",
+          "default": 1000,
+          "description": "Maximum number of packets to include per stream in LLM context.",
+          "scope": "resource"
+        },
+        "nettrace.excludeProtocols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "arp",
+            "mdns",
+            "ssdp",
+            "nbns",
+            "igmp",
+            "llmnr",
+            "cdp",
+            "lldp",
+            "stp"
+          ],
+          "description": "Protocols to exclude from analysis by default.",
+          "scope": "resource"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.5.0"
+  }
+}
