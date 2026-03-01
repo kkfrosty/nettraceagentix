@@ -33,10 +33,14 @@
   ],
   "activationEvents": [
     "workspaceContains:.nettrace/config.json",
+    "workspaceContains:**/*.pcap",
+    "workspaceContains:**/*.pcapng",
+    "workspaceContains:**/*.cap",
     "onCommand:nettrace.initWorkspace",
     "onCommand:nettrace.importCapture",
     "onCommand:nettrace.askAI",
-    "onCommand:nettrace.openCapture"
+    "onCommand:nettrace.openCapture",
+    "onCustomEditor:nettrace.captureEditor"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -236,6 +240,18 @@
             "serverCapture"
           ]
         }
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "nettrace.captureEditor",
+        "displayName": "NetTrace Capture Viewer",
+        "selector": [
+          { "filenamePattern": "*.pcap" },
+          { "filenamePattern": "*.pcapng" },
+          { "filenamePattern": "*.cap" }
+        ],
+        "priority": "default"
       }
     ],
     "viewsContainers": {

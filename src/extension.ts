@@ -13,6 +13,7 @@ import { KnowledgeTreeProvider } from './views/knowledgeTreeProvider';
 import { NetTraceParticipant } from './participant/nettraceParticipant';
 import { registerLMTools } from './tools/lmTools';
 import { CaptureWebviewPanel } from './views/captureWebviewPanel';
+import { CaptureEditorProvider } from './views/captureEditorProvider';
 import { CaptureFile } from './types';
 
 let outputChannel: vscode.OutputChannel;
@@ -77,6 +78,12 @@ export async function activate(context: vscode.ExtensionContext) {
     const participant = new NetTraceParticipant(
         context, tsharkRunner, configLoader, contextAssembler,
         capturesTree, agentsTree, streamsTree, outputChannel
+    );
+
+    // ─── Custom Editor for pcap/pcapng/cap files ──────────────────────────
+
+    context.subscriptions.push(
+        CaptureEditorProvider.register(context, tsharkRunner, capturesTree, streamsTree, outputChannel)
     );
 
     // ─── Language Model Tools ─────────────────────────────────────────────
