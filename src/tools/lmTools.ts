@@ -465,18 +465,13 @@ export function registerLMTools(
                     ]);
                 }
 
-                const folders = vscode.workspace.workspaceFolders;
-                if (!folders) {
-                    return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No workspace folder is open.')
-                    ]);
-                }
+                const toolRootUri = configLoader.getRootUri();
 
                 outputChannel.appendLine(`[Tool] createAgent: name="${name}", displayName="${displayName}"`);
 
                 try {
                     // Ensure .nettrace/agents/ directory exists
-                    const agentsDir = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'agents');
+                    const agentsDir = vscode.Uri.joinPath(toolRootUri, '.nettrace', 'agents');
                     try { await vscode.workspace.fs.createDirectory(agentsDir); } catch { /* already exists */ }
 
                     const agentDef: any = {
@@ -546,17 +541,12 @@ export function registerLMTools(
                     ]);
                 }
 
-                const folders = vscode.workspace.workspaceFolders;
-                if (!folders) {
-                    return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No workspace folder is open.')
-                    ]);
-                }
+                const toolRootUri = configLoader.getRootUri();
 
                 outputChannel.appendLine(`[Tool] createKnowledge: category="${category}", filename="${filename}"`);
 
                 try {
-                    const categoryDir = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'knowledge', category);
+                    const categoryDir = vscode.Uri.joinPath(toolRootUri, '.nettrace', 'knowledge', category);
                     try { await vscode.workspace.fs.createDirectory(categoryDir); } catch { /* already exists */ }
 
                     const fileUri = vscode.Uri.joinPath(categoryDir, `${filename}.md`);

@@ -7,20 +7,19 @@ import { NetTraceConfig, ScenarioDetails } from './types';
  * and scaffolding default configuration files.
  */
 export class WorkspaceInitializer {
+    private rootUri: vscode.Uri;
     private outputChannel: vscode.OutputChannel;
 
-    constructor(outputChannel: vscode.OutputChannel) {
+    constructor(rootUri: vscode.Uri, outputChannel: vscode.OutputChannel) {
+        this.rootUri = rootUri;
         this.outputChannel = outputChannel;
     }
 
     /**
-     * Check if the current workspace is initialized.
+     * Check if the storage root is initialized (has a config.json).
      */
     async isInitialized(): Promise<boolean> {
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders || folders.length === 0) { return false; }
-
-        const configUri = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'config.json');
+        const configUri = vscode.Uri.joinPath(this.rootUri, '.nettrace', 'config.json');
         try {
             await vscode.workspace.fs.stat(configUri);
             return true;
@@ -49,13 +48,7 @@ export class WorkspaceInitializer {
      * Run the full workspace initialization wizard.
      */
     async initializeWorkspace(): Promise<boolean> {
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders || folders.length === 0) {
-            vscode.window.showErrorMessage('Please open a folder first.');
-            return false;
-        }
-
-        const rootUri = folders[0].uri;
+        const rootUri = this.rootUri;
 
         // Step 1: What kind of traffic?
         const trafficType = await vscode.window.showQuickPick(

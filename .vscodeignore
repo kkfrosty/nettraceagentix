@@ -2,8 +2,8 @@
 .vscode/**
 src/**
 docs/**
-NetTraceAIAnalysisWorkspace/captures/**
-!NetTraceAIAnalysisWorkspace/captures/.gitkeep
+NetTraceAIAnalysisWorkspace/**
+Release/**
 *.pcap
 *.pcapng
 *.cap

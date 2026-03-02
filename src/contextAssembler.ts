@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { CaptureFile, TcpStream, AgentDefinition, ScenarioDetails, AssembledContext, TokenBudgetConfig, CaptureSignals, KnowledgeEntry } from './types';
 import { TsharkRunner } from './parsing/tsharkRunner';
 import { ConfigLoader } from './configLoader';
@@ -49,13 +50,16 @@ export class ContextAssembler {
         const scenarioContext = this.buildScenarioContext();
         usedTokens += this.estimateTokens(scenarioContext);
 
-        // 3. Capture summary with expert info (always included — lightweight stats + expert breakdown)
-        const captureSummary = await this.buildCaptureSummary(captures);
-        usedTokens += this.estimateTokens(captureSummary);
-
-        // 4. Knowledge context — conditionally assembled based on capture signals
-        const knowledgeContext = await this.buildKnowledgeContext(captures, streams, agent);
-        usedTokens += this.estimateTokens(knowledgeContext);
+        // 3 & 4. Capture summary + knowledge context — run in parallel (both make tshark calls
+        //          but are completely independent of each other, so no reason to serialize)
+        this.outputChannel.appendLine(`[ContextAssembler] Building capture summary and knowledge context in parallel...`);
+        const [captureSummary, knowledgeResult] = await Promise.all([
+            this.buildCaptureSummary(captures),
+            this.buildKnowledgeContext(captures, streams, agent),
+        ]);
+        const knowledgeContext = knowledgeResult.content;
+        const knowledgeManifest = knowledgeResult.manifest;
+        usedTokens += this.estimateTokens(captureSummary) + this.estimateTokens(knowledgeContext);
 
         // 5. Stream details — conversation index with anomaly scores
         //    This is a compact list, not full packet data. Cap at 50K tokens.
@@ -88,6 +92,7 @@ export class ContextAssembler {
             scenarioContext,
             packetData: packetResult.data,
             knowledgeContext,
+            knowledgeManifest,
             estimatedTokens: usedTokens,
             coverage: packetResult.coverage,
         };
@@ -137,7 +142,8 @@ ${followed}
 
     /** Build the knowledge context (public for follow-up turns). */
     async buildKnowledgeContextPublic(captures: CaptureFile[], streams: TcpStream[], agent: AgentDefinition): Promise<string> {
-        return this.buildKnowledgeContext(captures, streams, agent);
+        const result = await this.buildKnowledgeContext(captures, streams, agent);
+        return result.content;
     }
 
     // ─── Prompt Builders ──────────────────────────────────────────────────
@@ -359,6 +365,65 @@ ${followed}
                             this.outputChannel.appendLine(`[ContextAssembler] Error sampling stream ${stream.index}: ${e}`);
                         }
                     }
+                }
+
+                // --- Section E: Fill remaining budget with evenly-spaced middle samples ---
+                // After A/B/C/D, there is often significant token budget left unused (especially on
+                // small-context models where sections C/D may not fire). Rather than leaving the
+                // budget empty, sample the middle of the capture in evenly-spaced windows so the
+                // LLM has representative mid-session traffic for its initial analysis. Uncovered
+                // gaps are still listed below so the LLM can use tools to drill in further.
+                const TOKENS_PER_PACKET_EST = 30; // ~110 chars/packet ÷ 4 chars/token, conservatively rounded
+                const MAX_FILL_BATCHES = 6;        // Hard cap — each batch = 1 extra tshark call on the file
+                const FILL_BATCH_SIZE = 500;       // Packets per middle-fill batch
+                const lastStartForMiddle = Math.max(totalPackets - 99, firstN + 1);
+                const middleRegionStart = firstN + 1;
+                const middleRegionEnd = lastStartForMiddle - 1;
+                const remainingBudgetForFill = budgetPerCapture - captureBudgetUsed;
+
+                if (remainingBudgetForFill > 10000 && middleRegionEnd > middleRegionStart + FILL_BATCH_SIZE) {
+                    const packetsCanFit = Math.floor((remainingBudgetForFill * 0.85) / TOKENS_PER_PACKET_EST);
+                    const numFillBatches = Math.min(
+                        Math.max(1, Math.floor(packetsCanFit / FILL_BATCH_SIZE)),
+                        MAX_FILL_BATCHES
+                    );
+                    const middleSize = middleRegionEnd - middleRegionStart;
+                    const fillStep = Math.floor(middleSize / (numFillBatches + 1));
+
+                    this.outputChannel.appendLine(
+                        `[ContextAssembler] Section E: ${remainingBudgetForFill} tokens remaining, ` +
+                        `can fit ~${packetsCanFit} packets → ${numFillBatches} evenly-spaced batch(es) of ${FILL_BATCH_SIZE} through frames ${middleRegionStart}–${middleRegionEnd}`
+                    );
+
+                    packetData += `\n#### Representative mid-capture samples (${numFillBatches} batch${numFillBatches > 1 ? 'es' : ''} of up to ${FILL_BATCH_SIZE} packets, evenly spaced)\n\n`;
+
+                    for (let i = 1; i <= numFillBatches && captureBudgetUsed < budgetPerCapture * 0.92; i++) {
+                        const batchStart = middleRegionStart + (i * fillStep);
+                        const batchEnd = Math.min(batchStart + FILL_BATCH_SIZE - 1, middleRegionEnd);
+                        if (batchStart > middleRegionEnd) { break; }
+
+                        try {
+                            const batchPackets = await this.tsharkRunner.getPacketRange(
+                                capture.filePath, batchStart, batchEnd, agentDisplayFilter
+                            );
+                            if (batchPackets && batchPackets.trim()) {
+                                const batchTokens = this.estimateTokens(batchPackets);
+                                if (captureBudgetUsed + batchTokens > budgetPerCapture * 0.95) { break; }
+
+                                const pct = Math.round((batchStart / totalPackets) * 100);
+                                packetData += `##### Frames ${batchStart.toLocaleString()}\u2013${batchEnd.toLocaleString()} (~${pct}% through capture)\n`;
+                                packetData += '```\n' + batchPackets + '\n```\n\n';
+                                captureBudgetUsed += batchTokens;
+                                coveredRanges.push([batchStart, batchEnd]);
+                            }
+                        } catch (e) {
+                            this.outputChannel.appendLine(`[ContextAssembler] Section E batch ${i} error: ${e}`);
+                        }
+                    }
+                } else {
+                    this.outputChannel.appendLine(
+                        `[ContextAssembler] Section E skipped: remainingBudget=${remainingBudgetForFill}, middleSize=${middleRegionEnd - middleRegionStart}`
+                    );
                 }
 
                 // --- Gap map: tell the model exactly which frame ranges it hasn't seen ---
@@ -820,9 +885,12 @@ Each tool response adds to the context — be efficient but thorough.
         captures: CaptureFile[],
         streams: TcpStream[],
         agent: AgentDefinition
-    ): Promise<string> {
+    ): Promise<{ content: string; manifest: { wisdomFiles: string[]; securityFiles: string[]; securityTriggered: boolean } }> {
         const excludedAdvisors = agent.excludeAdvisors || [];
-        let context = '';
+        let content = '';
+        const wisdomFiles: string[] = [];
+        const securityFiles: string[] = [];
+        let securityTriggered = false;
 
         // User-provided knowledge files only — no built-in wisdom injection.
         // The model is an expert network analyst. Injecting "don't flag X as a problem"
@@ -832,10 +900,11 @@ Each tool response adds to the context — be efficient but thorough.
         if (!excludedAdvisors.includes('wisdom')) {
             const wisdomEntries = this.configLoader.getAlwaysOnKnowledge();
             if (wisdomEntries.length > 0) {
-                context += '## Additional Analysis Knowledge\n';
-                context += 'The following guidance was provided for this workspace. Apply it where relevant.\n\n';
+                content += '## Additional Analysis Knowledge\n';
+                content += 'The following guidance was provided for this workspace. Apply it where relevant.\n\n';
                 for (const entry of wisdomEntries) {
-                    context += entry.content + '\n\n';
+                    content += entry.content + '\n\n';
+                    wisdomFiles.push(path.basename(entry.source));
                 }
             }
             // No built-in wisdom fallback — let the model use its own expertise
@@ -845,31 +914,40 @@ Each tool response adds to the context — be efficient but thorough.
         // These are ESCALATION rules (malformed = critical, fragments = suspicious).
         // They tell the model to take things MORE seriously, never to dismiss findings.
         if (!excludedAdvisors.includes('security')) {
-            const signals = await this.detectCaptureSignals(captures);
-
-            if (signals.securityAnomalyCount > 0) {
-                this.outputChannel.appendLine(
-                    `[ContextAssembler] Security signals detected (${signals.securityAnomalyCount} triggers: ${Array.from(signals.anomalyTypes).join(', ')}). Injecting security heuristics.`
-                );
-
-                // Prefer user-provided security knowledge if available
-                const securityEntries = this.configLoader.getSecurityKnowledge();
-                if (securityEntries.length > 0) {
-                    context += '## Security Analysis (Activated by Capture Signals)\n';
-                    context += `**Trigger:** This capture contains ${Array.from(signals.anomalyTypes).join(', ')} anomalies that warrant security-focused analysis.\n\n`;
-                    for (const entry of securityEntries) {
-                        context += entry.content + '\n\n';
-                    }
-                } else {
-                    // Use built-in security heuristics
-                    context += this.getBuiltInSecurityHeuristics(signals);
+            // User-provided security files are ALWAYS injected — the user explicitly placed
+            // them in .nettrace/knowledge/ meaning "use these for this workspace".
+            // No signal scan needed; skip it to avoid unnecessary tshark queries.
+            const securityEntries = this.configLoader.getSecurityKnowledge();
+            if (securityEntries.length > 0) {
+                securityTriggered = true;
+                content += '## Security Analysis Knowledge\n';
+                content += 'The following security guidance was provided for this workspace. Apply it where relevant.\n\n';
+                for (const entry of securityEntries) {
+                    content += entry.content + '\n\n';
+                    securityFiles.push(path.basename(entry.source));
                 }
+                this.outputChannel.appendLine(
+                    `[ContextAssembler] User security knowledge injected: ${securityFiles.join(', ')}`
+                );
             } else {
-                this.outputChannel.appendLine('[ContextAssembler] No security signals detected — skipping security heuristics.');
+                // No user security files — fall back to built-in heuristics only when
+                // the capture contains actual suspicious signals (avoids noise on clean traces).
+                const signals = await this.detectCaptureSignals(captures);
+
+                if (signals.securityAnomalyCount > 0) {
+                    securityTriggered = true;
+                    this.outputChannel.appendLine(
+                        `[ContextAssembler] Security signals detected (${signals.securityAnomalyCount} triggers: ${Array.from(signals.anomalyTypes).join(', ')}). Injecting built-in security heuristics.`
+                    );
+                    content += this.getBuiltInSecurityHeuristics(signals);
+                    securityFiles.push('built-in security heuristics');
+                } else {
+                    this.outputChannel.appendLine('[ContextAssembler] No user security files and no signals detected — skipping security heuristics.');
+                }
             }
         }
 
-        return context;
+        return { content, manifest: { wisdomFiles, securityFiles, securityTriggered } };
     }
 
     /**
@@ -883,6 +961,7 @@ Each tool response adds to the context — be efficient but thorough.
             hasChecksumErrors: false,
             hasSuspiciousFlags: false,
             hasIcmpErrors: false,
+            hasTlsAlerts: false,
             securityAnomalyCount: 0,
             anomalyTypes: new Set(),
         };
@@ -895,6 +974,7 @@ Each tool response adds to the context — be efficient but thorough.
                 if (signals.hasChecksumErrors) { merged.hasChecksumErrors = true; }
                 if (signals.hasSuspiciousFlags) { merged.hasSuspiciousFlags = true; }
                 if (signals.hasIcmpErrors) { merged.hasIcmpErrors = true; }
+                if (signals.hasTlsAlerts) { merged.hasTlsAlerts = true; }
                 merged.securityAnomalyCount += signals.securityAnomalyCount;
                 for (const t of signals.anomalyTypes) { merged.anomalyTypes.add(t); }
             } catch (e) {

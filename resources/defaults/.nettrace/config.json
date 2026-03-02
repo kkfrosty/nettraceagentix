@@ -1,0 +1,13 @@
+{
+  "tsharkPath": "",
+  "tokenBudget": {
+    "maxContextTokens": 900000,
+    "reserveForResponse": 100000
+  },
+  "defaultAgent": "general",
+  "defaultFilters": {
+    "excludeProtocols": ["arp", "mdns", "ssdp", "nbns", "igmp", "llmnr", "cdp", "lldp", "stp"],
+    "maxPacketsPerStream": 1000
+  },
+  "captureMapping": {}
+}

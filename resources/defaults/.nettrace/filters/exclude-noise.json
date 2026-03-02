@@ -1,0 +1,6 @@
+{
+  "name": "exclude-noise",
+  "description": "Excludes common background protocols that are rarely relevant to support cases",
+  "excludeProtocols": ["arp", "mdns", "ssdp", "nbns", "igmp", "llmnr", "cdp", "lldp", "stp", "browser"],
+  "excludeTrafficTypes": ["broadcast", "multicast"]
+}

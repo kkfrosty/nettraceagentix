@@ -2,9 +2,12 @@
 
 AI-powered network trace analysis for VS Code. Drop in a `.pcap` file, type `@nettrace what's wrong?` in Copilot Chat, and get expert-level network diagnosis — no Wireshark expertise required.
 
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/CognitiveAgentics-KrisFrost.nettrace-agentix?label=Marketplace&color=blue)](https://marketplace.visualstudio.com/items?itemName=CognitiveAgentics-KrisFrost.nettrace-agentix)
 ![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.95.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-0.1.0-orange)
+
+> ⚠️ **Required: [Wireshark / tshark](https://www.wireshark.org/download.html) must be installed on your machine before use.**  
+> tshark is the CLI engine that parses `.pcap` files. See [Prerequisites](#prerequisites) for platform-specific install paths and how to verify it is working.
 
 ---
 
@@ -44,6 +47,7 @@ AI-powered network trace analysis for VS Code. Drop in a `.pcap` file, type `@ne
   - [Packaging](#packaging)
   - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
+  - [File Locations & Uninstalling](#file-locations--uninstalling)
 - [License](#license)
 
 ---
@@ -121,12 +125,12 @@ You can also manually configure the path in VS Code settings (see [Configuration
    npm run package
    ```
 
-   This produces a `.vsix` file in the project root (e.g., `network-capture-ai-diagnosis-0.1.0.vsix`).
+   This produces a `.vsix` file in the `Release/` folder (e.g., `nettrace-agentix-0.1.2.vsix`).
 
 5. **Install the VSIX in VS Code:**
 
    ```bash
-   code --install-extension network-capture-ai-diagnosis-0.1.0.vsix
+   code --install-extension Release/nettrace-agentix-0.1.2.vsix
    ```
 
    Or in VS Code: **Extensions** sidebar → `...` menu → **Install from VSIX...** → select the `.vsix` file.
@@ -572,6 +576,51 @@ For very large captures (100MB+):
 - Use the **Scenario Context** to narrow the AI's focus
 - Apply display filters to reduce noise: `@nettrace apply filter tcp.port == 443`
 - Switch to a specialized agent that filters to relevant traffic only
+
+### File Locations & Uninstalling
+
+NetTrace stores all user data (agents, knowledge files, filters, config) in **one of two places** depending on your settings:
+
+#### Default location (no `nettrace.storagePath` set)
+
+VS Code's per-extension global storage — managed automatically and **removed on uninstall**:
+
+| Platform | Path |
+|---|---|
+| Windows | `%APPDATA%\Code\User\globalStorage\cognitiveagentics-krisfrost.nettrace-agentix\` |
+| macOS | `~/Library/Application Support/Code/User/globalStorage/cognitiveagentics-krisfrost.nettrace-agentix/` |
+| Linux | `~/.config/Code/User/globalStorage/cognitiveagentics-krisfrost.nettrace-agentix/` |
+
+To quickly reveal this folder, run **NetTrace: Show Storage Location** from the Command Palette.
+
+#### Custom location (`nettrace.storagePath` overridden)
+
+Whatever folder you set in `nettrace.storagePath`. This path is **not automatically deleted on uninstall** — you must remove it manually if you no longer need it. The extension will warn you about this when uninstalling.
+
+#### Manual cleanup after uninstall
+
+If the extension folder is still present after uninstalling (VS Code defers cleanup until all windows are fully closed and restarted), you can remove it manually:
+
+**Windows (PowerShell):**
+```powershell
+# Extension binaries (safe to delete any time after uninstall)
+Remove-Item "$env:USERPROFILE\.vscode\extensions\cognitiveagentics-krisfrost.nettrace-agentix-*" -Recurse -Force
+
+# User data (only if you have no custom storagePath)
+Remove-Item "$env:APPDATA\Code\User\globalStorage\cognitiveagentics-krisfrost.nettrace-agentix" -Recurse -Force
+```
+
+**macOS/Linux (bash):**
+```bash
+# Extension binaries
+rm -rf ~/.vscode/extensions/cognitiveagentics-krisfrost.nettrace-agentix-*
+
+# User data (macOS)
+rm -rf "$HOME/Library/Application Support/Code/User/globalStorage/cognitiveagentics-krisfrost.nettrace-agentix"
+
+# User data (Linux)
+rm -rf ~/.config/Code/User/globalStorage/cognitiveagentics-krisfrost.nettrace-agentix
+```
 
 ---
 

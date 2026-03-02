@@ -186,6 +186,12 @@ export interface KnowledgeEntry {
     category: 'wisdom' | 'security' | 'known-issues';
     /** The markdown content */
     content: string;
+    /**
+     * Whether this entry is active. Set to false when the file begins with the
+     * disable marker comment: <!-- nettrace-disabled -->
+     * Disabled entries are loaded into memory but excluded from AI context.
+     */
+    enabled: boolean;
 }
 
 /**
@@ -198,6 +204,8 @@ export interface CaptureSignals {
     hasChecksumErrors: boolean;
     hasSuspiciousFlags: boolean;
     hasIcmpErrors: boolean;
+    /** TLS fatal alerts (content_type == 21) — handshake failures, cert errors, etc. */
+    hasTlsAlerts: boolean;
     /** Total count of security-relevant anomalies */
     securityAnomalyCount: number;
     /** All distinct anomaly types found */
@@ -259,6 +267,15 @@ export interface AssembledContext {
         totalPackets: number;
         packetsIncluded: number;
         uncoveredRanges?: Array<[number, number]>;
+    };
+    /** Which knowledge documents were injected — shown to the user in the chat header */
+    knowledgeManifest?: {
+        /** Always-on knowledge file names (e.g. 'network-wisdom.md') */
+        wisdomFiles: string[];
+        /** Security knowledge file names, only populated when security signals were detected */
+        securityFiles: string[];
+        /** True when security signals triggered conditional security heuristics */
+        securityTriggered: boolean;
     };
 }
 

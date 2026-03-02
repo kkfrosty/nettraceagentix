@@ -6,7 +6,7 @@ import { CapturesTreeProvider } from '../views/capturesTreeProvider';
 import { AgentsTreeProvider } from '../views/agentsTreeProvider';
 import { StreamsTreeProvider } from '../views/streamsTreeProvider';
 import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
-import { CaptureFile } from '../types';
+import { AgentDefinition, AssembledContext, CaptureFile } from '../types';
 
 /**
  * The @nettrace Chat Participant.
@@ -159,7 +159,7 @@ export class NetTraceParticipant {
                 );
             }
 
-            return await this.sendToModel(request, context, stream, token, assembledContext, request.prompt, activeCapture);
+            return await this.sendToModel(request, context, stream, token, assembledContext, request.prompt, activeCapture, agent, !isFollowUp);
         } catch (error) {
             this.outputChannel.appendLine(`[ChatParticipant] Error: ${error}`);
             if (error instanceof vscode.LanguageModelError) {
@@ -224,22 +224,48 @@ export class NetTraceParticipant {
         chatContext: vscode.ChatContext,
         stream: vscode.ChatResponseStream,
         token: vscode.CancellationToken,
-        context: { systemPrompt: string; captureSummary: string; streamDetails: string; scenarioContext: string; packetData: string; knowledgeContext: string; estimatedTokens: number; coverage?: { mode: 'complete' | 'sampled'; totalPackets: number; packetsIncluded: number; uncoveredRanges?: Array<[number, number]> } },
+        context: AssembledContext,
         userMessage: string,
-        activeCapture: CaptureFile
+        activeCapture: CaptureFile,
+        agent: AgentDefinition,
+        isFirstTurn: boolean
     ): Promise<vscode.ChatResult> {
         const model = request.model;
         const modelMax = model.maxInputTokens;
         this.outputChannel.appendLine(`[ChatParticipant] Model: ${model.name}, maxInput: ${modelMax}, context: ~${context.estimatedTokens} tokens`);
 
-        // Show context usage and coverage to the user
+        // Build coverage string and stats line
         const pct = modelMax > 0 ? Math.round((context.estimatedTokens / modelMax) * 100) : 0;
         const coverageInfo = context.coverage
             ? context.coverage.mode === 'complete'
-                ? `✅ All ${context.coverage.totalPackets.toLocaleString()} packets loaded`
-                : `📊 Sampled ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets (${context.coverage.uncoveredRanges?.length || 0} ranges pending review)`
+                ? `\u2705 All ${context.coverage.totalPackets.toLocaleString()} packets loaded`
+                : `\ud83d\udcca Sampled ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${(context.coverage.uncoveredRanges?.length || 0) > 0 ? ` \u00b7 AI will page through ${context.coverage.uncoveredRanges!.length} uncovered range${context.coverage.uncoveredRanges!.length > 1 ? 's' : ''} via tools` : ''}`
             : '';
-        stream.markdown(`*Using **${model.name}** — ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) · ${coverageInfo} · analyzing ${activeCapture.name}*\n\n`);
+        const statsLine = `*Using **${model.name}** \u2014 ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) \u00b7 ${coverageInfo} \u00b7 analyzing ${activeCapture.name}*`;
+
+        if (isFirstTurn) {
+            // \u2500\u2500 First-turn header: agent identity + knowledge documents in use \u2500\u2500
+            const agentLabel = agent.displayName || agent.name;
+            const agentDesc = agent.description ? ` \u2014 *${agent.description}*` : '';
+
+            const manifest = context.knowledgeManifest;
+            let knowledgeLine = '';
+            if (manifest) {
+                const allFiles = [...manifest.wisdomFiles, ...manifest.securityFiles];
+                if (allFiles.length > 0) {
+                    const fileLinks = allFiles.map(f => `\`${f}\``).join(' \u00b7 ');
+                    const securityNote = manifest.securityTriggered ? ' \u00b7 \u26a0\ufe0f *Security heuristics activated by capture signals*' : '';
+                    knowledgeLine = `\n**Knowledge:** ${fileLinks}${securityNote}`;
+                } else {
+                    knowledgeLine = `\n*No knowledge documents \u2014 using model\'s built-in expertise*`;
+                }
+            }
+
+            stream.markdown(`**Agent:** ${agentLabel}${agentDesc}${knowledgeLine}\n${statsLine}\n\n---\n\n`);
+        } else {
+            // Follow-up turns: compact status line only
+            stream.markdown(`${statsLine}\n\n`);
+        }
 
         // ── Build messages with strict role alternation ─────────────────────
         // Some LLM APIs require alternating user/assistant messages and that

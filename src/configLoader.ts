@@ -25,22 +25,32 @@ export class ConfigLoader {
     private readonly _onKnowledgeChanged = new vscode.EventEmitter<void>();
     readonly onKnowledgeChanged = this._onKnowledgeChanged.event;
 
-    constructor(outputChannel: vscode.OutputChannel) {
+    private rootUri: vscode.Uri;
+
+    constructor(rootUri: vscode.Uri, outputChannel: vscode.OutputChannel) {
+        this.rootUri = rootUri;
         this.outputChannel = outputChannel;
     }
 
     /**
-     * Load all configuration from the workspace's .nettrace/ folder.
+     * Get the root URI this ConfigLoader reads from.
+     */
+    getRootUri(): vscode.Uri {
+        return this.rootUri;
+    }
+
+    /**
+     * Update the root URI (e.g., when nettrace.storagePath setting changes).
+     */
+    setRootUri(rootUri: vscode.Uri): void {
+        this.rootUri = rootUri;
+    }
+
+    /**
+     * Load all configuration from the .nettrace/ folder at the configured rootUri.
      */
     async loadAll(): Promise<void> {
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders || folders.length === 0) {
-            this.outputChannel.appendLine('[ConfigLoader] No workspace folder open.');
-            return;
-        }
-
-        const rootUri = folders[0].uri;
-        const nettraceUri = vscode.Uri.joinPath(rootUri, '.nettrace');
+        const nettraceUri = vscode.Uri.joinPath(this.rootUri, '.nettrace');
 
         await Promise.all([
             this.loadConfig(nettraceUri),
@@ -51,7 +61,7 @@ export class ConfigLoader {
             this.loadKnowledge(nettraceUri),
         ]);
 
-        this.setupWatchers(rootUri);
+        this.setupWatchers(this.rootUri);
     }
 
     /**
@@ -275,7 +285,11 @@ If you need more data about a specific stream, use the available tools to retrie
      * Users add/edit .md files to teach the agent about situations it gets wrong.
      */
     private async loadKnowledge(nettraceUri: vscode.Uri): Promise<void> {
-        this.knowledge = [];
+        // Collect into a LOCAL array first — only assign to this.knowledge at the very
+        // end. This prevents a race condition where concurrent calls (e.g., loadAll +
+        // a file-watcher event firing at the same time) interleave their pushes into
+        // the shared array and produce duplicate entries.
+        const loaded: KnowledgeEntry[] = [];
 
         const categories: Array<{ dir: string; category: KnowledgeEntry['category'] }> = [
             { dir: 'wisdom', category: 'wisdom' },
@@ -293,10 +307,14 @@ If you need more data about a specific stream, use the available tools to retrie
                             const fileUri = vscode.Uri.joinPath(dirUri, name);
                             const data = await vscode.workspace.fs.readFile(fileUri);
                             const content = Buffer.from(data).toString();
-                            this.knowledge.push({
+                            // Check for disable marker — first line of file
+                            const firstLine = content.split('\n')[0].trim();
+                            const enabled = firstLine !== '<!-- nettrace-disabled -->';
+                            loaded.push({
                                 source: `knowledge/${dir}/${name}`,
                                 category,
                                 content,
+                                enabled,
                             });
                             this.outputChannel.appendLine(`[ConfigLoader] Knowledge loaded: ${dir}/${name} (${category})`);
                         } catch (e) {
@@ -308,6 +326,9 @@ If you need more data about a specific stream, use the available tools to retrie
                 // Directory doesn't exist yet — that's fine
             }
         }
+
+        // Atomic assignment — replaces whatever was there, no partial state
+        this.knowledge = loaded;
 
         this.outputChannel.appendLine(
             `[ConfigLoader] Knowledge base: ${this.knowledge.length} entries ` +
@@ -375,16 +396,28 @@ If you need more data about a specific stream, use the available tools to retrie
 
     /**
      * Get knowledge entries that should always be injected (wisdom + known-issues).
+     * Excludes entries disabled with the <!-- nettrace-disabled --> marker.
      */
     getAlwaysOnKnowledge(): KnowledgeEntry[] {
-        return this.knowledge.filter(k => k.category === 'wisdom' || k.category === 'known-issues');
+        return this.knowledge.filter(k => (k.category === 'wisdom' || k.category === 'known-issues') && k.enabled !== false);
     }
 
     /**
      * Get knowledge entries that are only injected when security signals are detected.
+     * Excludes entries disabled with the <!-- nettrace-disabled --> marker.
      */
     getSecurityKnowledge(): KnowledgeEntry[] {
-        return this.knowledge.filter(k => k.category === 'security');
+        return this.knowledge.filter(k => k.category === 'security' && k.enabled !== false);
+    }
+
+    /**
+     * Returns whether a specific knowledge file is enabled for AI injection.
+     * @param source — relative source path, e.g. 'knowledge/wisdom/analysis-false-positives.md'
+     */
+    isKnowledgeEnabled(source: string): boolean {
+        const entry = this.knowledge.find(k => k.source === source);
+        // If not yet loaded (file exists on disk but not yet in memory), default to enabled
+        return entry ? entry.enabled !== false : true;
     }
 
     /**
@@ -397,10 +430,7 @@ If you need more data about a specific stream, use the available tools to retrie
     async updateScenarioDetails(updates: Partial<ScenarioDetails>): Promise<void> {
         this.scenarioDetails = { ...this.scenarioDetails, ...updates };
 
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders) { return; }
-
-        const scenarioUri = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'scenario.json');
+        const scenarioUri = vscode.Uri.joinPath(this.rootUri, '.nettrace', 'scenario.json');
         const content = Buffer.from(JSON.stringify(this.scenarioDetails, null, 2));
         await vscode.workspace.fs.writeFile(scenarioUri, content);
     }

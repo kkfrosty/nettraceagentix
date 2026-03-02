@@ -3,14 +3,72 @@ import * as path from 'path';
 import { CaptureFile } from '../types';
 
 /**
+ * Minimal shape stored in globalState for each imported capture.
+ * We only persist the file path and role — everything else is re-derived on load.
+ */
+interface PersistedCapture {
+    filePath: string;
+    role?: 'client' | 'server';
+}
+
+const PERSISTED_CAPTURES_KEY = 'nettrace.captures';
+
+/**
  * TreeView provider for the Captures section in the NetTrace sidebar.
  * Shows all pcap/pcapng/pcpap files in the workspace, organized by folder.
+ *
+ * Persists imported capture file paths to globalState so they survive
+ * across VS Code sessions, project switches, and window reloads.
  */
 export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTreeItem> {
     private _onDidChangeTreeData = new vscode.EventEmitter<CaptureTreeItem | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
     private captures: CaptureFile[] = [];
+    private globalState: vscode.Memento;
+
+    constructor(globalState: vscode.Memento) {
+        this.globalState = globalState;
+    }
+
+    /**
+     * Restore previously imported captures from globalState.
+     * Called once during activation, before discoverCaptures.
+     * Verifies each file still exists; prunes stale entries.
+     */
+    async restorePersistedCaptures(): Promise<number> {
+        const persisted = this.globalState.get<PersistedCapture[]>(PERSISTED_CAPTURES_KEY, []);
+        let restoredCount = 0;
+        const stillValid: PersistedCapture[] = [];
+
+        for (const entry of persisted) {
+            try {
+                const stat = await vscode.workspace.fs.stat(vscode.Uri.file(entry.filePath));
+                const capture: CaptureFile = {
+                    filePath: entry.filePath,
+                    name: path.basename(entry.filePath),
+                    sizeBytes: stat.size,
+                    parsed: false,
+                    role: entry.role,
+                };
+                this.captures.push(capture);
+                stillValid.push(entry);
+                restoredCount++;
+            } catch {
+                // File no longer exists — skip it
+            }
+        }
+
+        // Prune stale entries
+        if (stillValid.length !== persisted.length) {
+            await this.globalState.update(PERSISTED_CAPTURES_KEY, stillValid);
+        }
+
+        if (restoredCount > 0) {
+            this.refresh();
+        }
+        return restoredCount;
+    }
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -22,7 +80,18 @@ export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTree
     }
 
     addCapture(capture: CaptureFile): void {
+        // Deduplicate by filePath
+        if (this.captures.some(c => c.filePath === capture.filePath)) {
+            return;
+        }
         this.captures.push(capture);
+        this._persistCaptures();
+        this.refresh();
+    }
+
+    removeCapture(filePath: string): void {
+        this.captures = this.captures.filter(c => c.filePath !== filePath);
+        this._persistCaptures();
         this.refresh();
     }
 
@@ -127,11 +196,12 @@ export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTree
             item.iconPath = new vscode.ThemeIcon('file');
         }
 
-        // Tooltip
+        // Tooltip — always show the full source path so users know where the file lives
+        const locationLine = `📂 ${capture.filePath}`;
         if (capture.summary) {
-            item.tooltip = `${capture.name}\n${capture.summary.packetCount} packets | ${capture.summary.tcpStreamCount} TCP streams | ${capture.summary.durationSeconds.toFixed(2)}s\n\nClick to open capture viewer`;
+            item.tooltip = `${capture.name}\n${capture.summary.packetCount} packets | ${capture.summary.tcpStreamCount} TCP streams | ${capture.summary.durationSeconds.toFixed(2)}s\n\n${locationLine}\n\nClick to open capture viewer`;
         } else {
-            item.tooltip = `${capture.name}\nClick to open capture viewer`;
+            item.tooltip = `${capture.name}\n${locationLine}\n\nClick to open capture viewer`;
         }
 
         // Click to open webview
@@ -142,6 +212,17 @@ export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTree
         };
 
         return item;
+    }
+
+    /**
+     * Persist current capture paths to globalState for cross-session survival.
+     */
+    private _persistCaptures(): void {
+        const toSave: PersistedCapture[] = this.captures.map(c => ({
+            filePath: c.filePath,
+            ...(c.role ? { role: c.role } : {}),
+        }));
+        this.globalState.update(PERSISTED_CAPTURES_KEY, toSave);
     }
 }
 

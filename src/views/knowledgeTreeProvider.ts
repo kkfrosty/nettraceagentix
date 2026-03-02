@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { ConfigLoader } from '../configLoader';
 
 /**
  * TreeView provider for the Knowledge section in the NetTrace sidebar.
@@ -14,6 +15,8 @@ export class KnowledgeTreeProvider implements vscode.TreeDataProvider<KnowledgeT
     private _onDidChangeTreeData = new vscode.EventEmitter<KnowledgeTreeItem | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
+    private rootUri: vscode.Uri;
+
     private categories: Array<{ dir: string; label: string; description: string; icon: string; tooltip: string }> = [
         { dir: 'security', label: 'Security Heuristics', description: 'Activated when suspicious packets detected', icon: 'shield',
           tooltip: 'Injected into AI context ONLY when suspicious patterns are detected (malformed packets, fragments, checksum errors, suspicious flags).\n\nUse for: attack signatures, IDS-like pattern descriptions, threshold-based detection guidance.' },
@@ -22,6 +25,18 @@ export class KnowledgeTreeProvider implements vscode.TreeDataProvider<KnowledgeT
         { dir: 'known-issues', label: 'Known Issues', description: 'Always applied — vendor/OS-specific behaviors', icon: 'warning',
           tooltip: 'ALWAYS injected into AI context for every analysis.\n\nUse for: OS-specific TCP quirks, firewall behaviors, known vendor bugs, application-specific patterns.' },
     ];
+
+    constructor(rootUri: vscode.Uri, private configLoader: ConfigLoader) {
+        this.rootUri = rootUri;
+    }
+
+    /**
+     * Update the root URI (e.g., when nettrace.storagePath setting changes).
+     */
+    setRootUri(rootUri: vscode.Uri): void {
+        this.rootUri = rootUri;
+        this.refresh();
+    }
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -32,10 +47,7 @@ export class KnowledgeTreeProvider implements vscode.TreeDataProvider<KnowledgeT
     }
 
     async getChildren(element?: KnowledgeTreeItem): Promise<KnowledgeTreeItem[]> {
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders) { return []; }
-
-        const knowledgeBase = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'knowledge');
+        const knowledgeBase = vscode.Uri.joinPath(this.rootUri, '.nettrace', 'knowledge');
 
         if (!element) {
             // Root: show categories
@@ -61,14 +73,20 @@ export class KnowledgeTreeProvider implements vscode.TreeDataProvider<KnowledgeT
                 const mdFiles = entries
                     .filter(([name, type]) => type === vscode.FileType.File && name.endsWith('.md'))
                     .map(([name]) => {
+                        const source = `knowledge/${element.categoryDir}/${name}`;
+                        const isEnabled = this.configLoader.isKnowledgeEnabled(source);
+                        const contextValue = isEnabled ? 'knowledgeFile' : 'knowledgeFileDisabled';
+
                         const item = new KnowledgeTreeItem(
                             name.replace('.md', ''),
                             vscode.TreeItemCollapsibleState.None,
-                            'knowledgeFile'
+                            contextValue
                         );
-                        item.description = name;
-                        item.iconPath = new vscode.ThemeIcon('file-text');
-                        item.tooltip = `Click to edit. Changes take effect immediately.\n\nFile: .nettrace/knowledge/${element.categoryDir}/${name}`;
+                        item.description = isEnabled ? name : `${name}  \u2014 disabled`;
+                        item.iconPath = new vscode.ThemeIcon(isEnabled ? 'file-text' : 'circle-slash');
+                        item.tooltip = isEnabled
+                            ? `Click to edit. Changes take effect immediately.\n\nFile: .nettrace/knowledge/${element.categoryDir}/${name}\n\nRight-click → Disable for Analysis to exclude from AI context.`
+                            : `This file is disabled and will NOT be injected into AI context.\n\nFile: .nettrace/knowledge/${element.categoryDir}/${name}\n\nRight-click → Enable for Analysis to re-activate it.`;
                         item.filePath = vscode.Uri.joinPath(categoryUri, name).fsPath;
 
                         // Click to open the markdown file

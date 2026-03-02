@@ -157,16 +157,18 @@ export class TsharkRunner {
             hasChecksumErrors: false,
             hasSuspiciousFlags: false,
             hasIcmpErrors: false,
+            hasTlsAlerts: false,
             securityAnomalyCount: 0,
             anomalyTypes: new Set(),
         };
 
         // Run all signal-detection queries in parallel
-        const [malformedOut, fragmentOut, suspFlagsOut, icmpOut] = await Promise.all([
+        const [malformedOut, fragmentOut, suspFlagsOut, icmpOut, tlsAlertOut] = await Promise.all([
             this.runTshark(['-r', captureFile, '-T', 'fields', '-e', 'frame.number', '-Y', '_ws.malformed', '-c', '1']),
             this.runTshark(['-r', captureFile, '-T', 'fields', '-e', 'frame.number', '-Y', 'ip.flags.mf == 1 || ip.frag_offset > 0', '-c', '1']),
             this.runTshark(['-r', captureFile, '-T', 'fields', '-e', 'frame.number', '-Y', 'tcp.flags.syn == 1 && tcp.flags.fin == 1', '-c', '1']),
             this.runTshark(['-r', captureFile, '-T', 'fields', '-e', 'frame.number', '-Y', 'icmp.type == 3 || icmp.type == 11', '-c', '1']),
+            this.runTshark(['-r', captureFile, '-T', 'fields', '-e', 'frame.number', '-Y', 'tls.record.content_type == 21', '-c', '1']),
         ]);
 
         if (malformedOut.trim()) {
@@ -186,14 +188,20 @@ export class TsharkRunner {
         }
         if (icmpOut.trim()) {
             signals.hasIcmpErrors = true;
+            signals.securityAnomalyCount++;  // fix: was detected but never counted
             signals.anomalyTypes.add('icmp-error');
+        }
+        if (tlsAlertOut.trim()) {
+            signals.hasTlsAlerts = true;
+            signals.securityAnomalyCount++;
+            signals.anomalyTypes.add('tls-alert');
         }
 
         this.outputChannel.appendLine(
             `[TsharkRunner] Capture signals for ${path.basename(captureFile)}: ` +
             `malformed=${signals.hasMalformedPackets}, fragments=${signals.hasFragments}, ` +
             `suspiciousFlags=${signals.hasSuspiciousFlags}, icmpErrors=${signals.hasIcmpErrors}, ` +
-            `securityScore=${signals.securityAnomalyCount}`
+            `tlsAlerts=${signals.hasTlsAlerts}, securityScore=${signals.securityAnomalyCount}`
         );
 
         return signals;

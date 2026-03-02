@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import { TsharkRunner } from './parsing/tsharkRunner';
 import { ConfigLoader } from './configLoader';
 import { ContextAssembler } from './contextAssembler';
@@ -16,9 +17,11 @@ import { CaptureWebviewPanel } from './views/captureWebviewPanel';
 import { CaptureEditorProvider } from './views/captureEditorProvider';
 import { CaptureFile } from './types';
 import { Logger } from './logger';
+import { getNetTraceRootUri, ensureDefaultFiles, validateCustomStoragePath, cleanupGlobalStorage } from './storage';
 
 let outputChannel: vscode.OutputChannel;
 let logger: Logger;
+let extensionContext: vscode.ExtensionContext | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     // Top-level try/catch — ensures we ALWAYS log failures to Debug Console,
@@ -49,6 +52,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
 async function activateInternal(context: vscode.ExtensionContext) {
     const activationStart = Date.now();
+    extensionContext = context; // stored for use in deactivate()
     console.log('[NetTrace] ════════════════════════════════════════════════');
     console.log('[NetTrace] Extension activate() called');
     console.log('[NetTrace] All NetTrace log lines are prefixed with [NetTrace].');
@@ -67,6 +71,46 @@ async function activateInternal(context: vscode.ExtensionContext) {
     logger.logExtensionEnvironment();
     logger.divider('Initialization Steps');
 
+    // ─── Storage Resolution & First-Run Provisioning ──────────────────────
+
+    logger.startStep('Storage Resolution');
+    let rootUri: vscode.Uri;
+    try {
+        // Validate custom path if set
+        const customPath = vscode.workspace.getConfiguration('nettrace').get<string>('storagePath', '').trim();
+        if (customPath) {
+            const valid = await validateCustomStoragePath(customPath, outputChannel);
+            if (!valid) {
+                logger.warn('Storage', `Custom storage path invalid: ${customPath} — falling back to globalStorageUri`);
+            }
+        }
+
+        rootUri = getNetTraceRootUri(context);
+        logger.info('Storage', `Root URI: ${rootUri.fsPath}`);
+
+        // Ensure globalStorageUri directory exists (VS Code may not create it until first use)
+        await vscode.workspace.fs.createDirectory(rootUri);
+
+        // First-run provisioning: copy bundled defaults for any missing files
+        const createdCount = await ensureDefaultFiles(rootUri, context.extensionUri, outputChannel);
+        if (createdCount > 0) {
+            const isFirstRun = !context.globalState.get<boolean>('nettrace.initialized');
+            if (isFirstRun) {
+                logger.info('Storage', `First-run: provisioned ${createdCount} default files`);
+                await context.globalState.update('nettrace.initialized', true);
+            } else {
+                logger.info('Storage', `Integrity check: restored ${createdCount} missing file(s)`);
+            }
+        }
+        logger.endStep('Storage Resolution', true, rootUri.fsPath);
+    } catch (e) {
+        logger.endStep('Storage Resolution', false, String(e));
+        logger.error('Storage', 'Failed to resolve/provision storage — using globalStorageUri fallback', e);
+        rootUri = context.globalStorageUri;
+        try { await vscode.workspace.fs.createDirectory(rootUri); } catch { /* best effort */ }
+        try { await ensureDefaultFiles(rootUri, context.extensionUri, outputChannel); } catch { /* best effort */ }
+    }
+
     // ─── Core Services ────────────────────────────────────────────────────
 
     logger.startStep('Core Services');
@@ -75,8 +119,8 @@ async function activateInternal(context: vscode.ExtensionContext) {
     let workspaceInitializer: WorkspaceInitializer;
     try {
         tsharkRunner = new TsharkRunner(outputChannel);
-        configLoader = new ConfigLoader(outputChannel);
-        workspaceInitializer = new WorkspaceInitializer(outputChannel);
+        configLoader = new ConfigLoader(rootUri, outputChannel);
+        workspaceInitializer = new WorkspaceInitializer(rootUri, outputChannel);
         logger.endStep('Core Services', true);
     } catch (e) {
         logger.endStep('Core Services', false, String(e));
@@ -120,11 +164,11 @@ async function activateInternal(context: vscode.ExtensionContext) {
     let agentsTree: AgentsTreeProvider;
     let knowledgeTree: KnowledgeTreeProvider;
     try {
-        capturesTree = new CapturesTreeProvider();
+        capturesTree = new CapturesTreeProvider(context.globalState);
         streamsTree = new StreamsTreeProvider();
         scenarioDetailsTree = new ScenarioDetailsTreeProvider(configLoader);
         agentsTree = new AgentsTreeProvider(configLoader);
-        knowledgeTree = new KnowledgeTreeProvider();
+        knowledgeTree = new KnowledgeTreeProvider(rootUri, configLoader);
 
         context.subscriptions.push(
             vscode.window.registerTreeDataProvider('nettrace.captures', capturesTree),
@@ -236,26 +280,8 @@ async function activateInternal(context: vscode.ExtensionContext) {
 
             if (!files || files.length === 0) { return; }
 
-            const folders = vscode.workspace.workspaceFolders;
-            if (!folders) {
-                vscode.window.showErrorMessage('Open a folder first.');
-                return;
-            }
-
             for (const fileUri of files) {
-                const fileName = path.basename(fileUri.fsPath);
-                const destUri = vscode.Uri.joinPath(folders[0].uri, 'captures', fileName);
-
-                // Copy file to workspace captures/ folder
-                try {
-                    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folders[0].uri, 'captures'));
-                    await vscode.workspace.fs.copy(fileUri, destUri, { overwrite: false });
-                    outputChannel.appendLine(`Imported: ${fileName}`);
-                } catch {
-                    // File may already be in the workspace — use it in place
-                    outputChannel.appendLine(`Using in place: ${fileUri.fsPath}`);
-                }
-
+                outputChannel.appendLine(`Imported: ${path.basename(fileUri.fsPath)} (tracked at ${fileUri.fsPath})`);
                 await addAndParseCapture(fileUri.fsPath, tsharkRunner, capturesTree, streamsTree);
             }
         })
@@ -346,11 +372,6 @@ async function activateInternal(context: vscode.ExtensionContext) {
     // Create Agent — wizard to create a new analysis agent
     context.subscriptions.push(
         vscode.commands.registerCommand('nettrace.createAgent', async () => {
-            const folders = vscode.workspace.workspaceFolders;
-            if (!folders) {
-                vscode.window.showErrorMessage('Open a workspace folder first.');
-                return;
-            }
 
             const name = await vscode.window.showInputBox({
                 prompt: 'Agent ID (lowercase, no spaces)',
@@ -415,7 +436,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
             };
 
             // Save to .nettrace/agents/
-            const agentsDir = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'agents');
+            const agentsDir = vscode.Uri.joinPath(rootUri, '.nettrace', 'agents');
             try {
                 await vscode.workspace.fs.createDirectory(agentsDir);
             } catch { /* exists */ }
@@ -438,10 +459,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
             const agent = item?.agent;
             if (!agent) { return; }
 
-            const folders = vscode.workspace.workspaceFolders;
-            if (!folders) { return; }
-
-            const agentsDir = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'agents');
+            const agentsDir = vscode.Uri.joinPath(rootUri, '.nettrace', 'agents');
             const agentUri = vscode.Uri.joinPath(agentsDir, `${agent.name}.json`);
 
             // Check if agent file exists on disk
@@ -482,9 +500,6 @@ async function activateInternal(context: vscode.ExtensionContext) {
             const agent = item?.agent;
             if (!agent) { return; }
 
-            const folders = vscode.workspace.workspaceFolders;
-            if (!folders) { return; }
-
             const newName = await vscode.window.showInputBox({
                 prompt: 'Name for the copy (lowercase, no spaces)',
                 placeHolder: `${agent.name}-copy`,
@@ -500,7 +515,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 displayName: `${agent.displayName} (Custom)`,
             };
 
-            const agentsDir = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'agents');
+            const agentsDir = vscode.Uri.joinPath(rootUri, '.nettrace', 'agents');
             try { await vscode.workspace.fs.createDirectory(agentsDir); } catch { /* exists */ }
 
             const agentUri = vscode.Uri.joinPath(agentsDir, `${newName}.json`);
@@ -530,10 +545,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
             );
             if (confirm !== 'Delete') { return; }
 
-            const folders = vscode.workspace.workspaceFolders;
-            if (!folders) { return; }
-
-            const agentUri = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'agents', `${agent.name}.json`);
+            const agentUri = vscode.Uri.joinPath(rootUri, '.nettrace', 'agents', `${agent.name}.json`);
             try {
                 await vscode.workspace.fs.delete(agentUri);
                 vscode.window.showInformationMessage(`Agent "${agent.displayName}" deleted.`);
@@ -554,14 +566,40 @@ async function activateInternal(context: vscode.ExtensionContext) {
         })
     );
 
+    // Toggle Knowledge — enable or disable a knowledge file with a marker comment
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.toggleKnowledge', async (item: any) => {
+            const filePath = item?.filePath;
+            if (!filePath) { return; }
+
+            try {
+                const fileUri = vscode.Uri.file(filePath);
+                const data = await vscode.workspace.fs.readFile(fileUri);
+                const content = Buffer.from(data).toString();
+                const DISABLED_MARKER = '<!-- nettrace-disabled -->';
+
+                let newContent: string;
+                if (content.startsWith(DISABLED_MARKER)) {
+                    // Currently disabled — remove marker to re-enable
+                    newContent = content.slice(DISABLED_MARKER.length).replace(/^\n/, '');
+                    vscode.window.showInformationMessage(`Knowledge enabled: ${filePath.split(/[\\/]/).pop()}`);
+                } else {
+                    // Currently enabled — prepend marker to disable
+                    newContent = `${DISABLED_MARKER}\n${content}`;
+                    vscode.window.showInformationMessage(`Knowledge disabled: ${filePath.split(/[\\/]/).pop()} — it will no longer be injected into AI context.`);
+                }
+
+                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(newContent));
+                // File watcher in configLoader detects the change → triggers reload → tree refreshes automatically
+            } catch (e) {
+                vscode.window.showErrorMessage(`Could not toggle knowledge file: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        })
+    );
+
     // Create Knowledge — create a new .md file in a knowledge category
     context.subscriptions.push(
         vscode.commands.registerCommand('nettrace.createKnowledge', async () => {
-            const folders = vscode.workspace.workspaceFolders;
-            if (!folders) {
-                vscode.window.showErrorMessage('Open a workspace folder first.');
-                return;
-            }
 
             const category = await vscode.window.showQuickPick([
                 { label: 'Security Heuristics', value: 'security', description: 'Rules for detecting attacks, malformed packets, suspicious patterns' },
@@ -578,7 +616,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
             });
             if (!fileName) { return; }
 
-            const categoryDir = vscode.Uri.joinPath(folders[0].uri, '.nettrace', 'knowledge', (category as any).value);
+            const categoryDir = vscode.Uri.joinPath(rootUri, '.nettrace', 'knowledge', (category as any).value);
             try {
                 await vscode.workspace.fs.createDirectory(categoryDir);
             } catch { /* exists */ }
@@ -700,6 +738,22 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 }
                 return;
             }
+            // Verify the file still exists before trying to open it
+            try {
+                await vscode.workspace.fs.stat(vscode.Uri.file(capture.filePath));
+            } catch {
+                const action = await vscode.window.showWarningMessage(
+                    `Capture file not found — it may have been moved or deleted:\n${capture.filePath}`,
+                    'Remove from List',
+                    'Re-import'
+                );
+                if (action === 'Remove from List') {
+                    capturesTree.removeCapture(capture.filePath);
+                } else if (action === 'Re-import') {
+                    vscode.commands.executeCommand('nettrace.importCapture');
+                }
+                return;
+            }
             CaptureWebviewPanel.createOrShow(context.extensionUri, capture, tsharkRunner, outputChannel);
         })
     );
@@ -772,7 +826,33 @@ async function activateInternal(context: vscode.ExtensionContext) {
         })
     );
 
-    commandCount = 20; // approximate count from all the registrations above
+    // Show Storage Location — reveals where NetTrace data files are stored
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.showStoragePath', () => {
+            const customPath = vscode.workspace.getConfiguration('nettrace').get<string>('storagePath', '').trim();
+            const storagePath = customPath || context.globalStorageUri.fsPath;
+            const storageUri = vscode.Uri.file(storagePath);
+
+            const isCustom = !!customPath;
+            const label = isCustom ? 'custom path (nettrace.storagePath setting)' : 'default global storage';
+            outputChannel.appendLine(`[Storage] NetTrace data location (${label}): ${storagePath}`);
+
+            vscode.window.showInformationMessage(
+                `NetTrace data is stored at:\n${storagePath}`,
+                'Reveal in Explorer',
+                'Copy Path'
+            ).then(action => {
+                if (action === 'Reveal in Explorer') {
+                    vscode.commands.executeCommand('revealFileInOS', storageUri);
+                } else if (action === 'Copy Path') {
+                    vscode.env.clipboard.writeText(storagePath);
+                    vscode.window.showInformationMessage('Path copied to clipboard.');
+                }
+            });
+        })
+    );
+
+    commandCount = 21; // approximate count from all the registrations above
     logger.endStep('Command Registration', true, `${commandCount} commands registered`);
     } catch (e) {
         logger.endStep('Command Registration', false, String(e));
@@ -790,11 +870,20 @@ async function activateInternal(context: vscode.ExtensionContext) {
         logger.error('ConfigLoader', 'Config load failed (non-fatal) — using defaults', e);
     }
 
+    logger.startStep('Restore Persisted Captures');
+    try {
+        const restoredCount = await capturesTree.restorePersistedCaptures();
+        logger.endStep('Restore Persisted Captures', true, `${restoredCount} capture(s) restored from previous session`);
+    } catch (e) {
+        logger.endStep('Restore Persisted Captures', false, String(e));
+        logger.error('Activation', 'Failed to restore persisted captures (non-fatal)', e);
+    }
+
     logger.startStep('Discover Captures');
     try {
         await discoverCaptures(tsharkRunner, capturesTree, streamsTree);
         const count = capturesTree.getCaptures().length;
-        logger.endStep('Discover Captures', true, `${count} capture file(s) found`);
+        logger.endStep('Discover Captures', true, `${count} capture file(s) total (persisted + workspace)`);
         logger.logCaptureSummary(count, tsharkRunner.isAvailable());
     } catch (e) {
         logger.endStep('Discover Captures', false, String(e));
@@ -819,22 +908,34 @@ async function activateInternal(context: vscode.ExtensionContext) {
         logger.error('Activation', 'Could not set up file watchers (non-fatal)', e);
     }
 
-    // ─── Check if workspace needs initialization ──────────────────────────
+    // ─── React to nettrace.storagePath setting changes ────────────────────
 
-    try {
-        if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-            const initialized = await workspaceInitializer.isInitialized();
-            if (!initialized) {
-                const hasCaptures = capturesTree.getCaptures().length > 0;
-                if (hasCaptures) {
-                    logger.info('Activation', 'Workspace not initialized — prompting user');
-                    workspaceInitializer.promptInitialize();
-                }
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration(async (e) => {
+            if (!e.affectsConfiguration('nettrace.storagePath')) { return; }
+            logger.info('Config', 'nettrace.storagePath changed — re-resolving storage');
+            try {
+                const customPath = vscode.workspace.getConfiguration('nettrace').get<string>('storagePath', '');
+                const ok = await validateCustomStoragePath(customPath, outputChannel);
+                if (!ok) { return; } // user cancelled or reset
+                const newRoot = getNetTraceRootUri(context);
+                await vscode.workspace.fs.createDirectory(newRoot);
+                await ensureDefaultFiles(newRoot, context.extensionUri, outputChannel);
+                rootUri = newRoot;
+                configLoader.setRootUri(rootUri);
+                knowledgeTree.setRootUri(rootUri);
+                await configLoader.loadAll();
+                knowledgeTree.refresh();
+                agentsTree.refresh();
+                scenarioDetailsTree.refresh();
+                logger.info('Config', `Storage path updated to: ${rootUri.fsPath}`);
+                vscode.window.showInformationMessage(`NetTrace storage moved to: ${rootUri.fsPath}`);
+            } catch (err) {
+                logger.error('Config', 'Failed to apply new storagePath', err);
+                vscode.window.showErrorMessage('Failed to apply new storage path. Check Output > NetTrace for details.');
             }
-        }
-    } catch (e) {
-        logger.error('Activation', 'Workspace initialization check failed (non-fatal)', e);
-    }
+        })
+    );
 
     // ─── Activation Complete ──────────────────────────────────────────────
 
@@ -868,7 +969,15 @@ async function discoverCaptures(
     const files = await vscode.workspace.findFiles('**/*.{pcap,pcapng,cap,pcpap}', '**/node_modules/**');
     log.debug('Discovery', `Found ${files.length} capture file(s) via glob`);
 
+    // Build set of already-known paths (from persisted captures) to avoid duplicates
+    const knownPaths = new Set(capturesTree.getCaptures().map(c => c.filePath));
+
+    let newCount = 0;
     for (const fileUri of files) {
+        if (knownPaths.has(fileUri.fsPath)) {
+            log.debug('Discovery', `Already tracked (persisted): ${path.basename(fileUri.fsPath)}`);
+            continue;
+        }
         try {
             const stat = await vscode.workspace.fs.stat(fileUri);
             const capture: CaptureFile = {
@@ -884,12 +993,14 @@ async function discoverCaptures(
             else if (parentDir === 'server') { capture.role = 'server'; }
 
             capturesTree.addCapture(capture);
+            newCount++;
             log.debug('Discovery', `Tracked: ${capture.name} (${(stat.size / 1024).toFixed(0)} KB${capture.role ? ', role=' + capture.role : ''})`);
         } catch (e) {
             log.warn('Discovery', `Could not stat file ${fileUri.fsPath}: ${e}`);
         }
     }
 
+    if (newCount > 0) { log.debug('Discovery', `Added ${newCount} new capture(s) from workspace`); }
     capturesTree.refresh();
 }
 
@@ -1021,13 +1132,61 @@ function setNestedValue(obj: any, key: string, value: any): void {
     current[pathKeys[pathKeys.length - 1]] = value;
 }
 
-export function deactivate() {
+export async function deactivate() {
     try {
         const log = Logger.get();
         log.info('Activation', 'Extension deactivating...');
+
+        // Detect uninstall: check if this extension is marked in VS Code's .obsolete file.
+        // VS Code writes the extension folder name into .obsolete when the user uninstalls,
+        // then defers the actual folder deletion until all Code processes exit.
+        // We clean up global storage here so data is removed immediately on uninstall.
+        if (extensionContext && isMarkedForUninstall(extensionContext)) {
+            log.info('Activation', 'Uninstall detected — cleaning up global storage...');
+            await cleanupGlobalStorage(extensionContext, outputChannel);
+
+            // If the user had a custom storagePath, we cannot safely delete it (it may contain
+            // other data), but we inform them so they can clean it up manually.
+            const customPath = vscode.workspace.getConfiguration('nettrace').get<string>('storagePath', '').trim();
+            if (customPath) {
+                vscode.window.showInformationMessage(
+                    `NetTrace uninstalled. Your custom data folder was not deleted automatically:\n${customPath}\n\nYou can remove it manually if no longer needed.`,
+                    'Reveal in Explorer'
+                ).then(action => {
+                    if (action === 'Reveal in Explorer') {
+                        vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(customPath));
+                    }
+                });
+            }
+        }
+
         log.divider('NetTrace Deactivated');
     } catch {
         // Logger may not be initialized if activation failed early
         outputChannel?.appendLine('Network Capture AI Diagnosis extension deactivated.');
+    }
+}
+
+/**
+ * Checks VS Code's .obsolete marker file to determine if this extension
+ * has been queued for uninstall. The .obsolete file lives in the same
+ * directory as the extension folder and contains a JSON object mapping
+ * extension folder names to `true`.
+ */
+function isMarkedForUninstall(context: vscode.ExtensionContext): boolean {
+    try {
+        const extFolderName = path.basename(context.extensionUri.fsPath);
+        const extensionsDir = path.dirname(context.extensionUri.fsPath);
+        const obsoleteFile = path.join(extensionsDir, '.obsolete');
+
+        if (!fs.existsSync(obsoleteFile)) {
+            return false;
+        }
+
+        const content = fs.readFileSync(obsoleteFile, 'utf8');
+        const obsolete: Record<string, boolean> = JSON.parse(content);
+        return obsolete[extFolderName] === true;
+    } catch {
+        return false;
     }
 }

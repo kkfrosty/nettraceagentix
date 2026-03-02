@@ -1,10 +1,15 @@
 {
   "name": "nettrace-agentix",
   "displayName": "NetTrace Agentix",
-  "description": "AI-powered network trace analysis. Parses pcap/pcapng captures with tshark and provides intelligent, agentic diagnosis via GitHub Copilot.",
-  "version": "0.1.0",
-  "publisher": "CognitiveAgentics",
+  "description": "AI-powered network trace and packet capture analysis for VS Code. Uses tshark (Wireshark CLI) to parse pcap and pcapng files, then drives GitHub Copilot to deliver expert network diagnosis, protocol-level troubleshooting, and anomaly detection — like having a network engineer in your editor.",
+  "version": "0.1.4",
+  "publisher": "CognitiveAgentics-KrisFrost",
   "license": "MIT",
+  "icon": "media/nettrace-icon.png",
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/kkfrosty/nettraceagentix"
@@ -13,36 +18,43 @@
     "vscode": "^1.95.0"
   },
   "categories": [
-    "Other",
-    "Data Science"
+    "AI",
+    "Debuggers",
+    "Data Science",
+    "Other"
   ],
   "extensionDependencies": [
     "github.copilot-chat"
   ],
   "keywords": [
-    "network",
     "wireshark",
     "pcap",
-    "pcpap",
-    "diagnosis",
-    "copilot",
-    "tshark",
-    "nettrace",
-    "agentix",
+    "pcapng",
     "packet capture",
-    "network analysis"
+    "packet analyzer",
+    "packet sniffer",
+    "network analysis",
+    "network trace",
+    "network monitor",
+    "network troubleshooting",
+    "network diagnostics",
+    "tshark",
+    "protocol analyzer",
+    "tcp",
+    "udp",
+    "copilot",
+    "capture analysis",
+    "network debug",
+    "network security",
+    "network forensics"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "workspaceContains:.nettrace/config.json",
     "workspaceContains:**/*.pcap",
     "workspaceContains:**/*.pcapng",
     "workspaceContains:**/*.cap",
-    "workspaceContains:**/*.pcpap",
-    "onCommand:nettrace.initWorkspace",
-    "onCommand:nettrace.importCapture",
-    "onCommand:nettrace.askAI",
-    "onCommand:nettrace.openCapture",
-    "onCustomEditor:nettrace.captureEditor"
+    "workspaceContains:**/*.pcpap"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -542,6 +554,12 @@
         "icon": "$(add)"
       },
       {
+        "command": "nettrace.toggleKnowledge",
+        "title": "Enable/Disable for Analysis",
+        "category": "NetTrace",
+        "icon": "$(circle-slash)"
+      },
+      {
         "command": "nettrace.closeCapture",
         "title": "Close Capture",
         "category": "NetTrace",
@@ -563,6 +581,12 @@
         "title": "Show Extension Log",
         "category": "NetTrace",
         "icon": "$(output)"
+      },
+      {
+        "command": "nettrace.showStoragePath",
+        "title": "Show Storage Location",
+        "category": "NetTrace",
+        "icon": "$(folder-opened)"
       },
       {
         "command": "nettrace.setClientCapture",
@@ -654,12 +678,35 @@
           "command": "nettrace.deleteAgent",
           "when": "view == nettrace.agents && viewItem == userAgent",
           "group": "1_manage@2"
+        },
+        {
+          "command": "nettrace.editKnowledge",
+          "when": "view == nettrace.knowledge && (viewItem == knowledgeFile || viewItem == knowledgeFileDisabled)",
+          "group": "inline@1"
+        },
+        {
+          "command": "nettrace.toggleKnowledge",
+          "when": "view == nettrace.knowledge && viewItem == knowledgeFile",
+          "title": "Disable for Analysis",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nettrace.toggleKnowledge",
+          "when": "view == nettrace.knowledge && viewItem == knowledgeFileDisabled",
+          "title": "Enable for Analysis",
+          "group": "1_manage@1"
         }
       ]
     },
     "configuration": {
       "title": "Network Capture AI Diagnosis",
       "properties": {
+        "nettrace.storagePath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom folder path for NetTrace data (agents, knowledge files, filters, config). Leave empty to use the default extension storage location (%APPDATA%\\Code\\User\\globalStorage\\cognitiveagentics-krisfrost.nettrace-agentix on Windows). Set this if you want to browse/edit files directly in Explorer or sync them via Git. Note: custom paths are NOT automatically removed on uninstall — you must delete them manually.",
+          "scope": "machine"
+        },
         "nettrace.tsharkPath": {
           "type": "string",
           "default": "",
