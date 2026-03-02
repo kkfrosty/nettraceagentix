@@ -583,18 +583,28 @@ export function registerLMTools(
  *           2) First capture in the tree (fallback)
  */
 function getDefaultCaptureFile(capturesTree: CapturesTreeProvider, outputChannel: vscode.OutputChannel): string | undefined {
-    // Always prefer the capture that's open in the viewer
+    // 1. Always prefer the capture visible in the active viewer panel
     const activeFile = CaptureWebviewPanel.getActiveCaptureFile();
     if (activeFile) {
         outputChannel.appendLine(`[Tool] Using active viewer capture: ${activeFile}`);
         return activeFile;
     }
-    // Fallback to first capture in tree
+
     const captures = capturesTree.getCaptures();
+
+    // 2. In dual-capture mode with no active panel, default to the client-role capture
+    const clientCapture = captures.find(c => c.role === 'client');
+    if (clientCapture) {
+        outputChannel.appendLine(`[Tool] No active viewer — using client-role capture: ${clientCapture.filePath}`);
+        return clientCapture.filePath;
+    }
+
+    // 3. Final fallback: first capture in tree
     if (captures.length > 0) {
         outputChannel.appendLine(`[Tool] No active viewer — falling back to first capture: ${captures[0].filePath}`);
         return captures[0].filePath;
     }
+
     outputChannel.appendLine(`[Tool] No capture file available`);
     return undefined;
 }

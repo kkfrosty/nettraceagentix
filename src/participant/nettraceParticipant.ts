@@ -61,61 +61,79 @@ export class NetTraceParticipant {
             return { metadata: { command: 'error' } };
         }
 
-        // Gate: a capture must be open in the viewer
-        const activePath = CaptureWebviewPanel.getActiveCaptureFile();
-        if (!activePath) {
-            stream.markdown('📂 **No capture is open.**\n\nTo analyze a network trace:\n1. Click on a capture file in the **NetTrace** sidebar\n2. Or use **NetTrace: Import Capture File** to add one\n3. The capture viewer will open — then come back here and ask your question\n');
-            stream.button({
-                command: 'nettrace.importCapture',
-                title: '📂 Import Capture File',
-            });
+        // Determine which captures to analyze — dual-capture mode if both roles assigned
+        const { captures: capturesToAnalyze, mode: captureMode } = this.getCapturesToAnalyze();
+
+        if (capturesToAnalyze.length === 0) {
+            stream.markdown(
+                '📂 **No capture is open.**\n\n' +
+                'To analyze a network trace:\n' +
+                '1. Click on a capture file in the **NetTrace** sidebar\n' +
+                '2. Or use **NetTrace: Import Capture File** to add one\n' +
+                '3. The capture viewer will open — then come back here and ask your question\n\n' +
+                'For **client/server dual-capture analysis**, right-click captures in the sidebar ' +
+                'and choose **Set as Client Capture** / **Set as Server Capture**.'
+            );
+            stream.button({ command: 'nettrace.importCapture', title: '📂 Import Capture File' });
             return { metadata: { command: 'no-capture' } };
         }
 
-        // Find the active capture
-        const activeCapture = this.capturesTree.getCaptures().find(c => c.filePath === activePath);
-        if (!activeCapture) {
-            stream.markdown('⚠️ Could not find the active capture. Try reopening it from the sidebar.');
-            return { metadata: { command: 'error' } };
-        }
+        // Primary capture: client in dual mode, or the only capture in single mode
+        const primaryCapture = capturesToAnalyze[0];
 
-        this.outputChannel.appendLine(`[ChatParticipant] Analyzing: ${activeCapture.name}`);
+        if (captureMode === 'dual') {
+            this.outputChannel.appendLine(
+                `[ChatParticipant] Dual-capture mode: ` +
+                capturesToAnalyze.map(c => `${c.name} [${c.role}]`).join(', ')
+            );
+        } else {
+            this.outputChannel.appendLine(`[ChatParticipant] Analyzing: ${primaryCapture.name}`);
+        }
 
         try {
             const agent = this.agentsTree.getActiveAgent();
             const isFollowUp = context.history.length > 0;
 
-            // Ensure capture has been parsed (summary populated) before analysis
-            if (!activeCapture.parsed || !activeCapture.summary) {
-                this.outputChannel.appendLine(`[ChatParticipant] Capture not yet parsed, parsing summary for ${activeCapture.name}...`);
-                stream.progress(`Parsing ${activeCapture.name}...`);
-                try {
-                    activeCapture.summary = await this.tsharkRunner.getCaptureSummary(activeCapture.filePath);
-                    activeCapture.parsed = true;
-                    this.capturesTree.refresh();
-                    this.outputChannel.appendLine(`[ChatParticipant] Parsed: ${activeCapture.summary.packetCount} packets, ${activeCapture.summary.tcpStreamCount} TCP streams`);
-                } catch (e) {
-                    this.outputChannel.appendLine(`[ChatParticipant] Failed to parse capture summary: ${e}`);
-                    stream.markdown(`⚠️ **Failed to parse capture:** ${e instanceof Error ? e.message : String(e)}\n\nMake sure tshark can read this file.`);
-                    return { metadata: { command: 'error' } };
+            // Ensure all captures have been parsed before analysis
+            for (const capture of capturesToAnalyze) {
+                if (!capture.parsed || !capture.summary) {
+                    const roleLabel = capture.role ? ` [${capture.role}]` : '';
+                    this.outputChannel.appendLine(`[ChatParticipant] Capture not yet parsed, parsing summary for ${capture.name}...`);
+                    stream.progress(`Parsing ${capture.name}${roleLabel}...`);
+                    try {
+                        capture.summary = await this.tsharkRunner.getCaptureSummary(capture.filePath);
+                        capture.parsed = true;
+                        this.capturesTree.refresh();
+                        this.outputChannel.appendLine(`[ChatParticipant] Parsed: ${capture.summary.packetCount} packets, ${capture.summary.tcpStreamCount} TCP streams`);
+                    } catch (e) {
+                        this.outputChannel.appendLine(`[ChatParticipant] Failed to parse capture summary: ${e}`);
+                        stream.markdown(`⚠️ **Failed to parse capture:** ${e instanceof Error ? e.message : String(e)}\n\nMake sure tshark can read this file.`);
+                        return { metadata: { command: 'error' } };
+                    }
                 }
             }
 
-            // Get streams for this capture — vital for anomaly-aware context assembly
-            let captureStreams = this.streamsTree.getStreams().filter(s => s.captureFile === activeCapture.filePath);
+            // Get streams for all captures — vital for anomaly-aware context assembly
+            let captureStreams = this.streamsTree.getStreams().filter(s =>
+                capturesToAnalyze.some(c => c.filePath === s.captureFile)
+            );
 
-            // If streams haven't been parsed yet for this capture, parse them now
-            if (captureStreams.length === 0) {
-                this.outputChannel.appendLine(`[ChatParticipant] No cached streams for ${activeCapture.name}, parsing conversations...`);
-                stream.progress('Parsing TCP conversations...');
-                try {
-                    captureStreams = await this.tsharkRunner.getConversations(activeCapture.filePath);
-                    const otherStreams = this.streamsTree.getStreams().filter(s => s.captureFile !== activeCapture.filePath);
-                    this.streamsTree.setStreams([...otherStreams, ...captureStreams]);
-                    this.outputChannel.appendLine(`[ChatParticipant] Parsed ${captureStreams.length} streams`);
-                } catch (e) {
-                    this.outputChannel.appendLine(`[ChatParticipant] Failed to parse streams: ${e}`);
-                    captureStreams = [];
+            // Parse streams for any capture that doesn't have cached streams yet
+            for (const capture of capturesToAnalyze) {
+                const alreadyCached = captureStreams.some(s => s.captureFile === capture.filePath);
+                if (!alreadyCached) {
+                    const roleLabel = capture.role ? ` [${capture.role}]` : '';
+                    this.outputChannel.appendLine(`[ChatParticipant] No cached streams for ${capture.name}, parsing conversations...`);
+                    stream.progress(`Parsing TCP conversations for ${capture.name}${roleLabel}...`);
+                    try {
+                        const newStreams = await this.tsharkRunner.getConversations(capture.filePath);
+                        const unrelated = this.streamsTree.getStreams().filter(s => s.captureFile !== capture.filePath);
+                        this.streamsTree.setStreams([...unrelated, ...newStreams]);
+                        captureStreams = [...captureStreams, ...newStreams];
+                        this.outputChannel.appendLine(`[ChatParticipant] Parsed ${newStreams.length} streams for ${capture.name}`);
+                    } catch (e) {
+                        this.outputChannel.appendLine(`[ChatParticipant] Failed to parse streams for ${capture.name}: ${e}`);
+                    }
                 }
             }
 
@@ -127,13 +145,16 @@ export class NetTraceParticipant {
                 // Don't re-send all packet data — just provide the capture summary + expert info
                 // so the model remembers what capture it's looking at. If the user asks about
                 // specific packets, the model can use tools to fetch them on demand.
-                stream.progress(`Follow-up on ${activeCapture.name}...`);
+                const followUpLabel = captureMode === 'dual'
+                    ? capturesToAnalyze.map(c => `${c.name} [${c.role}]`).join(' + ')
+                    : primaryCapture.name;
+                stream.progress(`Follow-up on ${followUpLabel}...`);
                 this.outputChannel.appendLine(`[ChatParticipant] Follow-up turn — using lightweight context (no packet data re-send)`);
 
                 const systemPrompt = this.contextAssembler.buildSystemPromptPublic(agent);
-                const captureSummary = await this.contextAssembler.buildCaptureSummaryPublic([activeCapture]);
+                const captureSummary = await this.contextAssembler.buildCaptureSummaryPublic(capturesToAnalyze);
                 const scenarioContext = this.contextAssembler.buildScenarioContextPublic();
-                const knowledgeContext = await this.contextAssembler.buildKnowledgeContextPublic([activeCapture], captureStreams, agent);
+                const knowledgeContext = await this.contextAssembler.buildKnowledgeContextPublic(capturesToAnalyze, captureStreams, agent);
 
                 const lightweightTokens =
                     Math.ceil(systemPrompt.length / 4) +
@@ -141,6 +162,9 @@ export class NetTraceParticipant {
                     Math.ceil(scenarioContext.length / 4) +
                     Math.ceil(knowledgeContext.length / 4);
 
+                const totalPacketsFollowUp = capturesToAnalyze.reduce(
+                    (sum, c) => sum + (c.summary?.packetCount || 0), 0
+                );
                 assembledContext = {
                     systemPrompt,
                     captureSummary,
@@ -149,17 +173,20 @@ export class NetTraceParticipant {
                     packetData: '',    // Not needed — model has its analysis. Use tools if it needs to revisit.
                     knowledgeContext,
                     estimatedTokens: lightweightTokens,
-                    coverage: { mode: 'complete' as const, totalPackets: activeCapture.summary?.packetCount || 0, packetsIncluded: activeCapture.summary?.packetCount || 0 },
+                    coverage: { mode: 'complete' as const, totalPackets: totalPacketsFollowUp, packetsIncluded: totalPacketsFollowUp },
                 };
             } else {
                 // ── First turn: full context with all packets ─────────────
-                stream.progress(`Analyzing ${activeCapture.name}...`);
+                const firstTurnLabel = captureMode === 'dual'
+                    ? capturesToAnalyze.map(c => `${c.name} [${c.role}]`).join(' + ')
+                    : primaryCapture.name;
+                stream.progress(`Analyzing ${firstTurnLabel}...`);
                 assembledContext = await this.contextAssembler.assembleContext(
-                    [activeCapture], captureStreams, agent, request.prompt, request.model
+                    capturesToAnalyze, captureStreams, agent, request.prompt, request.model
                 );
             }
 
-            return await this.sendToModel(request, context, stream, token, assembledContext, request.prompt, activeCapture, agent, !isFollowUp);
+            return await this.sendToModel(request, context, stream, token, assembledContext, request.prompt, capturesToAnalyze, agent, !isFollowUp);
         } catch (error) {
             this.outputChannel.appendLine(`[ChatParticipant] Error: ${error}`);
             if (error instanceof vscode.LanguageModelError) {
@@ -226,7 +253,7 @@ export class NetTraceParticipant {
         token: vscode.CancellationToken,
         context: AssembledContext,
         userMessage: string,
-        activeCapture: CaptureFile,
+        captures: CaptureFile[],
         agent: AgentDefinition,
         isFirstTurn: boolean
     ): Promise<vscode.ChatResult> {
@@ -241,7 +268,10 @@ export class NetTraceParticipant {
                 ? `\u2705 All ${context.coverage.totalPackets.toLocaleString()} packets loaded`
                 : `\ud83d\udcca Sampled ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${(context.coverage.uncoveredRanges?.length || 0) > 0 ? ` \u00b7 AI will page through ${context.coverage.uncoveredRanges!.length} uncovered range${context.coverage.uncoveredRanges!.length > 1 ? 's' : ''} via tools` : ''}`
             : '';
-        const statsLine = `*Using **${model.name}** \u2014 ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) \u00b7 ${coverageInfo} \u00b7 analyzing ${activeCapture.name}*`;
+        const captureLabel = captures.length > 1
+            ? captures.map(c => `${c.name}${c.role ? ` [${c.role}]` : ''}`).join(' + ')
+            : captures[0]?.name ?? 'unknown';
+        const statsLine = `*Using **${model.name}** \u2014 ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) \u00b7 ${coverageInfo} \u00b7 analyzing ${captureLabel}*`;
 
         if (isFirstTurn) {
             // \u2500\u2500 First-turn header: agent identity + knowledge documents in use \u2500\u2500
@@ -262,6 +292,12 @@ export class NetTraceParticipant {
             }
 
             stream.markdown(`**Agent:** ${agentLabel}${agentDesc}${knowledgeLine}\n${statsLine}\n\n---\n\n`);
+            if (captures.length > 1) {
+                stream.markdown(
+                    `> 🔄 **Dual-capture mode** — analyzing CLIENT and SERVER traces simultaneously. ` +
+                    `Tools can target either capture using the \`captureFile\` parameter shown in each capture's summary below.\n\n`
+                );
+            }
         } else {
             // Follow-up turns: compact status line only
             stream.markdown(`${statsLine}\n\n`);
@@ -506,9 +542,50 @@ export class NetTraceParticipant {
             stream.markdown('\n\n*⚠️ Reached tool-call limit. Analysis is based on data gathered so far.*');
         }
 
-        stream.reference(vscode.Uri.file(activeCapture.filePath));
+        for (const capture of captures) {
+            stream.reference(vscode.Uri.file(capture.filePath));
+        }
 
         return { metadata: { command: 'analysis' } };
+    }
+
+    // ─── Capture Selection ────────────────────────────────────────────────
+
+    /**
+     * Determine which captures to analyze.
+     *
+     * Priority:
+     * 1. Both client + server role captures assigned → dual-capture mode
+     * 2. Active webview panel capture → single mode
+     * 3. First capture in tree → fallback single mode
+     *
+     * This is fully backward-compatible: if only one capture is open (or no
+     * role tags are set), the returned array has exactly one element and the
+     * rest of the flow is identical to the previous single-capture behavior.
+     */
+    private getCapturesToAnalyze(): { captures: CaptureFile[]; mode: 'single' | 'dual' } {
+        const allCaptures = this.capturesTree.getCaptures();
+        const clientCapture = allCaptures.find(c => c.role === 'client');
+        const serverCapture = allCaptures.find(c => c.role === 'server');
+
+        // Dual-capture mode: both roles are explicitly assigned
+        if (clientCapture && serverCapture) {
+            return { captures: [clientCapture, serverCapture], mode: 'dual' };
+        }
+
+        // Single mode: use whichever panel is currently focused in the viewer
+        const activePath = CaptureWebviewPanel.getActiveCaptureFile();
+        const activeCapture = activePath ? allCaptures.find(c => c.filePath === activePath) : undefined;
+        if (activeCapture) {
+            return { captures: [activeCapture], mode: 'single' };
+        }
+
+        // Final fallback: first capture in tree (matches original behavior)
+        if (allCaptures.length > 0) {
+            return { captures: [allCaptures[0]], mode: 'single' };
+        }
+
+        return { captures: [], mode: 'single' };
     }
 
     // ─── Followup Suggestions ─────────────────────────────────────────────

@@ -656,9 +656,17 @@ Each tool response adds to the context — be efficient but thorough.
 
         let summary = '## Capture Summary\n\n';
 
+        // Dual-capture preamble — instructs the model how to use multi-capture tools
+        if (captures.length > 1) {
+            summary += '> **DUAL-CAPTURE ANALYSIS** — You are comparing simultaneous CLIENT-side and SERVER-side traces.\n';
+            summary += '> When calling tools, use the exact `captureFile` path shown under each section.\n';
+            summary += '> Key diagnostic question: what traffic appears on one side but is missing from the other?\n\n';
+        }
+
         for (const capture of captures) {
             const roleLabel = capture.role ? ` [${capture.role.toUpperCase()} SIDE]` : '';
             summary += `### ${capture.name}${roleLabel}\n`;
+            summary += `- **File path:** \`${capture.filePath}\`\n`;
 
             if (capture.summary) {
                 const s = capture.summary;

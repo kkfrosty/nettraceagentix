@@ -2,6 +2,14 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
+## [0.1.5] - 2026-03-02
+
+### Fixed
+- **Packet Bytes pane** — Toggle button now correctly visible and clickable after collapsing (label hidden, button centered in collapsed strip)
+
+### Added
+- **Packet Detail pane minimize** — New `▼/▲` toggle button on the Packet Detail header collapses the entire bottom section (Packet Detail + Packet Bytes) to a thin strip, giving the packet list maximum vertical space; click again to restore
+
 ## [0.1.0] - 2026-02-27
 
 ### Added

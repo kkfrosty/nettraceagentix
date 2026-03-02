@@ -823,6 +823,11 @@ export class CaptureWebviewPanel {
         .ws-pane-header .pane-toggle:hover { color: var(--vscode-foreground); }
         .ws-hex.collapsed { flex: 0 0 24px !important; max-width: none !important; min-height: auto !important; overflow: hidden; }
         .ws-hex.collapsed .ws-pane-body { display: none; }
+        .ws-hex.collapsed .ws-pane-header { justify-content: center; padding: 3px 0; }
+        .ws-hex.collapsed .ws-pane-header span { display: none; }
+        .ws-bottom.collapsed { flex: 0 0 24px !important; min-height: 0 !important; overflow: hidden; }
+        .ws-bottom.collapsed #packetDetailContent { display: none; }
+        .ws-bottom.collapsed .ws-hex { display: none; }
         .ws-empty {
             padding: 20px;
             text-align: center;
@@ -998,10 +1003,13 @@ export class CaptureWebviewPanel {
                     </table>
                 </div>
                 <!-- BOTTOM: Detail (left) + Hex (right), always visible -->
-                <div class="ws-bottom">
+                <div class="ws-bottom" id="wsBottom">
                     <!-- Left: Protocol detail tree -->
-                    <div class="ws-detail">
-                        <div class="ws-pane-header"><span id="detailTitle">Packet Detail</span></div>
+                    <div class="ws-detail" id="detailPane">
+                        <div class="ws-pane-header">
+                            <span id="detailTitle">Packet Detail</span>
+                            <button class="pane-toggle" id="btnToggleDetail" title="Minimize">&#x25bc;</button>
+                        </div>
                         <div id="packetDetailContent" style="padding: 4px 8px;">
                             <div class="ws-empty">Click a packet above to see its protocol dissection</div>
                         </div>
@@ -1146,6 +1154,21 @@ export class CaptureWebviewPanel {
             } else if (action === 'filterStream') {
                 filterInput.value = 'tcp.stream == ' + stream;
                 applyFilter();
+            }
+        });
+
+        // Detail pane toggle — collapses entire bottom section to give packet list more space
+        document.getElementById('btnToggleDetail').addEventListener('click', function() {
+            var wsBottom = document.getElementById('wsBottom');
+            var btn = document.getElementById('btnToggleDetail');
+            if (wsBottom.classList.contains('collapsed')) {
+                wsBottom.classList.remove('collapsed');
+                btn.textContent = '\u25bc';
+                btn.title = 'Minimize';
+            } else {
+                wsBottom.classList.add('collapsed');
+                btn.textContent = '\u25b2';
+                btn.title = 'Maximize';
             }
         });
 
