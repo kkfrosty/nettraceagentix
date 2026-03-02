@@ -4,7 +4,7 @@ import { CaptureFile } from '../types';
 
 /**
  * TreeView provider for the Captures section in the NetTrace sidebar.
- * Shows all pcap/pcapng files in the workspace, organized by folder.
+ * Shows all pcap/pcapng/pcpap files in the workspace, organized by folder.
  */
 export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTreeItem> {
     private _onDidChangeTreeData = new vscode.EventEmitter<CaptureTreeItem | undefined | void>();

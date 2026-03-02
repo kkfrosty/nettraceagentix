@@ -15,87 +15,201 @@ import { registerLMTools } from './tools/lmTools';
 import { CaptureWebviewPanel } from './views/captureWebviewPanel';
 import { CaptureEditorProvider } from './views/captureEditorProvider';
 import { CaptureFile } from './types';
+import { Logger } from './logger';
 
 let outputChannel: vscode.OutputChannel;
+let logger: Logger;
 
 export async function activate(context: vscode.ExtensionContext) {
-    console.log('[NetTrace] Extension activate() called');
-    outputChannel = vscode.window.createOutputChannel('NetTrace', { log: true });
-    outputChannel.appendLine('Network Capture AI Diagnosis extension activating...');
-
-    // ─── Core Services ────────────────────────────────────────────────────
-
-    const tsharkRunner = new TsharkRunner(outputChannel);
-    const configLoader = new ConfigLoader(outputChannel);
-    const workspaceInitializer = new WorkspaceInitializer(outputChannel);
-
-    // Detect tshark (non-blocking — don't await the user prompt)
-    const tsharkPath = await tsharkRunner.detectTshark();
-    if (tsharkPath) {
-        outputChannel.appendLine(`tshark found at: ${tsharkPath}`);
-    } else {
-        outputChannel.appendLine('tshark NOT found.');
-        // Fire-and-forget: show warning without blocking activation
-        vscode.window.showWarningMessage(
-            'NetTrace: tshark (Wireshark CLI) is required but was not found. Install Wireshark to enable capture analysis.',
-            'Download Wireshark',
-            'Configure Path'
+    // Top-level try/catch — ensures we ALWAYS log failures to Debug Console,
+    // even if something goes wrong before our logger is set up.
+    try {
+        return await activateInternal(context);
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const stack = e instanceof Error ? e.stack : '';
+        console.error(`[NetTrace] FATAL: Extension activation failed with unhandled error: ${msg}`);
+        console.error(`[NetTrace] Stack: ${stack}`);
+        if (logger) {
+            logger.error('Activation', 'FATAL: Unhandled error during activation', e);
+        }
+        if (outputChannel) {
+            outputChannel.show(true);
+        }
+        vscode.window.showErrorMessage(
+            `NetTrace failed to activate: ${msg}. Check Output > NetTrace for details.`,
+            'Show Log'
         ).then(action => {
-            if (action === 'Download Wireshark') {
-                vscode.env.openExternal(vscode.Uri.parse('https://www.wireshark.org/download.html'));
-            } else if (action === 'Configure Path') {
-                vscode.commands.executeCommand('workbench.action.openSettings', 'nettrace.tsharkPath');
+            if (action === 'Show Log') {
+                outputChannel?.show();
             }
         });
     }
+}
 
-    console.log('[NetTrace] Core services initialized, registering tree views...');
+async function activateInternal(context: vscode.ExtensionContext) {
+    const activationStart = Date.now();
+    console.log('[NetTrace] ════════════════════════════════════════════════');
+    console.log('[NetTrace] Extension activate() called');
+    console.log('[NetTrace] All NetTrace log lines are prefixed with [NetTrace].');
+    console.log('[NetTrace] Errors WITHOUT this prefix are from OTHER extensions.');
+    console.log('[NetTrace] ════════════════════════════════════════════════');
+    outputChannel = vscode.window.createOutputChannel('NetTrace', { log: true });
+    logger = Logger.init(outputChannel);
+
+    logger.divider('NetTrace Agentix Activation');
+    logger.info('Activation', 'Extension activation starting...');
+
+    // ─── Environment Diagnostics ──────────────────────────────────────────
+
+    logger.logEnvironment();
+    const deps = await logger.logDependencies();
+    logger.logExtensionEnvironment();
+    logger.divider('Initialization Steps');
+
+    // ─── Core Services ────────────────────────────────────────────────────
+
+    logger.startStep('Core Services');
+    let tsharkRunner: TsharkRunner;
+    let configLoader: ConfigLoader;
+    let workspaceInitializer: WorkspaceInitializer;
+    try {
+        tsharkRunner = new TsharkRunner(outputChannel);
+        configLoader = new ConfigLoader(outputChannel);
+        workspaceInitializer = new WorkspaceInitializer(outputChannel);
+        logger.endStep('Core Services', true);
+    } catch (e) {
+        logger.endStep('Core Services', false, String(e));
+        logger.error('Activation', 'Fatal: Could not create core services', e);
+        vscode.window.showErrorMessage('NetTrace failed to initialize core services. Check Output > NetTrace for details.');
+        return;
+    }
+
+    // Detect tshark (non-blocking — don't await the user prompt)
+    logger.startStep('tshark Detection');
+    try {
+        const tsharkPath = await tsharkRunner.detectTshark();
+        if (tsharkPath) {
+            logger.endStep('tshark Detection', true, `found at: ${tsharkPath}`);
+        } else {
+            logger.endStep('tshark Detection', false, 'not found — capture parsing disabled');
+            // Fire-and-forget: show warning without blocking activation
+            vscode.window.showWarningMessage(
+                'NetTrace: tshark (Wireshark CLI) is required but was not found. Install Wireshark to enable capture analysis.',
+                'Download Wireshark',
+                'Configure Path'
+            ).then(action => {
+                if (action === 'Download Wireshark') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://www.wireshark.org/download.html'));
+                } else if (action === 'Configure Path') {
+                    vscode.commands.executeCommand('workbench.action.openSettings', 'nettrace.tsharkPath');
+                }
+            });
+        }
+    } catch (e) {
+        logger.endStep('tshark Detection', false, 'exception during detection');
+        logger.error('TsharkRunner', 'tshark detection threw an exception', e);
+    }
 
     // ─── TreeView Providers ───────────────────────────────────────────────
 
-    const capturesTree = new CapturesTreeProvider();
-    const streamsTree = new StreamsTreeProvider(); // Internal data store — not shown in sidebar
-    const scenarioDetailsTree = new ScenarioDetailsTreeProvider(configLoader);
-    const agentsTree = new AgentsTreeProvider(configLoader);
-    const knowledgeTree = new KnowledgeTreeProvider();
+    logger.startStep('TreeView Providers');
+    let capturesTree: CapturesTreeProvider;
+    let streamsTree: StreamsTreeProvider;
+    let scenarioDetailsTree: ScenarioDetailsTreeProvider;
+    let agentsTree: AgentsTreeProvider;
+    let knowledgeTree: KnowledgeTreeProvider;
+    try {
+        capturesTree = new CapturesTreeProvider();
+        streamsTree = new StreamsTreeProvider();
+        scenarioDetailsTree = new ScenarioDetailsTreeProvider(configLoader);
+        agentsTree = new AgentsTreeProvider(configLoader);
+        knowledgeTree = new KnowledgeTreeProvider();
 
-    context.subscriptions.push(
-        vscode.window.registerTreeDataProvider('nettrace.captures', capturesTree),
-        vscode.window.registerTreeDataProvider('nettrace.agents', agentsTree),
-        vscode.window.registerTreeDataProvider('nettrace.knowledge', knowledgeTree),
-        vscode.window.registerTreeDataProvider('nettrace.scenarioDetails', scenarioDetailsTree),
-    );
+        context.subscriptions.push(
+            vscode.window.registerTreeDataProvider('nettrace.captures', capturesTree),
+            vscode.window.registerTreeDataProvider('nettrace.agents', agentsTree),
+            vscode.window.registerTreeDataProvider('nettrace.knowledge', knowledgeTree),
+            vscode.window.registerTreeDataProvider('nettrace.scenarioDetails', scenarioDetailsTree),
+        );
 
-    // Refresh knowledge tree when knowledge files change
-    configLoader.onKnowledgeChanged(() => knowledgeTree.refresh());
+        // Refresh knowledge tree when knowledge files change
+        configLoader.onKnowledgeChanged(() => knowledgeTree.refresh());
+        logger.endStep('TreeView Providers', true, '5 tree providers registered');
+    } catch (e) {
+        logger.endStep('TreeView Providers', false, String(e));
+        logger.error('Activation', 'Fatal: Could not register tree views', e);
+        vscode.window.showErrorMessage('NetTrace failed to register sidebar views. Check Output > NetTrace for details.');
+        return;
+    }
 
     // ─── Context Assembler ────────────────────────────────────────────────
 
-    const contextAssembler = new ContextAssembler(tsharkRunner, configLoader, outputChannel);
+    logger.startStep('Context Assembler');
+    let contextAssembler: ContextAssembler;
+    try {
+        contextAssembler = new ContextAssembler(tsharkRunner, configLoader, outputChannel);
+        logger.endStep('Context Assembler', true);
+    } catch (e) {
+        logger.endStep('Context Assembler', false, String(e));
+        logger.error('Activation', 'Fatal: Could not create context assembler', e);
+        vscode.window.showErrorMessage('NetTrace failed to create context assembler. Check Output > NetTrace for details.');
+        return;
+    }
 
     // ─── Chat Participant ─────────────────────────────────────────────────
 
-    const participant = new NetTraceParticipant(
-        context, tsharkRunner, configLoader, contextAssembler,
-        capturesTree, agentsTree, streamsTree, outputChannel
-    );
+    logger.startStep('Chat Participant');
+    if (deps.chatApi) {
+        try {
+            const participant = new NetTraceParticipant(
+                context, tsharkRunner, configLoader, contextAssembler,
+                capturesTree, agentsTree, streamsTree, outputChannel
+            );
+            logger.endStep('Chat Participant', true, '@nettrace participant registered');
+        } catch (e) {
+            logger.endStep('Chat Participant', false, String(e));
+            logger.error('Activation', 'Could not register @nettrace chat participant. Copilot Chat features will be unavailable.', e);
+        }
+    } else {
+        logger.endStep('Chat Participant', false, 'vscode.chat API not available — skipped');
+        logger.warn('Activation', 'Skipping chat participant registration (vscode.chat API unavailable). Install/enable GitHub Copilot Chat extension.');
+    }
 
-    // ─── Custom Editor for pcap/pcapng/cap files ──────────────────────────
+    // ─── Custom Editor for pcap/pcapng/cap/pcpap files ────────────────────
 
-    context.subscriptions.push(
-        CaptureEditorProvider.register(context, tsharkRunner, capturesTree, streamsTree, outputChannel)
-    );
+    logger.startStep('Custom Editor Provider');
+    try {
+        context.subscriptions.push(
+            CaptureEditorProvider.register(context, tsharkRunner, capturesTree, streamsTree, outputChannel)
+        );
+        logger.endStep('Custom Editor Provider', true, 'pcap/pcapng/cap/pcpap editor registered');
+    } catch (e) {
+        logger.endStep('Custom Editor Provider', false, String(e));
+        logger.error('Activation', 'Could not register custom editor for capture files. Double-clicking .pcap/.pcpap files may not work.', e);
+    }
 
     // ─── Language Model Tools ─────────────────────────────────────────────
 
-    try {
-        registerLMTools(context, tsharkRunner, capturesTree, configLoader, outputChannel);
-        console.log('[NetTrace] LM tools registered');
-    } catch (e) {
-        console.error('[NetTrace] Failed to register LM tools:', e);
+    logger.startStep('Language Model Tools');
+    if (deps.lmApi) {
+        try {
+            registerLMTools(context, tsharkRunner, capturesTree, configLoader, outputChannel);
+            logger.endStep('Language Model Tools', true, 'LM tools registered');
+        } catch (e) {
+            logger.endStep('Language Model Tools', false, String(e));
+            logger.error('Activation', 'Could not register LM tools. AI tool-calling will be unavailable.', e);
+        }
+    } else {
+        logger.endStep('Language Model Tools', false, 'vscode.lm API not available — skipped');
+        logger.warn('Activation', 'Skipping LM tool registration (vscode.lm API unavailable). Install/enable GitHub Copilot Chat extension.');
     }
 
     // ─── Commands ─────────────────────────────────────────────────────────
+
+    logger.startStep('Command Registration');
+    let commandCount = 0;
+    try {
 
     // Initialize Workspace
     context.subscriptions.push(
@@ -114,7 +228,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 canSelectFiles: true,
                 canSelectMany: true,
                 filters: {
-                    'Capture Files': ['pcap', 'pcapng', 'cap'],
+                    'Capture Files': ['pcap', 'pcapng', 'cap', 'pcpap'],
                     'All Files': ['*'],
                 },
                 title: 'Import Capture File',
@@ -651,46 +765,95 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    // ─── Auto-Discover Captures in Workspace ──────────────────────────────
+    // Show Log command — for easy access to the output panel
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.showLog', () => {
+            outputChannel.show();
+        })
+    );
 
-    try {
-        await configLoader.loadAll();
-        console.log('[NetTrace] Config loaded');
+    commandCount = 20; // approximate count from all the registrations above
+    logger.endStep('Command Registration', true, `${commandCount} commands registered`);
     } catch (e) {
-        console.error('[NetTrace] Config load failed (non-fatal):', e);
+        logger.endStep('Command Registration', false, String(e));
+        logger.error('Activation', 'Failed during command registration', e);
     }
 
+    // ─── Auto-Discover Captures in Workspace ──────────────────────────────
+
+    logger.startStep('Load Configuration');
+    try {
+        await configLoader.loadAll();
+        logger.endStep('Load Configuration', true);
+    } catch (e) {
+        logger.endStep('Load Configuration', false, String(e));
+        logger.error('ConfigLoader', 'Config load failed (non-fatal) — using defaults', e);
+    }
+
+    logger.startStep('Discover Captures');
     try {
         await discoverCaptures(tsharkRunner, capturesTree, streamsTree);
-        console.log('[NetTrace] Capture discovery done');
+        const count = capturesTree.getCaptures().length;
+        logger.endStep('Discover Captures', true, `${count} capture file(s) found`);
+        logger.logCaptureSummary(count, tsharkRunner.isAvailable());
     } catch (e) {
-        console.error('[NetTrace] Capture discovery failed (non-fatal):', e);
+        logger.endStep('Discover Captures', false, String(e));
+        logger.error('Activation', 'Capture discovery failed (non-fatal)', e);
     }
 
     // Watch for new pcap files
-    const pcapWatcher = vscode.workspace.createFileSystemWatcher('**/*.{pcap,pcapng,cap}');
-    pcapWatcher.onDidCreate(async (uri) => {
-        const autoParse = vscode.workspace.getConfiguration('nettrace').get<boolean>('autoParseOnAdd', true);
-        if (autoParse) {
-            await addAndParseCapture(uri.fsPath, tsharkRunner, capturesTree, streamsTree);
-        }
-    });
-    context.subscriptions.push(pcapWatcher);
+    logger.startStep('File Watchers');
+    try {
+        const pcapWatcher = vscode.workspace.createFileSystemWatcher('**/*.{pcap,pcapng,cap,pcpap}');
+        pcapWatcher.onDidCreate(async (uri) => {
+            logger.info('FileWatcher', `New capture file detected: ${uri.fsPath}`);
+            const autoParse = vscode.workspace.getConfiguration('nettrace').get<boolean>('autoParseOnAdd', true);
+            if (autoParse) {
+                await addAndParseCapture(uri.fsPath, tsharkRunner, capturesTree, streamsTree);
+            }
+        });
+        context.subscriptions.push(pcapWatcher);
+        logger.endStep('File Watchers', true);
+    } catch (e) {
+        logger.endStep('File Watchers', false, String(e));
+        logger.error('Activation', 'Could not set up file watchers (non-fatal)', e);
+    }
 
     // ─── Check if workspace needs initialization ──────────────────────────
 
-    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-        const initialized = await workspaceInitializer.isInitialized();
-        if (!initialized) {
-            // Check if there are pcap files — if so, prompt to initialize
-            const hasCaptures = capturesTree.getCaptures().length > 0;
-            if (hasCaptures) {
-                workspaceInitializer.promptInitialize();
+    try {
+        if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+            const initialized = await workspaceInitializer.isInitialized();
+            if (!initialized) {
+                const hasCaptures = capturesTree.getCaptures().length > 0;
+                if (hasCaptures) {
+                    logger.info('Activation', 'Workspace not initialized — prompting user');
+                    workspaceInitializer.promptInitialize();
+                }
             }
         }
+    } catch (e) {
+        logger.error('Activation', 'Workspace initialization check failed (non-fatal)', e);
     }
 
-    outputChannel.appendLine('Network Capture AI Diagnosis extension activated.');
+    // ─── Activation Complete ──────────────────────────────────────────────
+
+    const activationTime = Date.now() - activationStart;
+    logger.divider('Activation Complete');
+    logger.info('Activation', `Extension activated in ${activationTime}ms`);
+    logger.info('Activation', `Summary: tshark=${tsharkRunner.isAvailable() ? 'yes' : 'NO'}, chatAPI=${deps.chatApi ? 'yes' : 'NO'}, lmAPI=${deps.lmApi ? 'yes' : 'NO'}, captures=${capturesTree.getCaptures().length}`);
+
+    if (!deps.copilotChat) {
+        // This shouldn't normally happen since github.copilot-chat is a hard extensionDependency,
+        // but log it for diagnostics if somehow activation proceeded without it.
+        logger.warn('Activation', 'GitHub Copilot Chat not detected — AI features may be unavailable.');
+    }
+
+    // Auto-show the output channel on first activation if there were issues
+    if (!deps.chatApi || !deps.lmApi || !tsharkRunner.isAvailable()) {
+        logger.warn('Activation', 'Issues detected during activation — showing output panel for diagnostics');
+        outputChannel.show(true); // true = preserve focus
+    }
 }
 
 // ─── Helper Functions ─────────────────────────────────────────────────────
@@ -700,28 +863,33 @@ async function discoverCaptures(
     capturesTree: CapturesTreeProvider,
     streamsTree: StreamsTreeProvider
 ): Promise<void> {
-    const files = await vscode.workspace.findFiles('**/*.{pcap,pcapng,cap}', '**/node_modules/**');
+    const log = Logger.get();
+    log.debug('Discovery', 'Scanning workspace for capture files...');
+    const files = await vscode.workspace.findFiles('**/*.{pcap,pcapng,cap,pcpap}', '**/node_modules/**');
+    log.debug('Discovery', `Found ${files.length} capture file(s) via glob`);
 
     for (const fileUri of files) {
-        const stat = await vscode.workspace.fs.stat(fileUri);
-        const capture: CaptureFile = {
-            filePath: fileUri.fsPath,
-            name: path.basename(fileUri.fsPath),
-            sizeBytes: stat.size,
-            parsed: false,
-        };
+        try {
+            const stat = await vscode.workspace.fs.stat(fileUri);
+            const capture: CaptureFile = {
+                filePath: fileUri.fsPath,
+                name: path.basename(fileUri.fsPath),
+                sizeBytes: stat.size,
+                parsed: false,
+            };
 
-        // Detect role from folder name
-        const parentDir = path.basename(path.dirname(fileUri.fsPath)).toLowerCase();
-        if (parentDir === 'client') { capture.role = 'client'; }
-        else if (parentDir === 'server') { capture.role = 'server'; }
+            // Detect role from folder name
+            const parentDir = path.basename(path.dirname(fileUri.fsPath)).toLowerCase();
+            if (parentDir === 'client') { capture.role = 'client'; }
+            else if (parentDir === 'server') { capture.role = 'server'; }
 
-        capturesTree.addCapture(capture);
+            capturesTree.addCapture(capture);
+            log.debug('Discovery', `Tracked: ${capture.name} (${(stat.size / 1024).toFixed(0)} KB${capture.role ? ', role=' + capture.role : ''})`);
+        } catch (e) {
+            log.warn('Discovery', `Could not stat file ${fileUri.fsPath}: ${e}`);
+        }
     }
 
-    // Auto-parse if tshark is available — do NOT parse all on startup,
-    // just discover files. Parse on-demand when user opens a capture.
-    // This prevents 75+ tshark processes blocking activation with many captures.
     capturesTree.refresh();
 }
 
@@ -731,14 +899,21 @@ async function addAndParseCapture(
     capturesTree: CapturesTreeProvider,
     streamsTree: StreamsTreeProvider
 ): Promise<void> {
+    const log = Logger.get();
+    log.info('Parse', `addAndParseCapture: ${path.basename(filePath)}`);
+
     // Check if already tracked
     const existing = capturesTree.getCaptures().find(c => c.filePath === filePath);
-    if (existing && existing.parsed) { return; }
+    if (existing && existing.parsed) {
+        log.debug('Parse', `Already parsed: ${path.basename(filePath)} — skipping`);
+        return;
+    }
 
     let stat: vscode.FileStat;
     try {
         stat = await vscode.workspace.fs.stat(vscode.Uri.file(filePath));
-    } catch {
+    } catch (e) {
+        log.warn('Parse', `Cannot stat file ${filePath}: ${e}`);
         return;
     }
 
@@ -847,5 +1022,12 @@ function setNestedValue(obj: any, key: string, value: any): void {
 }
 
 export function deactivate() {
-    outputChannel?.appendLine('Network Capture AI Diagnosis extension deactivated.');
+    try {
+        const log = Logger.get();
+        log.info('Activation', 'Extension deactivating...');
+        log.divider('NetTrace Deactivated');
+    } catch {
+        // Logger may not be initialized if activation failed early
+        outputChannel?.appendLine('Network Capture AI Diagnosis extension deactivated.');
+    }
 }

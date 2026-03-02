@@ -39,7 +39,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng file first.')
+                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
                     ]);
                 }
 
@@ -69,7 +69,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng file first.')
+                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
                     ]);
                 }
 
@@ -109,7 +109,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng file first.')
+                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
                     ]);
                 }
 
@@ -140,7 +140,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng file first.')
+                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
                     ]);
                 }
 
@@ -207,7 +207,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng file first.')
+                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
                     ]);
                 }
 
@@ -261,7 +261,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng file first.')
+                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
                     ]);
                 }
 
@@ -385,7 +385,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng file first.')
+                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
                     ]);
                 }
 

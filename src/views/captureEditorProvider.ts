@@ -7,7 +7,7 @@ import { CaptureWebviewPanel } from './captureWebviewPanel';
 import { CaptureFile } from '../types';
 
 /**
- * Custom readonly editor provider for pcap/pcapng/cap files.
+ * Custom readonly editor provider for pcap/pcapng/cap/pcpap files.
  * When a user double-clicks a capture file in the VS Code file explorer,
  * this provider intercepts the open and launches the capture viewer webview
  * instead of VS Code's default text editor (which fails on binary files).

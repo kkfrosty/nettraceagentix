@@ -23,6 +23,7 @@
     "network",
     "wireshark",
     "pcap",
+    "pcpap",
     "diagnosis",
     "copilot",
     "tshark",
@@ -36,6 +37,7 @@
     "workspaceContains:**/*.pcap",
     "workspaceContains:**/*.pcapng",
     "workspaceContains:**/*.cap",
+    "workspaceContains:**/*.pcpap",
     "onCommand:nettrace.initWorkspace",
     "onCommand:nettrace.importCapture",
     "onCommand:nettrace.askAI",
@@ -378,7 +380,8 @@
         "selector": [
           { "filenamePattern": "*.pcap" },
           { "filenamePattern": "*.pcapng" },
-          { "filenamePattern": "*.cap" }
+          { "filenamePattern": "*.cap" },
+          { "filenamePattern": "*.pcpap" }
         ],
         "priority": "default"
       }
@@ -418,7 +421,7 @@
     "viewsWelcome": [
       {
         "view": "nettrace.captures",
-        "contents": "Load a network capture to get started.\n[Import Capture File](command:nettrace.importCapture)\nDrag .pcap/.pcapng files into the workspace, or click above to import.\n\nOnce loaded, click the 🔍 icon on a capture to analyze it with AI."
+        "contents": "Load a network capture to get started.\n[Import Capture File](command:nettrace.importCapture)\nDrag .pcap/.pcapng/.pcpap files into the workspace, or click above to import.\n\nOnce loaded, click the 🔍 icon on a capture to analyze it with AI."
       },
       {
         "view": "nettrace.agents",
@@ -554,6 +557,12 @@
         "command": "nettrace.reloadConfig",
         "title": "Reload Configuration",
         "category": "NetTrace"
+      },
+      {
+        "command": "nettrace.showLog",
+        "title": "Show Extension Log",
+        "category": "NetTrace",
+        "icon": "$(output)"
       },
       {
         "command": "nettrace.setClientCapture",
