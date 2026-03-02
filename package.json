@@ -137,7 +137,7 @@
         "name": "nettrace-applyFilter",
         "displayName": "Apply Display Filter",
         "description": "Applies a Wireshark display filter and returns matching packets",
-        "modelDescription": "Applies a Wireshark display filter expression to a capture file and returns matching packets. Use any valid Wireshark display filter syntax (e.g., 'tcp.analysis.retransmission', 'dns', 'http.response.code == 500'). Returns up to maxPackets matching packets.",
+        "modelDescription": "Applies a Wireshark display filter expression to a capture file and returns matching packets. Use any valid Wireshark display filter syntax (e.g., 'tcp.analysis.retransmission', 'dns', 'http.response.code == 500'). Returns up to maxPackets matching packets. By default, also pushes the filter to the capture viewer panel so the user sees the filtered view.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -152,6 +152,10 @@
             "maxPackets": {
               "type": "number",
               "description": "Maximum number of packets to return. Defaults to 100."
+            },
+            "applyToPanel": {
+              "type": "boolean",
+              "description": "If true (default), also pushes the filter to the Capture Viewer panel so the user sees filtered packets. Set to false if you only need data for analysis without changing the user's view."
             }
           },
           "required": [
@@ -240,6 +244,131 @@
             "serverCapture"
           ]
         }
+      },
+      {
+        "name": "nettrace-setDisplayFilter",
+        "displayName": "Set Display Filter in Viewer",
+        "description": "Pushes a Wireshark display filter to the active Capture Viewer panel, updating the packet display in real-time",
+        "modelDescription": "Pushes a Wireshark display filter into the active Capture Viewer panel (the UI the user sees). This UPDATES THE USER'S VIEW — packets shown in the viewer will be filtered to match. Use this when the user asks to filter, show, or focus on specific traffic (e.g., 'show me DNS traffic', 'filter to port 443'). Pass an empty string to clear the filter. This does NOT return data to you — use nettrace-applyFilter to get filtered packet data for your analysis.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filter": {
+              "type": "string",
+              "description": "Wireshark display filter expression to apply to the viewer (e.g., 'dns', 'tcp.port == 443', 'ip.addr == 10.0.0.1'). Pass empty string to clear."
+            }
+          },
+          "required": [
+            "filter"
+          ]
+        }
+      },
+      {
+        "name": "nettrace-runTshark",
+        "displayName": "Run Custom Tshark Command",
+        "description": "Executes a custom tshark command with arbitrary read-only arguments against a capture file",
+        "modelDescription": "Runs a custom tshark command against the active capture file. You can use any tshark read-only arguments: display filters (-Y), field extraction (-T fields -e), statistics (-z), protocol decoding, etc. The capture file is automatically provided via -r. DO NOT include -r in your args. Write operations (-w) are blocked for safety. Use this for specialized analysis not covered by other tools, like extracting specific protocol fields, running IO statistics, computing round-trip times, or any tshark capability. If applyToPanel is true, any -Y display filter in your args will also be pushed to the capture viewer panel.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string",
+              "description": "tshark arguments (excluding -r and the capture file). Example: '-Y dns -T fields -e dns.qry.name -e dns.qry.type -e dns.flags.rcode'"
+            },
+            "captureFile": {
+              "type": "string",
+              "description": "Optional: specific capture file path. Uses active capture if omitted."
+            },
+            "applyToPanel": {
+              "type": "boolean",
+              "description": "If true and args contain a -Y filter, also push that filter to the capture viewer panel. Defaults to false."
+            }
+          },
+          "required": [
+            "args"
+          ]
+        }
+      },
+      {
+        "name": "nettrace-createAgent",
+        "displayName": "Create Analysis Agent",
+        "description": "Creates a new analysis agent JSON file in the .nettrace/agents/ folder",
+        "modelDescription": "Creates a new analysis agent with a custom persona, tools, and filters. Use this when a user asks to create a specialized agent (e.g., 'create an agent for HTTP performance'). The agent will appear in the sidebar and can be activated for focused analysis. Agents change HOW the AI analyzes — they set the persona, select which tools to use, and optionally pre-filter traffic.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Agent ID (lowercase, hyphens only, e.g., 'http-performance')"
+            },
+            "displayName": {
+              "type": "string",
+              "description": "Human-readable name (e.g., 'HTTP Performance Analyst')"
+            },
+            "description": {
+              "type": "string",
+              "description": "Short description of what this agent specializes in"
+            },
+            "systemPrompt": {
+              "type": "string",
+              "description": "The full system prompt / persona instructions for this agent"
+            },
+            "displayFilter": {
+              "type": "string",
+              "description": "Optional Wireshark display filter to pre-filter traffic (e.g., 'http', 'tcp.port == 443')"
+            },
+            "tools": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Tool names this agent can use. Available: nettrace-getStreamDetail, nettrace-getPacketRange, nettrace-applyFilter, nettrace-getConversations, nettrace-followStream, nettrace-getExpertInfo, nettrace-compareCaptures, nettrace-runTshark, nettrace-setDisplayFilter"
+            },
+            "followups": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "label": { "type": "string" },
+                  "prompt": { "type": "string" }
+                }
+              },
+              "description": "Suggested follow-up prompts shown after analysis"
+            }
+          },
+          "required": [
+            "name",
+            "displayName",
+            "systemPrompt"
+          ]
+        }
+      },
+      {
+        "name": "nettrace-createKnowledge",
+        "displayName": "Create Knowledge File",
+        "description": "Creates a new knowledge markdown file in .nettrace/knowledge/ to teach the AI about specific patterns or behaviors",
+        "modelDescription": "Creates a knowledge file that gets injected into the AI's context during analysis. Use this when a user wants to teach the AI about environment-specific patterns, known issues, or security rules. Knowledge changes WHAT the AI knows — facts and patterns it should consider. Categories: 'wisdom' (always applied — expert tips), 'known-issues' (always applied — vendor bugs/OS quirks), 'security' (conditional — only when suspicious packets detected).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "enum": ["wisdom", "security", "known-issues"],
+              "description": "Knowledge category: 'wisdom' (always applied), 'known-issues' (always applied), 'security' (conditional on capture signals)"
+            },
+            "filename": {
+              "type": "string",
+              "description": "Filename without extension (lowercase, hyphens, e.g., 'azure-load-balancer-quirks')"
+            },
+            "content": {
+              "type": "string",
+              "description": "The markdown content of the knowledge file. Use clear headings, bullet points, and specific guidance the AI should follow."
+            }
+          },
+          "required": [
+            "category",
+            "filename",
+            "content"
+          ]
+        }
       }
     ],
     "customEditors": [
@@ -293,7 +422,11 @@
       },
       {
         "view": "nettrace.agents",
-        "contents": "Analysis agents customize how the AI evaluates captures.\n[Create Agent](command:nettrace.createAgent)\nAgents have specialized prompts, filters, and tools. Create one to tune the analysis for your scenario."
+        "contents": "**Agents** change HOW the AI thinks — each has a persona, prompt, tools, and filters.\n[Create Agent](command:nettrace.createAgent)\n\nCreate an agent for a new analysis workflow (e.g., TLS specialist, DNS troubleshooter).\nAgents filter traffic, prioritize specific anomalies, and guide the AI's approach.\n\n💡 Tip: Ask @nettrace to create an agent for you by describing what you need."
+      },
+      {
+        "view": "nettrace.knowledge",
+        "contents": "**Knowledge** changes WHAT the AI knows — facts, rules, and patterns from your environment.\n[Add Knowledge File](command:nettrace.createKnowledge)\n\n• **Analysis Guidance** — Always applied. Expert tips, false positive avoidance.\n• **Known Issues** — Always applied. Vendor bugs, OS behaviors, firewall quirks.\n• **Security Heuristics** — Conditional. Activated only when capture has suspicious signals.\n\n💡 Tip: Ask @nettrace to create knowledge files based on your expertise."
       },
       {
         "view": "nettrace.scenarioDetails",

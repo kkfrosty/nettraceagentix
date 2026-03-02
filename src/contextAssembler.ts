@@ -65,8 +65,10 @@ export class ContextAssembler {
 
         // 6. Packet data — includes ALL packets if they fit, otherwise samples
         //    This gets the remaining budget (the largest allocation)
+        //    If the agent defines autoFilters.displayFilter, pre-filter packets to relevant traffic
         const packetBudget = availableTokens - usedTokens - this.estimateTokens(userQuery) - 5000; // 5K buffer
-        const packetResult = await this.buildPacketDataWithCoverage(captures, packetBudget, streams);
+        const agentDisplayFilter = agent.autoFilters?.displayFilter;
+        const packetResult = await this.buildPacketDataWithCoverage(captures, packetBudget, streams, agentDisplayFilter);
         usedTokens += this.estimateTokens(packetResult.data);
 
         // 7. User query tokens
@@ -146,7 +148,8 @@ ${followed}
     private async buildPacketDataWithCoverage(
         captures: CaptureFile[],
         tokenBudget: number,
-        streams: TcpStream[] = []
+        streams: TcpStream[] = [],
+        agentDisplayFilter?: string
     ): Promise<{ data: string; coverage: { mode: 'complete' | 'sampled'; totalPackets: number; packetsIncluded: number; uncoveredRanges?: Array<[number, number]> } }> {
         if (captures.length === 0 || tokenBudget <= 0) {
             return { data: '', coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 } };
@@ -154,8 +157,12 @@ ${followed}
 
         const totalPackets = captures.reduce((sum, c) => sum + (c.summary?.packetCount || 0), 0);
 
+        if (agentDisplayFilter) {
+            this.outputChannel.appendLine(`[ContextAssembler] Agent autoFilter active: "${agentDisplayFilter}" — pre-filtering packets`);
+        }
+
         // Try full inclusion first
-        const fullPacketData = await this.tryBuildFullPacketData(captures, tokenBudget);
+        const fullPacketData = await this.tryBuildFullPacketData(captures, tokenBudget, agentDisplayFilter);
         if (fullPacketData) {
             return {
                 data: fullPacketData,
@@ -164,7 +171,7 @@ ${followed}
         }
 
         // Fall back to sampling
-        const sampledResult = await this.buildSampledPacketData(captures, tokenBudget, streams);
+        const sampledResult = await this.buildSampledPacketData(captures, tokenBudget, streams, agentDisplayFilter);
         return {
             data: sampledResult.data,
             coverage: {
@@ -191,7 +198,7 @@ ${followed}
      * We include the compact packet list (frame | time | src | dst | proto | len | info)
      * but NOT expert info or verbose dissections — those are available via tools.
      */
-    private async tryBuildFullPacketData(captures: CaptureFile[], tokenBudget: number): Promise<string | undefined> {
+    private async tryBuildFullPacketData(captures: CaptureFile[], tokenBudget: number, agentDisplayFilter?: string): Promise<string | undefined> {
         const totalPackets = captures.reduce((sum, c) => sum + (c.summary?.packetCount || 0), 0);
 
         // Quick pre-check: if we know the packet count and it's clearly too large, skip the fetch
@@ -217,7 +224,7 @@ ${followed}
             packetData += `### ${capture.name}${roleLabel}\n`;
 
             try {
-                const rawPackets = await this.tsharkRunner.getPacketsCompact(capture.filePath, '');
+                const rawPackets = await this.tsharkRunner.getPacketsCompact(capture.filePath, agentDisplayFilter || '');
 
                 if (!rawPackets || !rawPackets.trim()) {
                     packetData += '*No packet data could be read from this capture.*\n\n';
@@ -255,10 +262,13 @@ ${followed}
      * Build sampled packet data for large captures that don't fit in the budget.
      * Returns the packet data string plus coverage tracking info.
      */
-    private async buildSampledPacketData(captures: CaptureFile[], tokenBudget: number, streams: TcpStream[]): Promise<{ data: string; packetsIncluded: number; uncoveredRanges: Array<[number, number]> }> {
+    private async buildSampledPacketData(captures: CaptureFile[], tokenBudget: number, streams: TcpStream[], agentDisplayFilter?: string): Promise<{ data: string; packetsIncluded: number; uncoveredRanges: Array<[number, number]> }> {
         const totalAllPackets = captures.reduce((sum, c) => sum + (c.summary?.packetCount || 0), 0);
 
         let packetData = '## Sampled Packet Data\n\n';
+        if (agentDisplayFilter) {
+            packetData += `**Agent filter active:** \`${agentDisplayFilter}\` — showing only matching traffic.\n`;
+        }
         packetData += `This capture has ${totalAllPackets.toLocaleString()} packets — too large to include all at once.\n`;
         packetData += 'The sample below covers key sections. **Uncovered frame ranges are listed below — you MUST use nettrace-getPacketRange to review them.**\n';
         packetData += 'Format: frame.number | time_relative | source | destination | protocol | frame.len | info\n\n';
@@ -279,7 +289,7 @@ ${followed}
 
                 // --- Section A: First 200 packets (connection establishment, early traffic) ---
                 const firstN = Math.min(200, totalPackets);
-                const firstPackets = await this.tsharkRunner.getPacketRange(capture.filePath, 1, firstN);
+                const firstPackets = await this.tsharkRunner.getPacketRange(capture.filePath, 1, firstN, agentDisplayFilter);
                 if (firstPackets && firstPackets.trim()) {
                     packetData += `\n#### First ${firstN} packets (of ${totalPackets} total)\n`;
                     packetData += '```\n' + firstPackets + '\n```\n\n';
@@ -290,7 +300,7 @@ ${followed}
                 // --- Section B: Last 100 packets (how it ends) ---
                 if (totalPackets > firstN + 100) {
                     const lastStart = Math.max(totalPackets - 99, firstN + 1);
-                    const lastPackets = await this.tsharkRunner.getPacketRange(capture.filePath, lastStart, totalPackets);
+                    const lastPackets = await this.tsharkRunner.getPacketRange(capture.filePath, lastStart, totalPackets, agentDisplayFilter);
                     if (lastPackets && lastPackets.trim()) {
                         packetData += `#### Last 100 packets\n`;
                         packetData += '```\n' + lastPackets + '\n```\n\n';
@@ -472,15 +482,68 @@ The conversation list shows all TCP streams ranked by anomaly score.
 
 Use real packet numbers, IPs, and timestamps in your analysis. Do NOT guess or hallucinate details.
 
+## Tool Usage — Prefer nettrace-* Tools
+**Always prefer the nettrace-* tools for packet analysis.** They are better than raw terminal commands because:
+- **nettrace-applyFilter** and **nettrace-setDisplayFilter** automatically update the Capture Viewer panel the user is looking at
+- **nettrace-runTshark** runs any tshark command and returns structured output (no need for a terminal)
+- Tool results are managed (truncated, budgeted) to stay within the context window
+- The capture file path is provided automatically — you don't need to know it
+
+**nettrace-runTshark** is your universal escape hatch — it accepts any tshark CLI arguments, so there
+is no tshark operation you cannot perform through tools. Prefer it over raw terminal commands.
+
+Every tshark operation can be done through your tools:
+- Filtering → **nettrace-applyFilter** or **nettrace-setDisplayFilter**
+- Protocol stats → **nettrace-runTshark** with appropriate args
+- Stream reconstruction → **nettrace-followStream**
+- Custom analysis → **nettrace-runTshark** (accepts any tshark arguments)
+
+If a tool returns 0 results or an error, that is normal — it means no packets matched that filter
+or the filter syntax was incorrect. Try a different filter or broaden the expression.
+
 ## Available Tools
 | Tool | When to Use |
 |------|-------------|
 | **nettrace-getStreamDetail** | Deep dive into a specific TCP stream (flags, seq/ack, timing) |
 | **nettrace-followStream** | Reconstruct application-layer payload (HTTP, TLS handshake) |
-| **nettrace-applyFilter** | Find packets matching a Wireshark display filter |
+| **nettrace-applyFilter** | Find packets matching a Wireshark display filter — also updates the viewer panel |
 | **nettrace-getPacketRange** | Page through a large capture by frame range (up to 500 per call) |
 | **nettrace-getConversations** | Conversation list (only if you need UDP or IP level) |
 | **nettrace-compareCaptures** | Compare client vs server captures |
+| **nettrace-setDisplayFilter** | Push a display filter to the capture viewer panel (changes what the user sees) |
+| **nettrace-runTshark** | Run any custom tshark command (field extraction, statistics, protocol decoding) |
+| **nettrace-createAgent** | Create a new specialized analysis agent (JSON file in .nettrace/agents/) |
+| **nettrace-createKnowledge** | Create a knowledge file to teach the AI about patterns/behaviors |
+
+### Display Filter & Viewer Panel
+When the user asks to "filter", "show", or "focus on" specific traffic, you MUST:
+1. Use **nettrace-setDisplayFilter** to update the capture viewer panel the user is looking at
+2. Optionally use **nettrace-applyFilter** if you also need the filtered data for analysis
+   (nettrace-applyFilter updates the viewer panel by default AND returns data to you)
+
+**Always use standard Wireshark display filter syntax.** Common filters:
+- Protocol: \`dns\`, \`http\`, \`tls\`, \`tcp\`, \`udp\`, \`icmp\`, \`arp\`
+- Port: \`tcp.port == 443\`, \`udp.port == 53\`
+- IP address: \`ip.addr == 10.0.0.1\`, \`ip.src == 192.168.1.1\`
+- HTTP: \`http.request\`, \`http.response.code == 200\`, \`http.host contains "example"\`
+- DNS: \`dns.qry.name contains "google"\`, \`dns.flags.rcode != 0\`
+- TLS: \`tls.handshake\`, \`tls.handshake.type == 1\` (Client Hello)
+- TCP analysis: \`tcp.analysis.retransmission\`, \`tcp.analysis.zero_window\`, \`tcp.flags.reset == 1\`
+- Combine: \`dns || http\`, \`tcp.port == 80 && ip.addr == 10.0.0.1\`
+- NOT: \`!(arp || dns)\`, \`!tcp.port == 22\`
+
+### Custom Tshark Commands
+Use **nettrace-runTshark** for any analysis not covered by the specific tools above. You can extract
+specific protocol fields, run IO statistics, compute RTT, or use any tshark capability. Examples:
+- DNS queries: \`-Y dns -T fields -e dns.qry.name -e dns.qry.type -e dns.flags.rcode\`
+- TLS versions: \`-Y tls.handshake.type==1 -T fields -e ip.src -e tls.handshake.version\`
+- IO stats: \`-q -z io,stat,1\`
+- Protocol hierarchy: \`-q -z io,phs\`
+
+### Agent & Knowledge Creation
+When a user asks you to create a specialized agent or teach the AI about specific patterns, use
+**nettrace-createAgent** or **nettrace-createKnowledge**. Agents change HOW the AI analyzes
+(persona, tools, filters). Knowledge changes WHAT the AI knows (facts, rules, patterns).
 
 Each tool response adds to the context — be efficient but thorough.
 
@@ -489,6 +552,7 @@ Each tool response adds to the context — be efficient but thorough.
 - Flag connection failures, TLS rejections, unexpected RSTs, and protocol errors as issues
 - Explain findings in terms a support engineer can act on
 - Provide clear remediation steps when you identify a root cause
+- When you apply a filter for the user, confirm what filter was applied and that their viewer is updated
 `;
     }
 
@@ -673,10 +737,32 @@ Each tool response adds to the context — be efficient but thorough.
     ): Promise<string> {
         if (streams.length === 0) { return ''; }
 
-        // Sort by anomaly score (highest first)
+        const prioritySignals = agent.contextPriority?.prioritySignals || [];
+        const alwaysInclude = agent.contextPriority?.alwaysInclude || [];
+
+        // Sort by anomaly score (highest first), but boost streams matching agent priority signals
         const sorted = [...streams]
             .filter(s => !s.excluded)
-            .sort((a, b) => b.anomalyScore - a.anomalyScore);
+            .map(s => {
+                let boost = 0;
+                // Boost streams whose anomaly types match the agent's priority signals
+                if (prioritySignals.length > 0) {
+                    for (const anomaly of s.anomalies) {
+                        if (prioritySignals.includes(anomaly.type)) {
+                            boost += 10;
+                        }
+                    }
+                }
+                // Boost streams whose appProtocol matches alwaysInclude
+                if (alwaysInclude.length > 0 && s.appProtocol) {
+                    if (alwaysInclude.some(p => s.appProtocol!.toLowerCase().includes(p.toLowerCase()))) {
+                        boost += 20; // Always-include gets highest priority
+                    }
+                }
+                return { stream: s, effectiveScore: s.anomalyScore + boost };
+            })
+            .sort((a, b) => b.effectiveScore - a.effectiveScore)
+            .map(s => s.stream);
 
         const maxStreams = agent.contextPriority?.maxStreamsToAnalyze || 20;
         const perStreamBudget = this.getTokenBudget().perStreamBudget || 50000;

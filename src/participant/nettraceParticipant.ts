@@ -322,8 +322,10 @@ export class NetTraceParticipant {
 
         // ── Agentic tool-calling loop with token budget tracking ──────────
         // Track accumulated tokens to prevent exceeding the model's context limit.
-        // Reserve 15% of the model's context for the response itself.
-        const tokenLimit = Math.floor(modelMax * 0.85);
+        // Use the same 10% reserve the context assembler used — NOT an additional 15%.
+        // The assembler already budgeted within (maxTokens * 0.9), so we honor that boundary
+        // and only need a small additional margin for tool responses accumulating.
+        const tokenLimit = Math.floor(modelMax * 0.95); // 5% reserve for tool overhead; assembler already reserved 10%
         let roundTrip = 0;
 
         while (roundTrip < NetTraceParticipant.MAX_TOOL_ROUNDTRIPS) {
@@ -334,7 +336,11 @@ export class NetTraceParticipant {
             const estimatedTokens = this.estimateMessageTokens(messages);
             const remainingBudget = tokenLimit - estimatedTokens;
 
-            if (remainingBudget < 20000) {
+            // On the FIRST roundtrip, always send with tools — the model needs them
+            // to analyze the capture even if the context is large. The budget-cap
+            // path should only trigger on subsequent roundtrips after tool results
+            // have accumulated and genuinely exhausted the budget.
+            if (remainingBudget < 20000 && roundTrip > 1) {
                 // Less than ~20K tokens left — not enough for a useful tool response.
                 // Tell the model to wrap up with what it has.
                 this.outputChannel.appendLine(
@@ -490,6 +496,17 @@ export class NetTraceParticipant {
             return [];
         }
 
+        // Use the active agent's followups if defined, otherwise fall back to defaults
+        const agent = this.agentsTree.getActiveAgent();
+        if (agent.followups && agent.followups.length > 0) {
+            return agent.followups.map(f => ({
+                prompt: f.prompt,
+                label: f.label,
+                participant: 'nettrace.participant',
+            }));
+        }
+
+        // Default followups when agent doesn't define any
         return [
             { prompt: 'Are there any retransmissions or packet loss?', label: 'Retransmissions', participant: 'nettrace.participant' },
             { prompt: 'Show me the expert info warnings and errors', label: 'Expert Info', participant: 'nettrace.participant' },

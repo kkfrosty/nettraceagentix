@@ -152,6 +152,23 @@ export class ConfigLoader {
                         const fileUri = vscode.Uri.joinPath(agentsUri, name);
                         const data = await vscode.workspace.fs.readFile(fileUri);
                         const agent: AgentDefinition = JSON.parse(Buffer.from(data).toString());
+
+                        // Validate required fields
+                        if (!agent.name || typeof agent.name !== 'string') {
+                            this.outputChannel.appendLine(`[ConfigLoader] Skipping agent ${name}: missing or invalid 'name' field`);
+                            continue;
+                        }
+                        if (!agent.systemPrompt || typeof agent.systemPrompt !== 'string') {
+                            this.outputChannel.appendLine(`[ConfigLoader] Warning: agent ${name} has no systemPrompt — using default`);
+                            agent.systemPrompt = `You are a network analyst specializing in ${agent.displayName || agent.name} analysis.`;
+                        }
+                        if (!agent.displayName) {
+                            agent.displayName = agent.name;
+                        }
+                        if (!agent.description) {
+                            agent.description = '';
+                        }
+
                         this.agents.set(agent.name, agent);
                         this.outputChannel.appendLine(`[ConfigLoader] Agent loaded: ${agent.displayName}`);
                     } catch (e) {
@@ -190,6 +207,10 @@ If you need more data about a specific stream, use the available tools to retrie
                 'nettrace-applyFilter',
                 'nettrace-getConversations',
                 'nettrace-followStream',
+                'nettrace-setDisplayFilter',
+                'nettrace-runTshark',
+                'nettrace-createAgent',
+                'nettrace-createKnowledge',
             ],
             followups: [
                 { label: 'Show retransmissions', prompt: 'What streams have the most retransmissions and what might be causing them?' },
@@ -329,8 +350,8 @@ If you need more data about a specific stream, use the available tools to retrie
         return Array.from(this.tools.values());
     }
 
-    getEffectiveFilters(): FilterConfig {
-        // Merge: built-in defaults → config defaults → user filters
+    getEffectiveFilters(agent?: AgentDefinition): FilterConfig {
+        // Merge: built-in defaults → config defaults → agent autoFilters
         const builtIn: FilterConfig = {
             excludeProtocols: vscode.workspace.getConfiguration('nettrace').get<string[]>('excludeProtocols') || [],
             maxPacketsPerStream: vscode.workspace.getConfiguration('nettrace').get<number>('maxPacketsPerStream') || 1000,
@@ -338,10 +359,13 @@ If you need more data about a specific stream, use the available tools to retrie
 
         const configFilters = this.config.defaultFilters || {};
 
+        // Merge agent's excludeProtocols if the agent defines autoFilters
+        const agentExclude = agent?.autoFilters?.excludeProtocols || [];
+
         return {
-            excludeProtocols: [...new Set([...(builtIn.excludeProtocols || []), ...(configFilters.excludeProtocols || [])])],
+            excludeProtocols: [...new Set([...(builtIn.excludeProtocols || []), ...(configFilters.excludeProtocols || []), ...agentExclude])],
             excludeIPs: configFilters.excludeIPs || [],
-            includeFilter: configFilters.includeFilter,
+            includeFilter: agent?.autoFilters?.displayFilter || configFilters.includeFilter,
             excludeFilter: configFilters.excludeFilter,
             maxPacketsPerStream: configFilters.maxPacketsPerStream || builtIn.maxPacketsPerStream,
         };
