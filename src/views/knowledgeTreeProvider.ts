@@ -14,10 +14,13 @@ export class KnowledgeTreeProvider implements vscode.TreeDataProvider<KnowledgeT
     private _onDidChangeTreeData = new vscode.EventEmitter<KnowledgeTreeItem | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-    private categories: Array<{ dir: string; label: string; description: string; icon: string }> = [
-        { dir: 'security', label: 'Security Heuristics', description: 'Activated when suspicious packets detected', icon: 'shield' },
-        { dir: 'wisdom', label: 'Analysis Guidance', description: 'Always applied — expert tips & false positive avoidance', icon: 'lightbulb' },
-        { dir: 'known-issues', label: 'Known Issues', description: 'Always applied — vendor/OS-specific behaviors', icon: 'warning' },
+    private categories: Array<{ dir: string; label: string; description: string; icon: string; tooltip: string }> = [
+        { dir: 'security', label: 'Security Heuristics', description: 'Activated when suspicious packets detected', icon: 'shield',
+          tooltip: 'Injected into AI context ONLY when suspicious patterns are detected (malformed packets, fragments, checksum errors, suspicious flags).\n\nUse for: attack signatures, IDS-like pattern descriptions, threshold-based detection guidance.' },
+        { dir: 'wisdom', label: 'Analysis Guidance', description: 'Always applied — expert tips & false positive avoidance', icon: 'lightbulb',
+          tooltip: 'ALWAYS injected into AI context for every analysis.\n\nUse for: environment-specific tips, false positive notes, common patterns in your infrastructure, protocol quirks.' },
+        { dir: 'known-issues', label: 'Known Issues', description: 'Always applied — vendor/OS-specific behaviors', icon: 'warning',
+          tooltip: 'ALWAYS injected into AI context for every analysis.\n\nUse for: OS-specific TCP quirks, firewall behaviors, known vendor bugs, application-specific patterns.' },
     ];
 
     refresh(): void {
@@ -45,6 +48,7 @@ export class KnowledgeTreeProvider implements vscode.TreeDataProvider<KnowledgeT
                 item.description = cat.description;
                 item.iconPath = new vscode.ThemeIcon(cat.icon);
                 item.categoryDir = cat.dir;
+                item.tooltip = new vscode.MarkdownString(cat.tooltip);
                 return item;
             });
         }

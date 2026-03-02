@@ -48,6 +48,23 @@ export class AgentsTreeProvider implements vscode.TreeDataProvider<AgentTreeItem
             item.agent = agent;
             item.description = isActive ? '(active)' : agent.description;
 
+            // Rich tooltip showing agent capabilities
+            const toolList = agent.tools && agent.tools.length > 0
+                ? agent.tools.map(t => t.replace('nettrace-', '')).join(', ')
+                : 'default tools';
+            const filterInfo = agent.autoFilters?.displayFilter
+                ? `\nDisplay Filter: ${agent.autoFilters.displayFilter}`
+                : '';
+            const priorityInfo = agent.contextPriority?.prioritySignals?.length
+                ? `\nPriority Signals: ${agent.contextPriority.prioritySignals.join(', ')}`
+                : '';
+            item.tooltip = new vscode.MarkdownString(
+                `**${agent.displayName}**\n\n` +
+                `${agent.description || 'No description'}\n\n` +
+                `**Tools:** ${toolList}${filterInfo}${priorityInfo}\n\n` +
+                `_Click to activate this agent for analysis._`
+            );
+
             // Icon
             const iconName = agent.icon || 'robot';
             item.iconPath = isActive
