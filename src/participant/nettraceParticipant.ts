@@ -6,6 +6,7 @@ import { CapturesTreeProvider } from '../views/capturesTreeProvider';
 import { AgentsTreeProvider } from '../views/agentsTreeProvider';
 import { StreamsTreeProvider } from '../views/streamsTreeProvider';
 import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
+import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
 import { AgentDefinition, AssembledContext, CaptureFile } from '../types';
 
 /**
@@ -578,7 +579,20 @@ export class NetTraceParticipant {
             return { captures: [clientCapture, serverCapture], mode: 'dual' };
         }
 
-        // Single mode: use whichever panel is currently focused in the viewer
+        // Live capture panel takes priority if it is visible and has a capture file
+        const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
+        if (livePath) {
+            const path = require('path') as typeof import('path');
+            const liveCapture: CaptureFile = {
+                filePath: livePath,
+                name: path.basename(livePath),
+                sizeBytes: 0,
+                parsed: true,
+            };
+            return { captures: [liveCapture], mode: 'single' };
+        }
+
+        // Single mode: use whichever saved-capture panel is currently focused
         const activePath = CaptureWebviewPanel.getActiveCaptureFile();
         const activeCapture = activePath ? allCaptures.find(c => c.filePath === activePath) : undefined;
         if (activeCapture) {

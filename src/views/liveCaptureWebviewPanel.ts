@@ -31,6 +31,9 @@ export class LiveCaptureWebviewPanel {
     /** Only one live capture panel at a time. */
     private static instance: LiveCaptureWebviewPanel | undefined;
 
+    /** Last output file path from any live capture session — persists after panel loses focus. */
+    private static lastCaptureFilePath: string | undefined;
+
     private readonly panel: vscode.WebviewPanel;
     private readonly extensionUri: vscode.Uri;
     private disposables: vscode.Disposable[] = [];
@@ -99,6 +102,16 @@ export class LiveCaptureWebviewPanel {
         return LiveCaptureWebviewPanel.instance;
     }
 
+    /**
+     * Returns the output file path of the most recent live capture session.
+     * Remains set after the user switches away to Copilot Chat, so the participant
+     * can still resolve the live capture as the active source.
+     * Cleared only when the panel is disposed.
+     */
+    public static getActiveCaptureFile(): string | undefined {
+        return LiveCaptureWebviewPanel.lastCaptureFilePath;
+    }
+
     // ─── Constructor ──────────────────────────────────────────────────────
 
     private constructor(
@@ -130,6 +143,7 @@ export class LiveCaptureWebviewPanel {
         this.panel.onDidDispose(() => {
             this.teardown();
             LiveCaptureWebviewPanel.instance = undefined;
+            LiveCaptureWebviewPanel.lastCaptureFilePath = undefined;
         }, null, this.disposables);
     }
 
@@ -287,6 +301,7 @@ export class LiveCaptureWebviewPanel {
             if (s.status === 'capturing') {
                 if (!captureStartedNotified) {
                     captureStartedNotified = true;
+                    LiveCaptureWebviewPanel.lastCaptureFilePath = s.outputFilePath;
                     this.postMessage({ command: 'captureStarted', sessionId: s.id, outputFile: s.outputFilePath });
                     vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', true);
                     this.startRefreshTimer();

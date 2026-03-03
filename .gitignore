@@ -7,7 +7,10 @@ Release/
 Thumbs.db
 
 # Live capture output — contain packet data, never commit
-**/.nettrace/captures/live/
+# (folder path is intentionally NOT ignored so Explorer shows the live/ folder)
 **/.nettrace/captures/*.pcap
 **/.nettrace/captures/*.pcapng
 **/.nettrace/captures/*.pcpap
+**/.nettrace/captures/live/*.pcap
+**/.nettrace/captures/live/*.pcapng
+**/.nettrace/captures/live/*.pcpap
