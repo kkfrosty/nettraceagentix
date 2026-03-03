@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { TsharkRunner } from '../parsing/tsharkRunner';
 import { CapturesTreeProvider } from '../views/capturesTreeProvider';
 import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
+import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
 import { ConfigLoader } from '../configLoader';
 
 /**
@@ -572,6 +573,103 @@ export function registerLMTools(
                         new vscode.LanguageModelTextPart(`Error creating knowledge file: ${e}`)
                     ]);
                 }
+            }
+        })
+    );
+
+    // ─── Start Live Capture ───────────────────────────────────────────────
+    context.subscriptions.push(
+        vscode.lm.registerTool('nettrace-startCapture', {
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<{
+                captureFilter?: string;
+                interfaceHint?: string;
+                autoStart?: boolean;
+            }>, token) {
+                const { captureFilter = '', interfaceHint = '', autoStart = false } = options.input;
+
+                outputChannel.appendLine(`[Tool] startCapture: filter="${captureFilter}", interfaceHint="${interfaceHint}", autoStart=${autoStart}`);
+
+                // Make sure tshark is available before trying to list interfaces.
+                if (!tsharkRunner.isAvailable()) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(
+                            'Live capture is unavailable: tshark not found. '
+                            + 'The user needs to install Wireshark or configure the nettrace.tsharkPath setting.'
+                        )
+                    ]);
+                }
+
+                // Enumerate interfaces so we can resolve the hint.
+                let interfaces: import('../types').NetworkInterface[] = [];
+                try {
+                    interfaces = await tsharkRunner.listNetworkInterfaces();
+                } catch (e) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(
+                            `Could not list network interfaces: ${e}\n\n` +
+                            'This often means tshark cannot discover interfaces due to permissions. ' +
+                            'Try running VS Code as administrator (Windows) or checking wireshark group membership (Linux/macOS).'
+                        )
+                    ]);
+                }
+
+                if (interfaces.length === 0) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('No network interfaces found. Is Wireshark/tshark installed and accessible?')
+                    ]);
+                }
+
+                // Resolve the best interface from the hint.
+                const nonLoopback = interfaces.filter(i => !i.isLoopback);
+                let resolved: import('../types').NetworkInterface | undefined;
+
+                if (interfaceHint.trim()) {
+                    const hintLower = interfaceHint.toLowerCase();
+                    // Exact name match
+                    resolved = interfaces.find(i => i.name.toLowerCase() === hintLower);
+                    // Friendly display name match
+                    if (!resolved) { resolved = interfaces.find(i => i.displayName.toLowerCase() === hintLower); }
+                    // Substring match in display name
+                    if (!resolved) { resolved = interfaces.find(i => i.displayName.toLowerCase().includes(hintLower)); }
+                    // IP fragment match (user said 'capture on 192.168.1.x')
+                    if (!resolved) { resolved = nonLoopback[0]; }
+                } else {
+                    // No hint: prefer first non-loopback interface (usually the main network card).
+                    resolved = nonLoopback[0] ?? interfaces[0];
+                }
+
+                const ifaceSummary = resolved
+                    ? `${resolved.displayName} (${resolved.name})`
+                    : 'first available interface';
+
+                // Open the Live Capture panel via the registered command,
+                // passing prefill options. The panel manages its own process lifecycle.
+                await vscode.commands.executeCommand('nettrace.openLiveCapture', {
+                    suggestedInterface: resolved?.name,
+                    captureFilter,
+                    autoStart,
+                });
+
+                const actionLine = autoStart
+                    ? `Capture has been **started** on ${ifaceSummary}.`
+                    : `Live Capture panel is **ready** on ${ifaceSummary}. Click **▶ Start** to begin capturing.`;
+
+                const filterLine = captureFilter
+                    ? `\n- **Capture filter (BPF):** \`${captureFilter}\``
+                    : '';
+
+                const ifaceList = interfaces.slice(0, 6)
+                    .map(i => `  ${i.id}. ${i.displayName}${i.isLoopback ? ' (loopback)' : ''}`)
+                    .join('\n');
+
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(
+                        `${actionLine}${filterLine}\n\n` +
+                        `Available interfaces (${interfaces.length} total):\n${ifaceList}\n\n` +
+                        `The capture panel allows you to stop, clear, and re-capture at any time. ` +
+                        `When stopped, click **🤖 Analyze with AI** to diagnose the captured traffic.`
+                    )
+                ]);
             }
         })
     );

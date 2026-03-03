@@ -383,6 +383,29 @@
             "content"
           ]
         }
+      },
+      {
+        "name": "nettrace-startCapture",
+        "displayName": "Start Live Capture",
+        "description": "Opens the Live Capture panel to capture network traffic in real-time",
+        "modelDescription": "Opens a Wireshark-style Live Capture panel that lets the user capture live network traffic via tshark. Use this when the user asks to capture, record, sniff, monitor, or start a trace. Resolves the best network interface from the hint provided. If autoStart=true, the capture begins immediately. If autoStart=false, the panel opens pre-filled and the user clicks Start. Always prefer this over manual interface selection when you can derive an interface or filter from the user's request.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "captureFilter": {
+              "type": "string",
+              "description": "BPF capture filter expression applied at the OS level (e.g. 'tcp port 443 and host 192.168.1.1'). Leave empty for all traffic."
+            },
+            "interfaceHint": {
+              "type": "string",
+              "description": "IP address, interface name, or keyword describing the desired interface (e.g. 'Wi-Fi', 'eth0', '192.168.1.x'). Leave empty to auto-select the first non-loopback interface."
+            },
+            "autoStart": {
+              "type": "boolean",
+              "description": "If true, start the capture immediately after the panel opens. Set to true when the user says 'start' or 'capture now'. Set to false when the user says 'set up' or 'prepare'."
+            }
+          }
+        }
       }
     ],
     "customEditors": [
@@ -603,6 +626,29 @@
         "title": "Open in Wireshark",
         "category": "NetTrace",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "nettrace.deleteCapture",
+        "title": "Delete Capture",
+        "category": "NetTrace",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nettrace.openLiveCapture",
+        "title": "Start Live Capture",
+        "category": "NetTrace",
+        "icon": "$(circle-filled)"
+      },
+      {
+        "command": "nettrace.stopLiveCapture",
+        "title": "Stop Live Capture",
+        "category": "NetTrace",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "nettrace.newLiveCapture",
+        "title": "New Live Capture (Reset Panel)",
+        "category": "NetTrace"
       }
     ],
     "menus": {
@@ -621,6 +667,11 @@
           "command": "nettrace.importCapture",
           "when": "view == nettrace.captures",
           "group": "navigation@2"
+        },
+        {
+          "command": "nettrace.openLiveCapture",
+          "when": "view == nettrace.captures",
+          "group": "navigation@3"
         },
         {
           "command": "nettrace.editScenarioDetails",
@@ -650,9 +701,19 @@
           "group": "inline@2"
         },
         {
+          "command": "nettrace.deleteCapture",
+          "when": "view == nettrace.captures && viewItem == captureFile",
+          "group": "inline@3"
+        },
+        {
           "command": "nettrace.parseCapture",
           "when": "view == nettrace.captures && viewItem == captureFile",
           "group": "1_actions@1"
+        },
+        {
+          "command": "nettrace.deleteCapture",
+          "when": "view == nettrace.captures && viewItem == captureFile",
+          "group": "1_actions@9"
         },
         {
           "command": "nettrace.setClientCapture",
@@ -755,6 +816,12 @@
           ],
           "description": "Protocols to exclude from analysis by default.",
           "scope": "resource"
+        },
+        "nettrace.liveCapturePath": {
+          "type": "string",
+          "default": "",
+          "description": "Directory where live capture .pcapng files are saved. Leave empty to use .nettrace/captures/live/ inside the workspace folder.",
+          "scope": "machine"
         }
       }
     }

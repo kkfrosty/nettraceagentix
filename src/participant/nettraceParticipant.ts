@@ -364,7 +364,12 @@ export class NetTraceParticipant {
         messages.push(vscode.LanguageModelChatMessage.User(userMessage));
 
         const toolNames = this.agentsTree.getActiveAgent().tools || [];
-        const tools = this.resolveTools(toolNames);
+        // Always include nettrace-startCapture so the LLM can start/set up a live
+        // capture regardless of which analysis agent is active.
+        const allToolNames = toolNames.includes('nettrace-startCapture')
+            ? toolNames
+            : [...toolNames, 'nettrace-startCapture'];
+        const tools = this.resolveTools(allToolNames);
 
         // Log message structure for debugging API errors
         this.outputChannel.appendLine(`[ChatParticipant] Message structure (${messages.length} messages):`);

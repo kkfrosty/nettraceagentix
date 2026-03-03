@@ -5,3 +5,9 @@ Release/
 .vscode-test/
 .DS_Store
 Thumbs.db
+
+# Live capture output — contain packet data, never commit
+**/.nettrace/captures/live/
+**/.nettrace/captures/*.pcap
+**/.nettrace/captures/*.pcapng
+**/.nettrace/captures/*.pcpap
