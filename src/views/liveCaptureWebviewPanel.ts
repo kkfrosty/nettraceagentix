@@ -206,7 +206,12 @@ export class LiveCaptureWebviewPanel {
                         const detail = await this.tsharkRunner.getPacketDetail(this.session.outputFilePath, msg.frameNumber);
                         const pdml = await this.tsharkRunner.getPacketDetailPdml(this.session.outputFilePath, msg.frameNumber).catch(() => '');
                         if (pdml) {
-                            this.postMessage({ command: 'packetDetail', frameNumber: msg.frameNumber, pdml, raw: detail });
+                            const tree = this.parsePdmlToTree(pdml);
+                            if (tree.length > 0) {
+                                this.postMessage({ command: 'packetDetail', frameNumber: msg.frameNumber, tree });
+                            } else {
+                                this.postMessage({ command: 'packetDetailRaw', frameNumber: msg.frameNumber, text: detail });
+                            }
                         } else {
                             this.postMessage({ command: 'packetDetailRaw', frameNumber: msg.frameNumber, text: detail });
                         }
@@ -852,25 +857,66 @@ col.c-info { width: auto; }
 .p-icmp, .p-icmpv6 { color: #f44747; }
 .p-arp  { color: #ce9178; }
 
-/* Packet detail pane (collapsible bottom split) */
-#detail-pane {
-    display: none;
-    height: 180px;
-    min-height: 60px;
+/* ── Wireshark-style 3-pane detail / hex layout ─────────────── */
+.ws-bottom {
+    display: none;                    /* hidden until first packet selected */
+    flex: 0 0 220px;
+    min-height: 80px;
     border-top: 2px solid var(--border);
-    overflow: auto;
-    flex-shrink: 0;
-    background: var(--bg);
-    resize: vertical;
+    flex-direction: row;
+    overflow: hidden;
 }
-#detail-pane.visible { display: block; }
-#detail-pre {
+.ws-detail {
+    flex: 1;
+    overflow: auto;
+    border-right: 2px solid var(--border);
+}
+.ws-hex {
+    flex: 0 0 42%;
+    max-width: 52%;
+    overflow: auto;
     font-family: var(--mono);
     font-size: 11px;
-    padding: 6px 10px;
-    white-space: pre;
-    color: var(--fg);
 }
+.ws-pane-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 8px;
+    background: transparent;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 600;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+}
+.pane-toggle {
+    cursor: pointer;
+    border: none;
+    background: none;
+    color: var(--fg);
+    font-size: 12px;
+    padding: 0 4px;
+    line-height: 1;
+}
+.ws-hex.collapsed { flex: 0 0 26px !important; overflow: hidden; }
+.ws-hex.collapsed .ws-pane-body { display: none; }
+.ws-hex.collapsed .ws-pane-header span { display: none; }
+.ws-bottom.all-collapsed { flex: 0 0 26px !important; overflow: hidden; }
+.ws-bottom.all-collapsed .ws-detail .ws-pane-body,
+.ws-bottom.all-collapsed #liveDetailContent,
+.ws-bottom.all-collapsed .ws-hex { display: none; }
+/* Proto tree */
+.ws-empty { color: var(--vscode-descriptionForeground); padding: 8px; font-size: 12px; }
+.proto-tree { font-family: var(--mono); font-size: 12px; padding: 4px 0; }
+.proto-node { padding: 1px 0; line-height: 1.5; white-space: nowrap; }
+.proto-toggle { cursor: pointer; display: inline-block; width: 16px; text-align: center; font-size: 10px; }
+.proto-header  { font-weight: 600; }
+.proto-field   { color: var(--fg); }
+.proto-label:hover { background: var(--hover-bg, rgba(255,255,255,0.07)); border-radius: 2px; }
 </style>
 </head>
 <body>
@@ -972,9 +1018,26 @@ col.c-info { width: auto; }
         </table>
     </div>
 
-    <!-- Packet detail (appears when a row is clicked) -->
-    <div id="detail-pane">
-        <pre id="detail-pre">Click a packet row to inspect its fields.</pre>
+    <!-- Wireshark-style 3-pane detail/hex (appears when a row is clicked) -->
+    <div class="ws-bottom" id="wsBottom">
+        <div class="ws-detail" id="liveDetailPane">
+            <div class="ws-pane-header">
+                <span id="liveDetailTitle">Packet Detail</span>
+                <button class="pane-toggle" id="btnToggleDetail" title="Minimize">&#9660;</button>
+            </div>
+            <div id="liveDetailContent" style="padding: 4px 8px;">
+                <div class="ws-empty">Click a packet row to inspect its fields.</div>
+            </div>
+        </div>
+        <div class="ws-hex" id="liveHexPane">
+            <div class="ws-pane-header">
+                <span>Packet Bytes</span>
+                <button class="pane-toggle" id="btnToggleHex" title="Minimize">&#9664;</button>
+            </div>
+            <div class="ws-pane-body">
+                <pre id="liveHexContent" style="padding: 4px 8px; margin: 0;">Click a packet above to see hex dump</pre>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -1034,8 +1097,10 @@ const bannerEl        = document.getElementById('banner');
 const emptyState      = document.getElementById('empty-state');
 const tableWrap       = document.getElementById('table-wrap');
 const pktBody         = document.getElementById('pkt-body');
-const detailPane      = document.getElementById('detail-pane');
-const detailPre       = document.getElementById('detail-pre');
+const wsBottom          = document.getElementById('wsBottom');
+const liveDetailTitle   = document.getElementById('liveDetailTitle');
+const liveDetailContent = document.getElementById('liveDetailContent');
+const liveHexContent    = document.getElementById('liveHexContent');
 
 // ── Logging helper ──────────────────────────────────────────────────
 function log(text) { vscode.postMessage({ command: 'log', text: String(text) }); }
@@ -1064,8 +1129,13 @@ function initializeUiState() {
     pktBody.innerHTML = '';
     tableWrap.style.display = 'none';
     emptyState.style.display = 'flex';
-    detailPane.classList.remove('visible');
-    detailPre.textContent = 'Click a packet row to inspect its fields.';
+    wsBottom.style.display = 'none';
+    liveDetailContent.innerHTML = '<div class="ws-empty">Click a packet row to inspect its fields.</div>';
+    liveHexContent.textContent = 'Click a packet above to see hex dump';
+    wsBottom.classList.remove('all-collapsed');
+    document.getElementById('liveHexPane').classList.remove('collapsed');
+    document.getElementById('btnToggleDetail').textContent = '\u25bc';
+    document.getElementById('btnToggleHex').textContent = '\u25c4';
     filterBar.classList.remove('visible');
     if (filterRow) { filterRow.style.display = 'flex'; }
     if (ifaceWrap) { ifaceWrap.style.display = 'flex'; }
@@ -1212,9 +1282,55 @@ pktBody.addEventListener('click', e => {
     selectedTr = tr;
     const frame = parseInt(tr.dataset.f);
     if (!isNaN(frame)) {
-        detailPre.textContent = 'Loading…';
-        detailPane.classList.add('visible');
+        liveDetailTitle.textContent = 'Packet #' + frame + ' Detail';
+        liveDetailContent.innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail…</div>';
+        liveHexContent.textContent = 'Loading hex dump…';
+        wsBottom.style.display = 'flex';
         vscode.postMessage({ command: 'getPacketDetail', frameNumber: frame });
+        vscode.postMessage({ command: 'getPacketHex', frameNumber: frame });
+    }
+});
+
+// ── Detail / hex pane collapse toggles ──────────────────────────────
+document.getElementById('btnToggleDetail').addEventListener('click', function() {
+    if (wsBottom.classList.contains('all-collapsed')) {
+        wsBottom.classList.remove('all-collapsed');
+        this.textContent = '\u25bc';
+        this.title = 'Minimize';
+    } else {
+        wsBottom.classList.add('all-collapsed');
+        this.textContent = '\u25b2';
+        this.title = 'Maximize';
+    }
+});
+
+document.getElementById('btnToggleHex').addEventListener('click', function() {
+    var hexPane = document.getElementById('liveHexPane');
+    if (hexPane.classList.contains('collapsed')) {
+        hexPane.classList.remove('collapsed');
+        this.textContent = '\u25c4';
+        this.title = 'Minimize';
+    } else {
+        hexPane.classList.add('collapsed');
+        this.textContent = '\u25ba';
+        this.title = 'Maximize';
+    }
+});
+
+// Protocol tree toggle — delegate from detail pane
+liveDetailContent.addEventListener('click', function(e) {
+    var toggle = e.target.closest('.proto-toggle');
+    if (!toggle) { return; }
+    var targetId = toggle.getAttribute('data-toggle');
+    if (!targetId) { return; }
+    var el = document.getElementById(targetId);
+    if (!el) { return; }
+    if (el.style.display === 'none') {
+        el.style.display = 'block';
+        toggle.textContent = '\u25bc';
+    } else {
+        el.style.display = 'none';
+        toggle.textContent = '\u25ba';
     }
 });
 
@@ -1258,7 +1374,13 @@ function resetToConfigureState() {
     pktBody.innerHTML = '';
     tableWrap.style.display    = 'none';
     emptyState.style.display   = 'flex';
-    detailPane.classList.remove('visible');
+    wsBottom.style.display = 'none';
+    liveDetailContent.innerHTML = '<div class="ws-empty">Click a packet row to inspect its fields.</div>';
+    liveHexContent.textContent = 'Click a packet above to see hex dump';
+    wsBottom.classList.remove('all-collapsed');
+    document.getElementById('liveHexPane').classList.remove('collapsed');
+    document.getElementById('btnToggleDetail').textContent = '\u25bc';
+    document.getElementById('btnToggleHex').textContent = '\u25c4';
     filterBar.classList.remove('visible');
     if (filterRow) { filterRow.style.display = 'flex'; }
     if (ifaceWrap) { ifaceWrap.style.display = 'flex'; }
@@ -1329,6 +1451,44 @@ function shortFileLabel(value) {
         return fileName;
     }
     return fileName.slice(0, 24) + '…' + fileName.slice(-(max - 25));
+}
+
+// ── Proto tree rendering (mirrors captureWebviewPanel) ──────────────
+function renderProtoTree(nodes) {
+    if (!nodes || nodes.length === 0) {
+        return '<div class="ws-empty">No detail available.</div>';
+    }
+    var html = '<div class="proto-tree">';
+    for (var i = 0; i < nodes.length; i++) {
+        var isLast = (i === nodes.length - 1);
+        html += renderProtoNode(nodes[i], 0, isLast);
+    }
+    html += '</div>';
+    return html;
+}
+
+function renderProtoNode(node, depth, startExpanded) {
+    var hasChildren = node.children && node.children.length > 0;
+    var indent = depth * 16;
+    var id = 'pn_' + Math.random().toString(36).substr(2, 9);
+    var expanded = startExpanded === true;
+    var html = '<div class="proto-node" style="padding-left:' + indent + 'px;">';
+    if (hasChildren) {
+        var arrow = expanded ? '\u25bc' : '\u25ba';
+        var displayStyle = expanded ? 'block' : 'none';
+        html += '<span class="proto-toggle" data-toggle="' + id + '" id="toggle_' + id + '">' + arrow + '</span> ';
+        html += '<span class="proto-label ' + (depth === 0 ? 'proto-header' : 'proto-field') + '">' + esc(node.showname) + '</span>';
+        html += '<div class="proto-children" id="' + id + '" style="display:' + displayStyle + ';">';
+        for (var ci = 0; ci < node.children.length; ci++) {
+            html += renderProtoNode(node.children[ci], depth + 1, false);
+        }
+        html += '</div>';
+    } else {
+        html += '<span style="display:inline-block;width:16px;"></span> ';
+        html += '<span class="proto-field">' + esc(node.showname) + '</span>';
+    }
+    html += '</div>';
+    return html;
 }
 
 function renderPackets(packets) {
@@ -1511,15 +1671,19 @@ window.addEventListener('message', e => {
             break;
 
         case 'packetDetail':
-            if (msg.raw) { detailPre.textContent = msg.raw; }
+            if (msg.tree && msg.tree.length > 0) {
+                liveDetailContent.innerHTML = renderProtoTree(msg.tree);
+            } else if (msg.raw) {
+                liveDetailContent.innerHTML = '<pre style="margin:0;padding:8px;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + esc(msg.raw) + '</pre>';
+            }
             break;
 
         case 'packetDetailRaw':
-            detailPre.textContent = msg.text || '';
+            liveDetailContent.innerHTML = '<pre style="margin:0;padding:8px;font-size:12px;white-space:pre-wrap;word-break:break-all;">' + esc(msg.text || '') + '</pre>';
             break;
 
         case 'packetHex':
-            detailPre.textContent = msg.hex || '';
+            liveHexContent.textContent = msg.hex || '';
             break;
     }
 });
@@ -1527,4 +1691,69 @@ window.addEventListener('message', e => {
 </body>
 </html>`;
     }
+
+    // ─── PDML parsing (mirrors CaptureWebviewPanel) ───────────────────────
+
+    private parsePdmlToTree(pdml: string): ProtoTreeNode[] {
+        const nodes: ProtoTreeNode[] = [];
+        const normalized = pdml.replace(/\n\s*/g, ' ');
+        const tagRegex = /<(\/?)([\w:.-]+)(\s[^>]*?)?\s*(\/?)>/g;
+        const stack: ProtoTreeNode[] = [];
+        let skipDepth = 0;
+        let match;
+        while ((match = tagRegex.exec(normalized)) !== null) {
+            const isClosing    = match[1] === '/';
+            const tagName      = match[2];
+            const attrStr      = match[3] || '';
+            const isSelfClosing = match[4] === '/';
+            if (tagName !== 'proto' && tagName !== 'field') { continue; }
+            if (isClosing) {
+                if (skipDepth > 0) { skipDepth--; continue; }
+                stack.pop();
+                continue;
+            }
+            const attrs = this.parseXmlAttrs(attrStr);
+            if (tagName === 'proto' && attrs.name === 'geninfo') {
+                if (!isSelfClosing) { skipDepth++; }
+                continue;
+            }
+            if (attrs.hide === 'yes') {
+                if (!isSelfClosing) { skipDepth++; }
+                continue;
+            }
+            if (skipDepth > 0) {
+                if (!isSelfClosing) { skipDepth++; }
+                continue;
+            }
+            if (tagName === 'field' && !attrs.showname) {
+                if (!isSelfClosing) { skipDepth++; }
+                continue;
+            }
+            const node: ProtoTreeNode = {
+                name: attrs.name || '',
+                showname: attrs.showname || attrs.name || 'Unknown',
+                children: [],
+            };
+            if (stack.length === 0) { nodes.push(node); }
+            else { stack[stack.length - 1].children.push(node); }
+            if (!isSelfClosing) { stack.push(node); }
+        }
+        return nodes;
+    }
+
+    private parseXmlAttrs(attrString: string): Record<string, string> {
+        const attrs: Record<string, string> = {};
+        const regex = /(\w+)="([^"]*)"/g;
+        let match;
+        while ((match = regex.exec(attrString)) !== null) {
+            attrs[match[1]] = match[2];
+        }
+        return attrs;
+    }
+}
+
+interface ProtoTreeNode {
+    name: string;
+    showname: string;
+    children: ProtoTreeNode[];
 }
