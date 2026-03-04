@@ -26,11 +26,12 @@ AI-powered network trace analysis for VS Code. Drop in a `.pcap` file, type `@ne
 - [Features](#features)
   - [Chat Participant (@nettrace)](#chat-participant-nettrace)
   - [Capture Viewer](#capture-viewer)
+  - [Live Packet Capture](#live-packet-capture)
   - [Sidebar Views](#sidebar-views)
   - [Agentic Tool Calling](#agentic-tool-calling)
   - [Client/Server Capture Comparison](#clientserver-capture-comparison)
   - [Analysis Agents](#analysis-agents)
-  - [Knowledge Templates](#knowledge-templates)
+  - [Knowledge Base](#knowledge-base)
 - [Commands](#commands)
 - [Configuration](#configuration)
   - [VS Code Settings](#vs-code-settings)
@@ -130,7 +131,7 @@ You can also manually configure the path in VS Code settings (see [Configuration
 5. **Install the VSIX in VS Code:**
 
    ```bash
-   code --install-extension Release/nettrace-agentix-0.1.2.vsix
+   code --install-extension Release/nettrace-agentix-0.1.6.vsix
    ```
 
    Or in VS Code: **Extensions** sidebar → `...` menu → **Install from VSIX...** → select the `.vsix` file.
@@ -186,7 +187,9 @@ The AI analyzes the active capture, highlights anomalies, and provides diagnosis
 
 ### Chat Participant (@nettrace)
 
-The extension registers a `@nettrace` chat participant in Copilot Chat. Simply mention `@nettrace` followed by your question:
+The extension registers a `@nettrace` chat participant in GitHub Copilot Chat. No separate API keys are needed — it uses your existing Copilot subscription through the VS Code Language Model API.
+
+Simply mention `@nettrace` followed by your question:
 
 | Example | What it does |
 |---|---|
@@ -194,11 +197,14 @@ The extension registers a `@nettrace` chat participant in Copilot Chat. Simply m
 | `@nettrace why are there so many retransmissions?` | Focused analysis on a specific issue |
 | `@nettrace is the TLS handshake completing correctly?` | Protocol-specific question |
 | `@nettrace compare client and server captures` | Cross-capture comparison |
+| `@nettrace start a live capture on the Wi-Fi adapter` | Launch Live Capture panel via natural language |
 | `@nettrace /summarize` | Capture summary with stats and anomaly highlights |
 | `@nettrace /diagnose` | Root cause diagnosis using scenario context |
 | `@nettrace /stream 5` | Deep dive into TCP stream index 5 |
 | `@nettrace /compare` | Compare client vs server captures |
 | `@nettrace /agent tls-specialist` | Switch to the TLS analysis agent |
+
+**Multi-turn conversations** are fully supported. Follow-up questions carry forward from the first analysis — the AI remembers the capture context and can call tools to revisit specific packets without re-sending all packet data.
 
 ### Capture Viewer
 
@@ -207,30 +213,54 @@ A richly interactive webview panel that shows:
 - Packet list with timestamps, source/destination, protocol, and info
 - Conversation statistics
 - Ability to apply Wireshark display filters
+- Three-pane layout: packet list, protocol detail tree, hex dump
 - Click-to-analyze integration with Copilot Chat
+- Collapsible Packet Detail and Packet Bytes panes for maximum screen space
+
+### Live Packet Capture
+
+Capture live network traffic directly from VS Code without leaving the editor:
+
+1. Run **NetTrace: Start Live Capture** from the Command Palette, or ask `@nettrace start capturing traffic on my Wi-Fi adapter`
+2. The **Live Capture panel** opens showing available network interfaces with friendly names
+3. Optionally set a **BPF capture filter** (e.g., `port 443`, `host 10.0.1.1`) to limit captured traffic
+4. Click **▶ Start** — live packets stream into the panel in real time
+5. Click **⏹ Stop** when done
+6. Click **🤖 Analyze with AI** to immediately feed the capture to `@nettrace` for diagnosis
+
+**Live captures are saved as `.pcapng` files** in your workspace, so you can revisit them later or open them in Wireshark for additional analysis.
+
+> **Note:** Live capture requires tshark to run with packet capture privileges. On Windows, Wireshark installs the required Npcap driver automatically. On Linux/macOS, tshark may need to run as root or your user must be in the `wireshark` group.
 
 ### Sidebar Views
 
 The **NetTrace** Activity Bar entry provides:
 
 - **Captures** — All capture files in the workspace, organized by folder. Right-click for actions (analyze, parse, set as client/server, open in Wireshark).
+- **Analysis Agents** — Lists all available agents (built-in and custom). Click to activate an agent; the active agent's persona and tools are used for the next `@nettrace` request.
+- **Knowledge Base** — Shows knowledge documents organized by category (Analysis Guidance, Security Heuristics, Known Issues). Enabled/disabled status is visible at a glance; click to open and edit any file.
 - **Scenario Context** — Optional scenario metadata (scenario ID, symptom, topology, IPs) that gets injected into every LLM prompt for more targeted diagnosis.
 
 ### Agentic Tool Calling
 
-During analysis, the LLM can autonomously call these tools to gather more data:
+During analysis, the LLM autonomously calls tools to gather more data — up to 25 round-trips per conversation turn. The AI starts with a high-level summary and drills into specific streams on its own when it detects something suspicious. Each agent defines which tools it has access to.
 
 | Tool | Description |
 |---|---|
 | **Get TCP Stream Detail** | Full packet-level detail for a specific TCP stream |
 | **Get Packet Range** | Fetch packets by frame number range (pagination for large captures) |
 | **Get Expert Info** | Wireshark expert info — errors, warnings, notes |
-| **Apply Display Filter** | Apply any Wireshark display filter and return matching packets |
+| **Apply Display Filter** | Apply any Wireshark display filter, return matching packets, and update the viewer panel |
 | **Get Conversations** | List all TCP/UDP/IP conversations with byte counts, durations, anomalies |
 | **Follow TCP Stream** | Reconstruct application-layer payload (like Wireshark's Follow Stream) |
 | **Compare Captures** | Compare client-side and server-side captures for discrepancies |
+| **Set Display Filter** | Update the active capture viewer's filter bar without querying data |
+| **Run Tshark Command** | Execute any read-only tshark command for ad-hoc statistics and analysis |
+| **Create Agent** | Generate a new `.nettrace/agents/*.json` agent definition on the fly |
+| **Create Knowledge** | Write a new knowledge document to `.nettrace/knowledge/` |
+| **Start Live Capture** | Open the Live Capture panel and optionally start capturing on a specified interface |
 
-The AI starts with a high-level summary and drills into specific streams on its own when it detects something suspicious.
+Display filter changes made by any tool are automatically **pushed to the open Capture Viewer panel**, keeping the UI in sync with what the AI is analyzing.
 
 ### Client/Server Capture Comparison
 
@@ -259,15 +289,19 @@ Select an agent via the command **NetTrace: Select Analysis Agent** or use the `
 
 You can also create custom agents — see [Workspace Configuration](#workspace-configuration-nettrace-folder).
 
-### Knowledge Templates
+### Knowledge Base
 
-The `.nettrace/knowledge/` directory in your workspace contains markdown files that are automatically injected into the LLM context during analysis:
+The `.nettrace/knowledge/` directory contains markdown files automatically injected into the LLM context during every analysis. This is how you teach the AI about your specific environment — devices, quirks, known issues, and false positives to ignore.
 
-- **known-issues/** — Firewall appliance quirks, Windows TCP stack behaviors (always loaded)
-- **security/** — Patterns for identifying security-relevant anomalies (loaded when suspicious packets are detected)
-- **wisdom/** — Common false positives to avoid misdiagnosis (always loaded)
+| Category | Folder | When injected |
+|---|---|---|
+| **Analysis Guidance** | `wisdom/` | Always — false positive avoidance, environment-specific tips, protocol quirks |
+| **Known Issues** | `known-issues/` | Always — OS TCP stack behaviors, vendor bugs, firewall appliance quirks |
+| **Security Heuristics** | `security/` | Conditional — only when suspicious packets are detected (malformed, fragments, checksum errors) |
 
-Add or edit `.md` files in these folders to customize the AI's knowledge. Changes take effect immediately via hot-reload — no restart needed.
+Add or edit `.md` files in these folders to customize the AI's knowledge. Changes take effect immediately via hot-reload — no restart needed. You can also **disable individual files** without deleting them by adding `<!-- nettrace-disabled -->` as the first line.
+
+The **Knowledge Base sidebar** shows all loaded documents with their enabled/disabled status. The AI also uses the **Create Knowledge** tool to write new knowledge files automatically when it learns something useful during a session.
 
 ---
 
@@ -284,6 +318,8 @@ All commands are available via the Command Palette (Ctrl+Shift+P) under the **Ne
 | **NetTrace: Analyze All Captures** | Analyze all loaded captures at once |
 | **NetTrace: Open Capture Viewer** | Open the interactive packet viewer for a capture |
 | **NetTrace: Chat with AI about Traces** | Open Copilot Chat with the `@nettrace` participant |
+| **NetTrace: Start Live Capture** | Open the Live Capture panel to capture traffic from a network interface |
+| **NetTrace: Stop Live Capture** | Stop the currently running live capture session |
 | **NetTrace: Edit Scenario Context** | Edit scenario details (symptom, IPs, topology) |
 | **NetTrace: Select Analysis Agent** | Switch the active analysis agent |
 | **NetTrace: Apply Display Filter** | Apply a Wireshark display filter to the active viewer |
@@ -508,16 +544,21 @@ src/
 ├── configLoader.ts                 # Loads .nettrace/ JSON config with hot-reload watchers
 ├── contextAssembler.ts             # Token budgeting, priority ranking, prompt assembly
 ├── workspaceInitializer.ts         # Workspace scaffolding wizard
+├── logger.ts                       # Structured output channel logging
+├── storage.ts                      # Extension global storage management
 ├── parsing/
-│   └── tsharkRunner.ts             # tshark execution engine (all pcap parsing)
+│   └── tsharkRunner.ts             # tshark execution engine (all pcap parsing + live capture)
 ├── participant/
 │   └── nettraceParticipant.ts      # @nettrace chat participant handler
 ├── views/
 │   ├── capturesTreeProvider.ts     # Sidebar: capture files
 │   ├── streamsTreeProvider.ts      # Internal: TCP streams sorted by anomaly score
 │   ├── scenarioDetailsTreeProvider.ts  # Sidebar: scenario context
-│   ├── agentsTreeProvider.ts       # Agent management
-│   └── captureWebviewPanel.ts      # Interactive capture viewer
+│   ├── agentsTreeProvider.ts       # Sidebar: analysis agents
+│   ├── knowledgeTreeProvider.ts    # Sidebar: knowledge base documents
+│   ├── captureWebviewPanel.ts      # Interactive capture viewer (static pcap)
+│   ├── captureEditorProvider.ts    # Custom editor provider for capture files
+│   └── liveCaptureWebviewPanel.ts  # Live Capture panel (real-time packet streaming)
 └── tools/
     └── lmTools.ts                  # Language Model Tools the AI calls during analysis
 
