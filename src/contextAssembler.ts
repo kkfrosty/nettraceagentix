@@ -38,23 +38,51 @@ export class ContextAssembler {
         const budget = this.getTokenBudget();
         const maxTokens = modelMax || budget.maxInputTokens || 900000;
 
-        // Reserve headroom for the agentic tool-calling loop that runs AFTER context assembly.
-        // Each round-trip (tool call + result + model reply) adds ~10-15K tokens accumulated in
-        // the message history. For large captures that need sampling, we call getPacketRange for
-        // every uncovered range PLUS targeted analysis calls — easily 8-15 round-trips.
+        // Predict whether this capture will need sampling before setting the reserve.
+        // Sampling mode requires a heavy tool loop (getPacketRange for every uncovered range +
+        // targeted drill-down calls) — each round-trip accumulates ~10-15K tokens in the message
+        // history, so we need to reserve significant headroom up front.
         //
-        // Small models (< 200K tokens): reserve 35% — tool loop headroom is scarce; cut initial
-        //   context aggressively so there is a real budget for tool interactions.
-        // Large models (200K–500K): reserve 20% — modest headroom; still large enough for context.
-        // Very large models (> 500K): reserve 15% — plenty of room; preserve as much upfront data
-        //   as possible since tools are rarely the bottleneck.
-        const isSmallContextModel = maxTokens < 200000;
-        const isVeryLargeContextModel = maxTokens > 500000;
-        const toolLoopReserveFraction = isSmallContextModel ? 0.35 : isVeryLargeContextModel ? 0.15 : 0.20;
+        // Complete mode (everything fits): the model gets all packets in the initial context and
+        // rarely needs more than 1-2 optional tool calls. A small 10% reserve is plenty.
+        //
+        // Sampled mode (capture is too large): the model MUST page through uncovered ranges via
+        // tools — easily 8-15 round-trips on a large capture. Reserve aggressively:
+        //   < 200K model: 35%  — context is tight; every token counts
+        //   200K–500K:    20%  — moderate headroom
+        //   > 500K:       15%  — plenty of room; preserve as much upfront context as possible
+        //
+        // We use the same cheap estimate (totalPackets × ~110 chars ÷ 4) already used internally
+        // by tryBuildFullPacketData to decide. This costs nothing — no tshark call needed.
+        const totalPacketsEstimate = captures.reduce((sum, c) => sum + (c.summary?.packetCount || 0), 0);
+        const estimatedPacketTokens = Math.ceil((totalPacketsEstimate * 110) / ContextAssembler.CHARS_PER_TOKEN);
+
+        // Use a baseline 10% reserve to compute the packet budget for the "will it fit?" check.
+        // If the estimate says sampling is needed we then switch to the larger reserve.
+        const baselineAvailable = maxTokens - Math.floor(maxTokens * 0.10);
+        const samplingRequired = estimatedPacketTokens > baselineAvailable;
+
+        let toolLoopReserveFraction: number;
+        if (!samplingRequired) {
+            // All packets fit — complete mode. Small reserve; tools are optional extras only.
+            toolLoopReserveFraction = 0.10;
+        } else if (maxTokens < 200000) {
+            toolLoopReserveFraction = 0.35;
+        } else if (maxTokens > 500000) {
+            toolLoopReserveFraction = 0.15;
+        } else {
+            toolLoopReserveFraction = 0.20;
+        }
+
         const reserveForResponse = Math.floor(maxTokens * toolLoopReserveFraction);
         const availableTokens = maxTokens - reserveForResponse;
 
-        this.outputChannel.appendLine(`[ContextAssembler] Model context window: ${modelMax ? modelMax + ' tokens (from model)' : 'using config default'}, available: ${availableTokens} (reserved ${Math.round(toolLoopReserveFraction * 100)}% = ${reserveForResponse} for tool loop)`);
+        this.outputChannel.appendLine(
+            `[ContextAssembler] Model: ${maxTokens} tokens, estimated packet tokens: ~${estimatedPacketTokens}, ` +
+            `mode: ${samplingRequired ? 'SAMPLED' : 'COMPLETE'}, ` +
+            `reserved ${Math.round(toolLoopReserveFraction * 100)}% = ${reserveForResponse} for tool loop, ` +
+            `available: ${availableTokens}`
+        );
 
         // 1. System prompt (always included)
         const systemPrompt = this.buildSystemPrompt(agent);
@@ -556,7 +584,7 @@ ranges are reviewed. Each tool result accumulates in the conversation history, s
 your calls determines how much you can cover.
 
 **Round 1 — Cover ALL uncovered ranges first.**
-In your VERY FIRST set of tool calls, issue one `nettrace-getPacketRange` call per uncovered range
+In your VERY FIRST set of tool calls, issue one \`nettrace-getPacketRange\` call per uncovered range
 listed in the packet data header. Issue them IN PARALLEL (multiple tool calls in the same response).
 **Do NOT make ANY other tool calls in round 1** — no applyFilter, no getConversations, no runTshark.
 Note your preliminary observations on each batch but defer detailed conclusions.

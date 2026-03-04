@@ -2,6 +2,18 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
+## [0.1.7] - 2026-03-04
+
+### Fixed
+- **Large capture token exhaustion** — Analysis of captures larger than the model's context window was cutting off before all packet ranges were reviewed. The tool loop was running out of headroom after only 2-3 round-trips because the initial context reserve was too small for the required range-paging calls
+- **Context reserve now scales with capture size** — For captures that fit entirely within the model's context window, the original 10% reserve is preserved (no regression). For captures requiring sampling mode, the reserve scales by model size: 35% for models under 200K tokens, 20% for 200K–500K, 15% for 500K+. This ensures the tool loop has enough room to page through all uncovered frame ranges
+- **Sampling mode pre-detection** — A lightweight packet-count estimate (no tshark call) now determines which reserve strategy to use before context assembly begins, so the split is always correctly sized for the actual capture
+- **Tool loop cutoff threshold** — The remaining-budget threshold that stops tool calls and forces a final synthesis now scales with model size (`max(20K, 10% of modelMax)`) instead of a flat 20K. On 128K models the old flat threshold was firing after just 2 rounds
+- **SAMPLED MODE PROTOCOL enforced in system prompt** — The AI is now explicitly instructed to issue all `nettrace-getPacketRange` calls in parallel in round 1 before making any filter or stats calls. This prevents exploratory calls from consuming budget before uncovered ranges are reviewed
+
+### Improved
+- **Sampled mode status line** — The UI stat line now reads `📊 Pre-loaded X of Y packets · 🔍 tools scanning remaining Z% via N range passes` instead of the misleading "Sampled X" wording, making clear this is a coverage plan rather than a cap
+
 ## [0.1.6] - 2026-03-03
 
 ### Added

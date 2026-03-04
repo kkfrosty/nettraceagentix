@@ -264,7 +264,20 @@ export class NetTraceParticipant {
         const coverageInfo = context.coverage
             ? context.coverage.mode === 'complete'
                 ? `\u2705 All ${context.coverage.totalPackets.toLocaleString()} packets loaded`
-                : `\ud83d\udcca Sampled ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${(context.coverage.uncoveredRanges?.length || 0) > 0 ? ` \u00b7 AI will page through ${context.coverage.uncoveredRanges!.length} uncovered range${context.coverage.uncoveredRanges!.length > 1 ? 's' : ''} via tools` : ''}`
+                : (() => {
+                    // Sampled mode: the initial load is intentionally sized to leave room in the
+                    // tool loop for range-paging calls. Surface this as a coverage plan, not a
+                    // limitation — "pre-loaded X%, tools will cover the rest" is more accurate
+                    // than implying only X% of the capture will be analyzed.
+                    const numRanges = context.coverage.uncoveredRanges?.length || 0;
+                    const uncoveredPct = context.coverage.totalPackets > 0
+                        ? Math.round(((context.coverage.totalPackets - context.coverage.packetsIncluded) / context.coverage.totalPackets) * 100)
+                        : 0;
+                    const rangeNote = numRanges > 0
+                        ? ` \u00b7 \ud83d\udd0d tools scanning remaining ${uncoveredPct}% via ${numRanges} range pass${numRanges > 1 ? 'es' : ''}`
+                        : '';
+                    return `\ud83d\udcca Pre-loaded ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${rangeNote}`;
+                })()
             : '';
         const captureLabel = captures.length > 1
             ? captures.map(c => `${c.name}${c.role ? ` [${c.role}]` : ''}`).join(' + ')
