@@ -63,20 +63,17 @@ export class NetTraceParticipant {
         }
 
         // Determine which captures to analyze — dual-capture mode if both roles assigned
-        const { captures: capturesToAnalyze, mode: captureMode } = this.getCapturesToAnalyze();
+        const { captures: capturesToAnalyze, mode: captureMode } = await this.getCapturesToAnalyze();
 
         if (capturesToAnalyze.length === 0) {
-            stream.markdown(
-                '📂 **No capture is open.**\n\n' +
-                'To analyze a network trace:\n' +
-                '1. Click on a capture file in the **NetTrace** sidebar\n' +
-                '2. Or use **NetTrace: Import Capture File** to add one\n' +
-                '3. The capture viewer will open — then come back here and ask your question\n\n' +
-                'For **client/server dual-capture analysis**, right-click captures in the sidebar ' +
-                'and choose **Set as Client Capture** / **Set as Server Capture**.'
-            );
-            stream.button({ command: 'nettrace.importCapture', title: '📂 Import Capture File' });
-            return { metadata: { command: 'no-capture' } };
+            // No capture is currently open in a viewer panel.
+            // Instead of hard-blocking with an error, run in "no-capture" mode so agent
+            // tools (e.g., nettrace-startCapture) can still be invoked by the model.
+            // This fixes the case where GHC is asked to start a live capture BEFORE
+            // any panel is open — the old code would fall back to allCaptures[0] and
+            // wastefully assemble full context for the wrong file.
+            this.outputChannel.appendLine('[ChatParticipant] No capture open — proceeding in no-capture mode');
+            return await this.handleNoCaptureRequest(request, context, stream, token);
         }
 
         // Primary capture: client in dual mode, or the only capture in single mode
@@ -271,7 +268,7 @@ export class NetTraceParticipant {
             : '';
         const captureLabel = captures.length > 1
             ? captures.map(c => `${c.name}${c.role ? ` [${c.role}]` : ''}`).join(' + ')
-            : captures[0]?.name ?? 'unknown';
+            : captures.length === 1 ? captures[0].name : 'no capture loaded';
         const statsLine = `*Using **${model.name}** \u2014 ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) \u00b7 ${coverageInfo} \u00b7 analyzing ${captureLabel}*`;
 
         if (isFirstTurn) {
@@ -555,6 +552,66 @@ export class NetTraceParticipant {
         return { metadata: { command: 'analysis' } };
     }
 
+    // ─── No-Capture Mode ──────────────────────────────────────────────────
+
+    /**
+     * Handle a request when no capture panel is currently open.
+     *
+     * Rather than blocking with an error, we give the model a minimal context
+     * (system prompt + scenario) and full tool access. This allows it to:
+     *   - Call nettrace-startCapture to open a live capture session
+     *   - Advise the user to open an existing capture
+     *   - Answer general network questions with its built-in knowledge
+     */
+    private async handleNoCaptureRequest(
+        request: vscode.ChatRequest,
+        chatContext: vscode.ChatContext,
+        stream: vscode.ChatResponseStream,
+        token: vscode.CancellationToken
+    ): Promise<vscode.ChatResult> {
+        const agent = this.agentsTree.getActiveAgent();
+
+        const systemPrompt = this.contextAssembler.buildSystemPromptPublic(agent);
+        const scenarioContext = this.contextAssembler.buildScenarioContextPublic();
+
+        const noCaptureNote = [
+            '## No Capture Currently Open',
+            '',
+            'There is no network capture currently loaded in a viewer panel.',
+            '',
+            'Available actions:',
+            '- Use the `nettrace-startCapture` tool to open the Live Capture panel and begin capturing',
+            '- Prompt the user to click a capture file in the **NetTrace** sidebar to open it',
+            '- Prompt the user to run **NetTrace: Import Capture File** to load a .pcap/.pcapng file',
+            '',
+            'If the user is asking to capture traffic ("start capturing", "capture on localhost", etc.),',
+            'call `nettrace-startCapture` with the appropriate filter and interface hint.',
+            'If the user is asking to analyze an existing file, instruct them to open it first.',
+        ].join('\n');
+
+        const estimatedTokens =
+            Math.ceil(systemPrompt.length / 4) +
+            Math.ceil(scenarioContext.length / 4) +
+            Math.ceil(noCaptureNote.length / 4);
+
+        const assembledContext: import('../types').AssembledContext = {
+            systemPrompt,
+            captureSummary: noCaptureNote,
+            streamDetails: '',
+            scenarioContext,
+            packetData: '',
+            knowledgeContext: '',
+            estimatedTokens,
+            coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 },
+        };
+
+        return await this.sendToModel(
+            request, chatContext, stream, token,
+            assembledContext, request.prompt,
+            /*captures=*/[], agent, /*isFirstTurn=*/true
+        );
+    }
+
     // ─── Capture Selection ────────────────────────────────────────────────
 
     /**
@@ -562,14 +619,16 @@ export class NetTraceParticipant {
      *
      * Priority:
      * 1. Both client + server role captures assigned → dual-capture mode
-     * 2. Active webview panel capture → single mode
-     * 3. First capture in tree → fallback single mode
+     * 2. Active live-capture session (panel open or recently stopped) → single mode
+     * 3. Explicitly opened CaptureWebviewPanel → single mode
+     * 4. Empty → no-capture mode (handled by handleNoCaptureRequest)
      *
-     * This is fully backward-compatible: if only one capture is open (or no
-     * role tags are set), the returned array has exactly one element and the
-     * rest of the flow is identical to the previous single-capture behavior.
+     * The allCaptures[0] fallback was intentionally removed. Automatically picking
+     * an arbitrary capture from the tree causes the wrong file to be loaded when
+     * the user's request is unrelated to any open capture (e.g., asking the model
+     * to start a live capture, configure settings, answer general questions).
      */
-    private getCapturesToAnalyze(): { captures: CaptureFile[]; mode: 'single' | 'dual' } {
+    private async getCapturesToAnalyze(): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
         const allCaptures = this.capturesTree.getCaptures();
         const clientCapture = allCaptures.find(c => c.role === 'client');
         const serverCapture = allCaptures.find(c => c.role === 'server');
@@ -579,7 +638,8 @@ export class NetTraceParticipant {
             return { captures: [clientCapture, serverCapture], mode: 'dual' };
         }
 
-        // Live capture panel takes priority if it is visible and has a capture file
+        // Live capture session takes absolute priority — the user ran a live capture
+        // and we must analyze that file regardless of what other panels are open.
         const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
         if (livePath) {
             const path = require('path') as typeof import('path');
@@ -589,21 +649,52 @@ export class NetTraceParticipant {
                 sizeBytes: 0,
                 parsed: true,
             };
+            this.outputChannel.appendLine(`[ChatParticipant] Live capture in use: ${livePath}`);
             return { captures: [liveCapture], mode: 'single' };
         }
 
-        // Single mode: use whichever saved-capture panel is currently focused
+        // Use the visible/focused panel, or the only open panel if exactly one exists.
         const activePath = CaptureWebviewPanel.getActiveCaptureFile();
-        const activeCapture = activePath ? allCaptures.find(c => c.filePath === activePath) : undefined;
-        if (activeCapture) {
-            return { captures: [activeCapture], mode: 'single' };
+        if (activePath) {
+            const activeCapture = allCaptures.find(c => c.filePath === activePath);
+            if (activeCapture) {
+                return { captures: [activeCapture], mode: 'single' };
+            }
         }
 
-        // Final fallback: first capture in tree (matches original behavior)
-        if (allCaptures.length > 0) {
-            return { captures: [allCaptures[0]], mode: 'single' };
+        // Multiple panels are open but none is currently focused (user switched to Chat).
+        // Show a QuickPick so the user explicitly chooses which capture to analyze.
+        // Never silently pick one — analyzing the wrong file is worse than asking.
+        const openPanels = CaptureWebviewPanel.getOpenCapturePanels();
+        if (openPanels.length > 1) {
+            this.outputChannel.appendLine(
+                `[ChatParticipant] ${openPanels.length} capture panels open, none focused — showing QuickPick`
+            );
+            type PanelPick = vscode.QuickPickItem & { filePath: string };
+            const pick = await vscode.window.showQuickPick<PanelPick>(
+                openPanels.map(p => ({
+                    label: p.name,
+                    description: p.filePath,
+                    filePath: p.filePath,
+                })),
+                {
+                    placeHolder: 'Which capture should @nettrace analyze?',
+                    title: 'NetTrace: Multiple captures are open — select one',
+                }
+            );
+            if (!pick) {
+                // User dismissed — treat as no capture (model gets no-capture guidance)
+                return { captures: [], mode: 'single' };
+            }
+            const chosen = allCaptures.find(c => c.filePath === pick.filePath);
+            if (chosen) {
+                this.outputChannel.appendLine(`[ChatParticipant] User chose: ${chosen.name}`);
+                return { captures: [chosen], mode: 'single' };
+            }
         }
 
+        // No panel open at all — return empty so handleRequest delegates to
+        // handleNoCaptureRequest. This prevents silently loading allCaptures[0].
         return { captures: [], mode: 'single' };
     }
 
