@@ -303,38 +303,48 @@ async function activateInternal(context: vscode.ExtensionContext) {
 
     // Delete Capture (from list and optionally from disk)
     context.subscriptions.push(
-        vscode.commands.registerCommand('nettrace.deleteCapture', async (item: any) => {
-            const filePath = item?.capture?.filePath || item?.resourceUri?.fsPath || (typeof item === 'string' ? item : undefined);
-            if (!filePath) { return; }
+        vscode.commands.registerCommand('nettrace.deleteCapture', async (item: any, allSelected?: any[]) => {
+            // Multi-select: allSelected contains all highlighted items; single: just use item
+            const targets: string[] = [];
+            const rawItems = (allSelected && allSelected.length > 0) ? allSelected : [item];
+            for (const raw of rawItems) {
+                const fp = raw?.capture?.filePath || raw?.resourceUri?.fsPath || (typeof raw === 'string' ? raw : undefined);
+                if (fp) { targets.push(fp); }
+            }
+            if (targets.length === 0) { return; }
 
-            const existsOnDisk = fs.existsSync(filePath);
-            const fileName = path.basename(filePath);
+            const multi = targets.length > 1;
+            const label = multi ? `${targets.length} captures` : `"${path.basename(targets[0])}"`;
 
-            const warningItems = existsOnDisk
-                ? ['Delete File + Remove from List', 'Remove from List', 'Cancel']
+            // Check which targets still exist on disk
+            const onDisk = targets.filter(fp => fs.existsSync(fp));
+            const warningItems = onDisk.length > 0
+                ? ['Delete Files + Remove from List', 'Remove from List Only', 'Cancel']
                 : ['Remove from List', 'Cancel'];
 
             const choice = await vscode.window.showWarningMessage(
-                `Delete capture "${fileName}"?`,
+                `Delete ${label}?`,
                 { modal: true },
                 ...warningItems
             );
 
             if (!choice || choice === 'Cancel') { return; }
 
-            if (choice === 'Delete File + Remove from List') {
-                try {
-                    await vscode.workspace.fs.delete(vscode.Uri.file(filePath));
-                    outputChannel.appendLine(`[Capture] Deleted file: ${filePath}`);
-                } catch (e) {
-                    vscode.window.showErrorMessage(`Failed to delete file: ${e}`);
-                    return;
+            if (choice === 'Delete Files + Remove from List' || choice === 'Delete File + Remove from List') {
+                for (const fp of onDisk) {
+                    try {
+                        await vscode.workspace.fs.delete(vscode.Uri.file(fp));
+                        outputChannel.appendLine(`[Capture] Deleted file: ${fp}`);
+                    } catch (e) {
+                        vscode.window.showErrorMessage(`Failed to delete file: ${e}`);
+                    }
                 }
             }
 
-            capturesTree.removeCapture(filePath);
-            streamsTree.setStreams(streamsTree.getStreams().filter(s => s.captureFile !== filePath));
-            outputChannel.appendLine(`[Capture] Removed from list: ${filePath}`);
+            capturesTree.removeCaptures(targets);
+            const removedSet = new Set(targets);
+            streamsTree.setStreams(streamsTree.getStreams().filter(s => !removedSet.has(s.captureFile)));
+            outputChannel.appendLine(`[Capture] Removed from list: ${targets.join(', ')}`);
         })
     );
 

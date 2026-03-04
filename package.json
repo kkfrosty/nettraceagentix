@@ -434,7 +434,8 @@
       "nettrace-explorer": [
         {
           "id": "nettrace.captures",
-          "name": "Captures"
+          "name": "Captures",
+          "canSelectMany": true
         },
         {
           "id": "nettrace.agents",

@@ -95,6 +95,13 @@ export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTree
         this.refresh();
     }
 
+    removeCaptures(filePaths: string[]): void {
+        const toRemove = new Set(filePaths);
+        this.captures = this.captures.filter(c => !toRemove.has(c.filePath));
+        this._persistCaptures();
+        this.refresh();
+    }
+
     getCaptures(): CaptureFile[] {
         return this.captures;
     }
