@@ -405,12 +405,18 @@ export class NetTraceParticipant {
             // to analyze the capture even if the context is large. The budget-cap
             // path should only trigger on subsequent roundtrips after tool results
             // have accumulated and genuinely exhausted the budget.
-            if (remainingBudget < 20000 && roundTrip > 1) {
-                // Less than ~20K tokens left — not enough for a useful tool response.
+            //
+            // Threshold: 10% of the model's total context OR 20K tokens, whichever is larger.
+            // A flat 20K threshold is too small on 128K models where tool results can be 8-15K
+            // each — it would cut off analysis after just 2-3 rounds. Using 10% of modelMax
+            // ensures we always have room for at least one more meaningful tool exchange.
+            const minRemainingBudget = Math.max(20000, Math.floor(modelMax * 0.10));
+            if (remainingBudget < minRemainingBudget && roundTrip > 1) {
+                // Budget near floor — not enough for a useful tool response.
                 // Tell the model to wrap up with what it has.
                 this.outputChannel.appendLine(
-                    `[ChatParticipant] Token budget nearly exhausted (~${estimatedTokens} tokens used, limit ${tokenLimit}). ` +
-                    `Sending final request without tools.`
+                    `[ChatParticipant] Token budget nearly exhausted (~${estimatedTokens} tokens used, limit ${tokenLimit}, ` +
+                    `min threshold ${minRemainingBudget}). Sending final request without tools.`
                 );
                 stream.markdown('\n\n*Context limit approaching — finalizing analysis with data gathered so far.*\n\n');
 

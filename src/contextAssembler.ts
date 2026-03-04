@@ -37,10 +37,24 @@ export class ContextAssembler {
         const modelMax = model?.maxInputTokens;
         const budget = this.getTokenBudget();
         const maxTokens = modelMax || budget.maxInputTokens || 900000;
-        const reserveForResponse = Math.min(budget.reserveForResponse || 100000, Math.floor(maxTokens * 0.1));
+
+        // Reserve headroom for the agentic tool-calling loop that runs AFTER context assembly.
+        // Each round-trip (tool call + result + model reply) adds ~10-15K tokens accumulated in
+        // the message history. For large captures that need sampling, we call getPacketRange for
+        // every uncovered range PLUS targeted analysis calls — easily 8-15 round-trips.
+        //
+        // Small models (< 200K tokens): reserve 35% — tool loop headroom is scarce; cut initial
+        //   context aggressively so there is a real budget for tool interactions.
+        // Large models (200K–500K): reserve 20% — modest headroom; still large enough for context.
+        // Very large models (> 500K): reserve 15% — plenty of room; preserve as much upfront data
+        //   as possible since tools are rarely the bottleneck.
+        const isSmallContextModel = maxTokens < 200000;
+        const isVeryLargeContextModel = maxTokens > 500000;
+        const toolLoopReserveFraction = isSmallContextModel ? 0.35 : isVeryLargeContextModel ? 0.15 : 0.20;
+        const reserveForResponse = Math.floor(maxTokens * toolLoopReserveFraction);
         const availableTokens = maxTokens - reserveForResponse;
 
-        this.outputChannel.appendLine(`[ContextAssembler] Model context window: ${modelMax ? modelMax + ' tokens (from model)' : 'using config default'}, available: ${availableTokens}`);
+        this.outputChannel.appendLine(`[ContextAssembler] Model context window: ${modelMax ? modelMax + ' tokens (from model)' : 'using config default'}, available: ${availableTokens} (reserved ${Math.round(toolLoopReserveFraction * 100)}% = ${reserveForResponse} for tool loop)`);
 
         // 1. System prompt (always included)
         const systemPrompt = this.buildSystemPrompt(agent);
@@ -535,12 +549,27 @@ which frame ranges are covered and which are NOT. You MUST use **nettrace-getPac
 systematically page through the uncovered ranges. Do not skip sections — issues can be anywhere
 in the capture.
 
-### Large Capture Analysis Workflow
-1. Analyze the sampled packets and streams provided
-2. Check the "Uncovered frame ranges" list in the sample header
-3. Use **nettrace-getPacketRange** to fetch each uncovered range (up to 500 frames per call)
-4. For each batch, note any anomalies then move to the next range
-5. After reviewing all ranges, synthesize your findings
+### ⚠️ SAMPLED MODE PROTOCOL — Follow This Exactly
+
+Context tokens are finite. Disobeying this protocol causes the analysis to be cut off before all
+ranges are reviewed. Each tool result accumulates in the conversation history, so the ORDER of
+your calls determines how much you can cover.
+
+**Round 1 — Cover ALL uncovered ranges first.**
+In your VERY FIRST set of tool calls, issue one `nettrace-getPacketRange` call per uncovered range
+listed in the packet data header. Issue them IN PARALLEL (multiple tool calls in the same response).
+**Do NOT make ANY other tool calls in round 1** — no applyFilter, no getConversations, no runTshark.
+Note your preliminary observations on each batch but defer detailed conclusions.
+
+**Round 2+ — Targeted drill-down.**
+Only AFTER all ranges are reviewed in round 1 may you use applyFilter, getStreamDetail, followStream,
+or runTshark to drill into specific patterns. Pick the top 2-3 highest-value calls; stay economical.
+
+**Final round — Synthesize.**
+Write your complete findings, referencing specific frame numbers and streams from ALL ranges you saw.
+
+**Why this matters:** Each round of tool responses consumes ~10-15K context tokens. If you make
+filter/stats calls before covering the uncovered ranges, you will hit the token limit and miss data.
 
 The capture summary includes Wireshark's expert frequency breakdown (retransmissions, RSTs, etc.).
 The conversation list shows all TCP streams ranked by anomaly score.
