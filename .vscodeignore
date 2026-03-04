@@ -17,3 +17,9 @@ node_modules/**
 .vscode-test/**
 **/.DS_Store
 **/Thumbs.db
+**/*.mp4
+**/*.mov
+**/*.avi
+**/*.mkv
+**/*.webm
+**/*.wmv
