@@ -458,18 +458,41 @@ export class CaptureWebviewPanel {
     }
 
     /**
-     * Static method to get the currently focused capture file path.
+     * Static method to get the currently focused (visible) capture file path.
+     *
+     * Returns the path only when a panel is unambiguously determined:
+     *  - A panel is currently visible (user is looking at it)
+     *  - Exactly ONE panel is open (unambiguous even if user switched to Chat)
+     *
+     * Returns undefined when multiple panels are open but none is focused.
+     * Callers that need to present a picker should call getOpenCapturePanels() separately.
      */
     public static getActiveCaptureFile(): string | undefined {
-        // Return the capture from the most recently focused panel
+        // Visible panel — definitive answer
         for (const [filePath, panel] of CaptureWebviewPanel.panels) {
             if (panel.panel.visible) {
                 return filePath;
             }
         }
-        // Fallback: return any open panel
-        const first = CaptureWebviewPanel.panels.values().next();
-        return first.done ? undefined : first.value.currentCapture.filePath;
+        // Exactly one panel open: unambiguous even when the user switched to Chat
+        if (CaptureWebviewPanel.panels.size === 1) {
+            const first = CaptureWebviewPanel.panels.values().next();
+            return first.done ? undefined : first.value.currentCapture.filePath;
+        }
+        // Multiple panels open, none focused — caller must disambiguate
+        return undefined;
+    }
+
+    /**
+     * Returns metadata for every currently open capture panel.
+     * Used to build a disambiguation QuickPick when multiple panels are open.
+     */
+    public static getOpenCapturePanels(): { filePath: string; name: string }[] {
+        const result: { filePath: string; name: string }[] = [];
+        for (const [, viewer] of CaptureWebviewPanel.panels) {
+            result.push({ filePath: viewer.currentCapture.filePath, name: viewer.currentCapture.name });
+        }
+        return result;
     }
 
     /**

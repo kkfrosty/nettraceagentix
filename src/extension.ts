@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as cp from 'child_process';
 import { TsharkRunner } from './parsing/tsharkRunner';
 import { ConfigLoader } from './configLoader';
 import { ContextAssembler } from './contextAssembler';
@@ -15,6 +16,7 @@ import { NetTraceParticipant } from './participant/nettraceParticipant';
 import { registerLMTools } from './tools/lmTools';
 import { CaptureWebviewPanel } from './views/captureWebviewPanel';
 import { CaptureEditorProvider } from './views/captureEditorProvider';
+import { LiveCaptureWebviewPanel } from './views/liveCaptureWebviewPanel';
 import { CaptureFile } from './types';
 import { Logger } from './logger';
 import { getNetTraceRootUri, ensureDefaultFiles, validateCustomStoragePath, cleanupGlobalStorage } from './storage';
@@ -22,6 +24,8 @@ import { getNetTraceRootUri, ensureDefaultFiles, validateCustomStoragePath, clea
 let outputChannel: vscode.OutputChannel;
 let logger: Logger;
 let extensionContext: vscode.ExtensionContext | undefined;
+/** Module-level reference so deactivate() can stop live captures. */
+let activeTsharkRunner: TsharkRunner | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     // Top-level try/catch — ensures we ALWAYS log failures to Debug Console,
@@ -119,6 +123,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
     let workspaceInitializer: WorkspaceInitializer;
     try {
         tsharkRunner = new TsharkRunner(outputChannel);
+        activeTsharkRunner = tsharkRunner; // stored for use in deactivate()
         configLoader = new ConfigLoader(rootUri, outputChannel);
         workspaceInitializer = new WorkspaceInitializer(rootUri, outputChannel);
         logger.endStep('Core Services', true);
@@ -293,6 +298,53 @@ async function activateInternal(context: vscode.ExtensionContext) {
             const filePath = item?.capture?.filePath || item?.resourceUri?.fsPath;
             if (!filePath) { return; }
             await addAndParseCapture(filePath, tsharkRunner, capturesTree, streamsTree);
+        })
+    );
+
+    // Delete Capture (from list and optionally from disk)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.deleteCapture', async (item: any, allSelected?: any[]) => {
+            // Multi-select: allSelected contains all highlighted items; single: just use item
+            const targets: string[] = [];
+            const rawItems = (allSelected && allSelected.length > 0) ? allSelected : [item];
+            for (const raw of rawItems) {
+                const fp = raw?.capture?.filePath || raw?.resourceUri?.fsPath || (typeof raw === 'string' ? raw : undefined);
+                if (fp) { targets.push(fp); }
+            }
+            if (targets.length === 0) { return; }
+
+            const multi = targets.length > 1;
+            const label = multi ? `${targets.length} captures` : `"${path.basename(targets[0])}"`;
+
+            // Check which targets still exist on disk
+            const onDisk = targets.filter(fp => fs.existsSync(fp));
+            const warningItems = onDisk.length > 0
+                ? ['Delete Files + Remove from List', 'Remove from List Only', 'Cancel']
+                : ['Remove from List', 'Cancel'];
+
+            const choice = await vscode.window.showWarningMessage(
+                `Delete ${label}?`,
+                { modal: true },
+                ...warningItems
+            );
+
+            if (!choice || choice === 'Cancel') { return; }
+
+            if (choice === 'Delete Files + Remove from List' || choice === 'Delete File + Remove from List') {
+                for (const fp of onDisk) {
+                    try {
+                        await vscode.workspace.fs.delete(vscode.Uri.file(fp));
+                        outputChannel.appendLine(`[Capture] Deleted file: ${fp}`);
+                    } catch (e) {
+                        vscode.window.showErrorMessage(`Failed to delete file: ${e}`);
+                    }
+                }
+            }
+
+            capturesTree.removeCaptures(targets);
+            const removedSet = new Set(targets);
+            streamsTree.setStreams(streamsTree.getStreams().filter(s => !removedSet.has(s.captureFile)));
+            outputChannel.appendLine(`[Capture] Removed from list: ${targets.join(', ')}`);
         })
     );
 
@@ -797,15 +849,91 @@ async function activateInternal(context: vscode.ExtensionContext) {
         })
     );
 
+    // ── Live Capture commands ──────────────────────────────────────────
+
+    // Open Live Capture panel
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.openLiveCapture', async (prefill?: any) => {
+            if (!tsharkRunner.isAvailable()) {
+                vscode.window.showWarningMessage(
+                    'tshark not found. Install Wireshark and restart VS Code, or set nettrace.tsharkPath in settings.',
+                    'Open Settings'
+                ).then(a => {
+                    if (a === 'Open Settings') { vscode.commands.executeCommand('workbench.action.openSettings', 'nettrace.tsharkPath'); }
+                });
+                return;
+            }
+            await LiveCaptureWebviewPanel.createOrShow(context.extensionUri, tsharkRunner, outputChannel, prefill);
+        })
+    );
+
+    // Stop active live capture
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.stopLiveCapture', () => {
+            const panel = LiveCaptureWebviewPanel.getActivePanel();
+            if (panel) {
+                panel.stopCapture();
+            } else {
+                vscode.window.showInformationMessage('No live capture is currently running.');
+            }
+        })
+    );
+
+    // New Capture — reset the active live capture panel to configure state
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.newLiveCapture', () => {
+            const panel = LiveCaptureWebviewPanel.getActivePanel();
+            if (panel) {
+                panel.newCapture();
+            } else {
+                vscode.commands.executeCommand('nettrace.openLiveCapture');
+            }
+        })
+    );
+
+    // ── End Live Capture commands ──────────────────────────────────────
+
     // Open in Wireshark
     context.subscriptions.push(
         vscode.commands.registerCommand('nettrace.openInWireshark', async (item: any) => {
-            const filePath = item?.capture?.filePath || item?.resourceUri?.fsPath;
+            const filePath = item?.capture?.filePath || item?.resourceUri?.fsPath || (typeof item === 'string' ? item : undefined);
             if (!filePath) { return; }
 
-            const wiresharkPath = vscode.workspace.getConfiguration('nettrace').get<string>('wiresharkPath') || 'wireshark';
-            const terminal = vscode.window.createTerminal({ name: 'Wireshark', hideFromUser: true });
-            terminal.sendText(`"${wiresharkPath}" "${filePath}"`);
+            if (!fs.existsSync(filePath)) {
+                vscode.window.showErrorMessage(`Capture file not found: ${filePath}`);
+                return;
+            }
+
+            const configured = vscode.workspace.getConfiguration('nettrace').get<string>('wiresharkPath', '').trim();
+            const candidates = configured
+                ? [configured]
+                : [
+                    'wireshark',
+                    'C:\\Program Files\\Wireshark\\Wireshark.exe',
+                    'C:\\Program Files (x86)\\Wireshark\\Wireshark.exe',
+                ];
+
+            let launched = false;
+            let lastErr: string | undefined;
+            for (const candidate of candidates) {
+                try {
+                    const child = cp.spawn(candidate, [filePath], {
+                        detached: true,
+                        stdio: 'ignore',
+                        windowsHide: true,
+                    });
+                    child.unref();
+                    launched = true;
+                    outputChannel.appendLine(`[Wireshark] Opened ${filePath} using ${candidate}`);
+                    break;
+                } catch (e) {
+                    lastErr = String(e);
+                }
+            }
+
+            if (!launched) {
+                vscode.window.showErrorMessage(`Could not launch Wireshark. Set nettrace.wiresharkPath in settings. ${lastErr ? `(${lastErr})` : ''}`);
+            }
         })
     );
 
@@ -896,6 +1024,15 @@ async function activateInternal(context: vscode.ExtensionContext) {
         const pcapWatcher = vscode.workspace.createFileSystemWatcher('**/*.{pcap,pcapng,cap,pcpap}');
         pcapWatcher.onDidCreate(async (uri) => {
             logger.info('FileWatcher', `New capture file detected: ${uri.fsPath}`);
+
+            // Ignore live capture output files while they are still being written.
+            // They are parsed by the Live Capture panel itself after capture completes.
+            const normalized = uri.fsPath.replace(/\\/g, '/').toLowerCase();
+            if (normalized.includes('/.nettrace/captures/live/')) {
+                logger.debug('FileWatcher', `Skipping auto-parse for live capture output: ${uri.fsPath}`);
+                return;
+            }
+
             const autoParse = vscode.workspace.getConfiguration('nettrace').get<boolean>('autoParseOnAdd', true);
             if (autoParse) {
                 await addAndParseCapture(uri.fsPath, tsharkRunner, capturesTree, streamsTree);
@@ -1159,6 +1296,11 @@ export async function deactivate() {
                 });
             }
         }
+
+        // Stop any live packet captures so tshark processes don't outlive VS Code.
+        try {
+            activeTsharkRunner?.stopAllLiveCaptures();
+        } catch { /* ignore */ }
 
         log.divider('NetTrace Deactivated');
     } catch {

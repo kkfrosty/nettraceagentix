@@ -5,3 +5,18 @@ Release/
 .vscode-test/
 .DS_Store
 Thumbs.db
+
+# Media / large binary files
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Live capture output — contain packet data, never commit
+# (folder path is intentionally NOT ignored so Explorer shows the live/ folder)
+**/.nettrace/captures/*.pcap
+**/.nettrace/captures/*.pcapng
+**/.nettrace/captures/*.pcpap
+**/.nettrace/captures/live/*.pcap
+**/.nettrace/captures/live/*.pcapng
+**/.nettrace/captures/live/*.pcpap

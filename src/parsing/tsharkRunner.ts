@@ -1,15 +1,24 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
-import { CaptureSummary, TcpStream, StreamAnomaly, ExpertInfoSummary, ExpertInfoEntry, CaptureSignals } from '../types';
+import { CaptureSummary, TcpStream, StreamAnomaly, ExpertInfoSummary, ExpertInfoEntry, CaptureSignals, NetworkInterface, LiveCaptureSession, LivePreviewPacket } from '../types';
 
 /**
  * Manages tshark execution and pcap file parsing.
  * This is the core engine that converts binary pcap data into structured text for LLM analysis.
  */
+/** Internal record that ties a live capture session ID to its child process. */
+interface LiveCaptureProcess {
+    proc: cp.ChildProcess;
+    previewProc?: cp.ChildProcess;
+    session: LiveCaptureSession;
+}
+
 export class TsharkRunner {
     private tsharkPath: string | undefined;
     private outputChannel: vscode.OutputChannel;
+    /** Active live capture processes keyed by session ID. */
+    private liveCaptures = new Map<string, LiveCaptureProcess>();
 
     constructor(outputChannel: vscode.OutputChannel) {
         this.outputChannel = outputChannel;
@@ -319,7 +328,7 @@ export class TsharkRunner {
      * Get packets as structured data for the webview panel.
      * Returns pipe-separated fields: frame.number|time|src|dst|protocol|length|info|tcp.stream
      */
-    async getPacketsForDisplay(captureFile: string, filter: string = ''): Promise<string> {
+    async getPacketsForDisplay(captureFile: string, filter: string = '', maxPackets?: number): Promise<string> {
         const args = [
             '-r', captureFile,
             '-T', 'fields',
@@ -337,6 +346,11 @@ export class TsharkRunner {
 
         if (filter && filter.trim()) {
             args.splice(2, 0, '-Y', filter);
+        }
+
+        // Limit packet count during live capture to keep UI responsive.
+        if (maxPackets && maxPackets > 0) {
+            args.push('-c', String(maxPackets));
         }
 
         return this.runTshark(args);
@@ -424,6 +438,372 @@ export class TsharkRunner {
      */
     async runCustomCommand(captureFile: string, args: string[]): Promise<string> {
         return this.runTshark(['-r', captureFile, ...args]);
+    }
+
+    // ─── Live Capture ─────────────────────────────────────────────────────
+
+    /**
+     * List all network interfaces available for live capture.
+     * Runs `tshark -D` and parses the numbered interface list.
+     */
+    async listNetworkInterfaces(): Promise<NetworkInterface[]> {
+        if (!this.tsharkPath) {
+            throw new Error('tshark not found. Install Wireshark or configure nettrace.tsharkPath.');
+        }
+
+        const output = await new Promise<string>((resolve, reject) => {
+            cp.exec(`"${this.tsharkPath}" -D`, { timeout: 10000 }, (error, stdout, stderr) => {
+                // tshark -D may exit 0 or non-zero depending on platform/permissions;
+                // stdout always contains the interface list when successful.
+                if (stdout && stdout.trim()) {
+                    resolve(stdout + stderr);
+                } else {
+                    reject(new Error(stderr || (error?.message ?? 'tshark -D returned no output')));
+                }
+            });
+        });
+
+        const interfaces: NetworkInterface[] = [];
+        const loopbackKeywords = ['loopback', 'lo ', 'npcap loopback', 'npf_loopback', '\\device\\npf_lo'];
+
+        for (const rawLine of output.split('\n')) {
+            const line = rawLine.trim(); // strip \r on Windows CRLF output
+            // Lines look like:  1. \Device\NPF_{GUID} (Friendly Name)
+            //                   2. eth0
+            //                   3. lo (Loopback)
+            const m = line.match(/^(\d+)\. (\S+)(?:\s+(.*))?$/);
+            if (!m) { continue; }
+
+            const id = parseInt(m[1]);
+            const name = m[2].trim();
+            // Description is in parentheses on the same line, or empty
+            const rawDesc = (m[3] || '').trim().replace(/^\(|\)$/g, '');
+            const displayName = rawDesc || name;
+
+            const nameLower = (name + ' ' + displayName).toLowerCase();
+            const isLoopback = loopbackKeywords.some(k => nameLower.includes(k));
+
+            interfaces.push({ id, name, displayName, isLoopback });
+        }
+
+        this.outputChannel.appendLine(`[TsharkRunner] listNetworkInterfaces: found ${interfaces.length} interfaces`);
+        return interfaces;
+    }
+
+    /**
+     * Start a live packet capture on the given interface, writing packets to outputFile.
+     * Returns the LiveCaptureSession immediately (status: 'starting').
+     * The `onUpdate` callback is called each time tshark reports a new packet count or error.
+     *
+     * The child process handle is stored internally — call `stopLiveCapture(session.id)` to end it.
+     */
+    startLiveCapture(
+        session: LiveCaptureSession,
+        onUpdate: (session: LiveCaptureSession) => void
+    ): void {
+        if (!this.tsharkPath) {
+            session.status = 'error';
+            session.errorMessage = 'tshark not found. Install Wireshark or configure nettrace.tsharkPath.';
+            onUpdate(session);
+            return;
+        }
+
+        const args: string[] = ['-i', session.interfaceName, '-w', session.outputFilePath];
+        if (session.captureFilter.trim()) {
+            args.push('-f', session.captureFilter.trim());
+        }
+
+        this.outputChannel.appendLine(`[TsharkRunner] startLiveCapture: ${this.tsharkPath} ${args.join(' ')}`);
+
+        const proc = cp.spawn(this.tsharkPath, args, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+        });
+
+        this.liveCaptures.set(session.id, { proc, session });
+        session.status = 'capturing';
+        onUpdate(session);
+
+        // tshark writes progress lines to stderr, e.g.:
+        //   "Capturing on 'Wi-Fi'"
+        //   "Packets: 1234"
+        //   "Packets captured: 5678" (on stop)
+        let stderrBuf = '';
+        let privilegeCheckDone = false;
+        const privilegePatterns = [
+            /you don.t have permission/i,
+            /permission denied/i,
+            /you need to be root/i,
+            /are you running as root/i,
+            /the requested operation requires elevation/i,
+            /you need to be a member of the .administrators./i,
+            /access is denied/i,
+            /couldn.t run \/usr\/bin\/dumpcap/i,
+        ];
+
+        proc.stderr?.on('data', (chunk: Buffer) => {
+            const text = chunk.toString();
+            stderrBuf += text;
+            this.outputChannel.appendLine(`[LiveCapture] stderr: ${text.trimEnd()}`);
+
+            // Check for privilege errors in first few seconds
+            if (!privilegeCheckDone) {
+                for (const pat of privilegePatterns) {
+                    if (pat.test(stderrBuf)) {
+                        privilegeCheckDone = true;
+                        session.status = 'error';
+                        session.errorMessage = this.buildPrivilegeErrorMessage(stderrBuf);
+                        onUpdate(session);
+                        break;
+                    }
+                }
+            }
+
+            // Parse "Packets: N" progress lines
+            const countMatch = text.match(/Packets(?:\s+captured)?:\s*(\d+)/i);
+            if (countMatch) {
+                session.packetCount = parseInt(countMatch[1]);
+                if (session.status === 'capturing') {
+                    onUpdate(session);
+                }
+            }
+        });
+
+        // Main capture process stdout is not used for packet previews when -w is enabled.
+        proc.stdout?.on('data', (chunk: Buffer) => {
+            const text = chunk.toString().trim();
+            if (text) {
+                this.outputChannel.appendLine(`[LiveCapture] capture stdout: ${text}`);
+            }
+        });
+
+        // Separate preview process for real-time decoded packet rows.
+        const previewArgs: string[] = [
+            '-l',
+            '-n',
+            '-i', session.interfaceName,
+            '-T', 'fields',
+            '-e', 'frame.number',
+            '-e', 'frame.time_relative',
+            '-e', '_ws.col.Source',
+            '-e', '_ws.col.Destination',
+            '-e', '_ws.col.Protocol',
+            '-e', 'frame.len',
+            '-e', '_ws.col.Info',
+            '-e', 'tcp.stream',
+            '-E', 'header=n',
+            '-E', 'separator=|',
+        ];
+        if (session.captureFilter.trim()) {
+            previewArgs.push('-f', session.captureFilter.trim());
+        }
+
+        this.outputChannel.appendLine(`[TsharkRunner] startLivePreview: ${this.tsharkPath} ${previewArgs.join(' ')}`);
+        const previewProc = cp.spawn(this.tsharkPath, previewArgs, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+        });
+        const entry = this.liveCaptures.get(session.id);
+        if (entry) {
+            entry.previewProc = previewProc;
+        }
+
+        let previewStdoutBuf = '';
+        previewProc.stdout?.on('data', (chunk: Buffer) => {
+            const text = chunk.toString();
+            previewStdoutBuf += text;
+
+            let lineBreak = previewStdoutBuf.indexOf('\n');
+            while (lineBreak >= 0) {
+                const line = previewStdoutBuf.slice(0, lineBreak).trim();
+                previewStdoutBuf = previewStdoutBuf.slice(lineBreak + 1);
+
+                const packet = this.parseLivePreviewPacket(line);
+                if (packet) {
+                    if (!session.livePreviewPackets) {
+                        session.livePreviewPackets = [];
+                    }
+                    session.livePreviewPackets.push(packet);
+                    if (session.livePreviewPackets.length <= 3) {
+                        this.outputChannel.appendLine(
+                            `[LiveCapture] preview parsed #${packet.num} ${packet.src} -> ${packet.dst} ${packet.proto} ${packet.len}`
+                        );
+                    }
+                    if (session.livePreviewPackets.length > 3000) {
+                        session.livePreviewPackets = session.livePreviewPackets.slice(-3000);
+                    }
+                    if (packet.num > session.packetCount) {
+                        session.packetCount = packet.num;
+                    }
+                    if (session.status === 'capturing') {
+                        onUpdate(session);
+                    }
+                }
+
+                lineBreak = previewStdoutBuf.indexOf('\n');
+            }
+        });
+
+        previewProc.stderr?.on('data', (chunk: Buffer) => {
+            const text = chunk.toString().trimEnd();
+            if (text) {
+                this.outputChannel.appendLine(`[LiveCapture] preview stderr: ${text}`);
+            }
+        });
+
+        previewProc.on('error', (err) => {
+            this.outputChannel.appendLine(`[LiveCapture] Preview spawn error: ${err.message}`);
+        });
+
+        previewProc.on('close', (code) => {
+            this.outputChannel.appendLine(`[LiveCapture] Preview process closed (code ${code}), session ${session.id}`);
+        });
+
+        proc.on('error', (err) => {
+            this.outputChannel.appendLine(`[LiveCapture] Spawn error: ${err.message}`);
+            this.liveCaptures.delete(session.id);
+            session.status = 'error';
+            session.errorMessage = err.message;
+            onUpdate(session);
+        });
+
+        proc.on('close', (code) => {
+            this.outputChannel.appendLine(`[LiveCapture] Process closed (code ${code}), session ${session.id}`);
+            this.liveCaptures.delete(session.id);
+            if (session.status !== 'error') {
+                session.status = 'stopped';
+                session.stopTime = new Date();
+            }
+            onUpdate(session);
+        });
+    }
+
+    /**
+     * Stop a live capture by session ID.
+     * Sends SIGTERM (or kills the process on Windows) and removes it from the internal map.
+     * The process 'close' event will fire and set session.status = 'stopped' via the onUpdate callback.
+     */
+    stopLiveCapture(sessionId: string): void {
+        const entry = this.liveCaptures.get(sessionId);
+        if (!entry) {
+            this.outputChannel.appendLine(`[TsharkRunner] stopLiveCapture: session ${sessionId} not found (already stopped?)`);
+            return;
+        }
+        entry.session.status = 'stopping';
+        this.outputChannel.appendLine(`[TsharkRunner] stopLiveCapture: stopping session ${sessionId} gracefully`);
+
+        // On Windows, tshark uses the Console API for CTRL+C — stdin writes have no effect
+        // when the process has no console (windowsHide:true).  Use proc.kill() for immediate
+        // termination; pcapng files are written with periodic flushes so the output is intact.
+        const stopProc = (proc: cp.ChildProcess, label: string) => {
+            try {
+                if (proc.stdin && !proc.stdin.destroyed) {
+                    proc.stdin.end();
+                }
+                proc.kill();
+            } catch (e) {
+                this.outputChannel.appendLine(`[TsharkRunner] stopLiveCapture: ${label} stop error: ${e}`);
+            }
+        };
+
+        stopProc(entry.proc, 'capture');
+        if (entry.previewProc) {
+            stopProc(entry.previewProc, 'preview');
+        }
+    }
+
+    /** Whether a live capture session is currently running. */
+    isLiveCaptureActive(sessionId: string): boolean {
+        return this.liveCaptures.has(sessionId);
+    }
+
+    /** Stop all live captures (called on extension deactivation). */
+    stopAllLiveCaptures(): void {
+        for (const [id] of this.liveCaptures) {
+            this.stopLiveCapture(id);
+        }
+    }
+
+    private buildPrivilegeErrorMessage(stderr: string): string {
+        const isWindows = process.platform === 'win32';
+        if (isWindows) {
+            return (
+                'Live capture requires elevated privileges on Windows.\n\n' +
+                'Fix options:\n' +
+                '• Run VS Code as Administrator (right-click → Run as administrator)\n' +
+                '• Or reinstall Npcap with "Install Npcap in WinPcap API-compatible Mode" and grant your user capture permissions\n\n' +
+                `tshark output: ${stderr.trim()}`
+            );
+        } else {
+            return (
+                'Live capture requires elevated privileges.\n\n' +
+                'Fix options:\n' +
+                '• Add your user to the wireshark group: sudo usermod -a -G wireshark $USER  (then log out and back in)\n' +
+                '• Or run VS Code as root (not recommended for daily use)\n\n' +
+                `tshark output: ${stderr.trim()}`
+            );
+        }
+    }
+
+    private parseLivePreviewPacket(line: string): LivePreviewPacket | undefined {
+        if (!line) {
+            return undefined;
+        }
+        const trimmed = line.trim();
+
+        // Preferred format: frame.number|time|src|dst|proto|len|info|stream
+        if (trimmed.includes('|')) {
+            const fields = trimmed.split('|');
+            if (fields.length >= 7) {
+                const num = parseInt((fields[0] || '').trim(), 10);
+                if (!Number.isNaN(num)) {
+                    return {
+                        num,
+                        time: (fields[1] || '').trim(),
+                        src: (fields[2] || '').trim(),
+                        dst: (fields[3] || '').trim(),
+                        proto: (fields[4] || '').trim(),
+                        len: (fields[5] || '').trim(),
+                        info: fields.slice(6, Math.max(7, fields.length - 1)).join('|').trim(),
+                        stream: (fields[fields.length - 1] || '').trim(),
+                    };
+                }
+            }
+        }
+
+        // Fallback A: tshark summary with explicit arrow
+        const m = trimmed.match(/^\s*(\d+)\s+([\d.]+)\s+(.+?)\s+(?:→|->)\s+(.+?)\s+([A-Za-z0-9_.-]+)\s+(\d+)\s+(.*)$/);
+        if (m) {
+            return {
+                num: parseInt(m[1], 10),
+                time: m[2] || '',
+                src: m[3] || '',
+                dst: m[4] || '',
+                proto: m[5] || '',
+                len: m[6] || '',
+                info: m[7] || '',
+                stream: '',
+            };
+        }
+
+        // Fallback B: default tshark columns separated by 2+ spaces:
+        // No.  Time  Source  Destination  Protocol  Length  Info
+        const cols = trimmed.split(/\s{2,}/).map(c => c.trim()).filter(Boolean);
+        if (cols.length >= 7 && /^\d+$/.test(cols[0])) {
+            const num = parseInt(cols[0], 10);
+            return {
+                num,
+                time: cols[1] || '',
+                src: cols[2] || '',
+                dst: cols[3] || '',
+                proto: cols[4] || '',
+                len: cols[5] || '',
+                info: cols.slice(6).join('  '),
+                stream: '',
+            };
+        }
+
+        return undefined;
     }
 
     // ─── Internal Execution ───────────────────────────────────────────────

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { TsharkRunner } from '../parsing/tsharkRunner';
 import { CapturesTreeProvider } from '../views/capturesTreeProvider';
 import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
+import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
 import { ConfigLoader } from '../configLoader';
 
 /**
@@ -39,7 +40,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
+                        new vscode.LanguageModelTextPart(buildNoCaptureError())
                     ]);
                 }
 
@@ -69,7 +70,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
+                        new vscode.LanguageModelTextPart(buildNoCaptureError())
                     ]);
                 }
 
@@ -109,7 +110,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
+                        new vscode.LanguageModelTextPart(buildNoCaptureError())
                     ]);
                 }
 
@@ -140,7 +141,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
+                        new vscode.LanguageModelTextPart(buildNoCaptureError())
                     ]);
                 }
 
@@ -207,7 +208,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
+                        new vscode.LanguageModelTextPart(buildNoCaptureError())
                     ]);
                 }
 
@@ -261,7 +262,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
+                        new vscode.LanguageModelTextPart(buildNoCaptureError())
                     ]);
                 }
 
@@ -385,7 +386,7 @@ export function registerLMTools(
 
                 if (!file) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart('Error: No capture file available. The user must open a .pcap/.pcapng/.pcpap file first.')
+                        new vscode.LanguageModelTextPart(buildNoCaptureError())
                     ]);
                 }
 
@@ -575,36 +576,181 @@ export function registerLMTools(
             }
         })
     );
+
+    // ─── Start Live Capture ───────────────────────────────────────────────
+    context.subscriptions.push(
+        vscode.lm.registerTool('nettrace-startCapture', {
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<{
+                captureFilter?: string;
+                interfaceHint?: string;
+                autoStart?: boolean;
+            }>, token) {
+                const { captureFilter = '', interfaceHint = '', autoStart = false } = options.input;
+
+                outputChannel.appendLine(`[Tool] startCapture: filter="${captureFilter}", interfaceHint="${interfaceHint}", autoStart=${autoStart}`);
+
+                // Make sure tshark is available before trying to list interfaces.
+                if (!tsharkRunner.isAvailable()) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(
+                            'Live capture is unavailable: tshark not found. '
+                            + 'The user needs to install Wireshark or configure the nettrace.tsharkPath setting.'
+                        )
+                    ]);
+                }
+
+                // Enumerate interfaces so we can resolve the hint.
+                let interfaces: import('../types').NetworkInterface[] = [];
+                try {
+                    interfaces = await tsharkRunner.listNetworkInterfaces();
+                } catch (e) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(
+                            `Could not list network interfaces: ${e}\n\n` +
+                            'This often means tshark cannot discover interfaces due to permissions. ' +
+                            'Try running VS Code as administrator (Windows) or checking wireshark group membership (Linux/macOS).'
+                        )
+                    ]);
+                }
+
+                if (interfaces.length === 0) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('No network interfaces found. Is Wireshark/tshark installed and accessible?')
+                    ]);
+                }
+
+                // Resolve the best interface from the hint.
+                const nonLoopback = interfaces.filter(i => !i.isLoopback);
+                let resolved: import('../types').NetworkInterface | undefined;
+
+                if (interfaceHint.trim()) {
+                    const hintLower = interfaceHint.toLowerCase();
+                    // Exact name match
+                    resolved = interfaces.find(i => i.name.toLowerCase() === hintLower);
+                    // Friendly display name match
+                    if (!resolved) { resolved = interfaces.find(i => i.displayName.toLowerCase() === hintLower); }
+                    // Substring match in display name
+                    if (!resolved) { resolved = interfaces.find(i => i.displayName.toLowerCase().includes(hintLower)); }
+                    // IP fragment match (user said 'capture on 192.168.1.x')
+                    if (!resolved) { resolved = nonLoopback[0]; }
+                } else {
+                    // No hint: prefer first non-loopback interface (usually the main network card).
+                    resolved = nonLoopback[0] ?? interfaces[0];
+                }
+
+                const ifaceSummary = resolved
+                    ? `${resolved.displayName} (${resolved.name})`
+                    : 'first available interface';
+
+                // Open the Live Capture panel via the registered command,
+                // passing prefill options. The panel manages its own process lifecycle.
+                await vscode.commands.executeCommand('nettrace.openLiveCapture', {
+                    suggestedInterface: resolved?.name,
+                    captureFilter,
+                    autoStart,
+                });
+
+                const actionLine = autoStart
+                    ? `Capture has been **started** on ${ifaceSummary}.`
+                    : `Live Capture panel is **ready** on ${ifaceSummary}. Click **▶ Start** to begin capturing.`;
+
+                const filterLine = captureFilter
+                    ? `\n- **Capture filter (BPF):** \`${captureFilter}\``
+                    : '';
+
+                const ifaceList = interfaces.slice(0, 6)
+                    .map(i => `  ${i.id}. ${i.displayName}${i.isLoopback ? ' (loopback)' : ''}`)
+                    .join('\n');
+
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(
+                        `${actionLine}${filterLine}\n\n` +
+                        `Available interfaces (${interfaces.length} total):\n${ifaceList}\n\n` +
+                        `The capture panel allows you to stop, clear, and re-capture at any time. ` +
+                        `When stopped, click **🤖 Analyze with AI** to diagnose the captured traffic.`
+                    )
+                ]);
+            }
+        })
+    );
 }
 
 /**
- * Get the capture file to analyze.
- * Priority: 1) Active webview panel (the capture the user is looking at)
- *           2) First capture in the tree (fallback)
+ * Build a human-readable (and model-readable) error message for when no unambiguous
+ * capture file can be resolved. Tells the model exacty what files are open so it can
+ * either pass captureFile explicitly or advise the user to focus the right panel.
+ */
+function buildNoCaptureError(): string {
+    const openPanels = CaptureWebviewPanel.getOpenCapturePanels();
+    if (openPanels.length > 1) {
+        const names = openPanels.map(p => `"${p.name}"`).join(', ');
+        const paths = openPanels.map(p => p.filePath).join(', ');
+        return (
+            `Multiple capture files are open (${names}) but none is currently focused in the viewer. ` +
+            `To disambiguate, re-invoke this tool with the \`captureFile\` parameter set to the ` +
+            `full path of the capture you want to analyze. Available paths: ${paths}`
+        );
+    }
+    return (
+        'No capture file is open in the viewer. ' +
+        'The user must click a capture in the NetTrace sidebar to open it, ' +
+        'or run NetTrace: Import Capture File. ' +
+        'Alternatively, use nettrace-startCapture to begin a live capture.'
+    );
+}
+
+/**
+ * Get the capture file to analyze for tool invocations.
+ *
+ * Priority:
+ * 1. Active/stopped live capture session — tools MUST target this file when a live
+ *    capture has been run, otherwise they fall back to a stale regular capture.
+ * 2. Visible/focused CaptureWebviewPanel, OR the only open panel if exactly one exists.
+ * 3. Ambiguous (multiple panels open, none focused) → returns undefined; caller emits
+ *    buildNoCaptureError() so the model knows how to recover.
+ * 4. No viewer open → client-role or first capture in tree.
  */
 function getDefaultCaptureFile(capturesTree: CapturesTreeProvider, outputChannel: vscode.OutputChannel): string | undefined {
-    // 1. Always prefer the capture visible in the active viewer panel
+    // 1. Live capture takes absolute priority — if there is an active or recently-stopped
+    //    live session, all tshark tools must target that file. Without this check, tools
+    //    fall through to CaptureWebviewPanel and end up analyzing the wrong file.
+    const liveFile = LiveCaptureWebviewPanel.getActiveCaptureFile();
+    if (liveFile) {
+        outputChannel.appendLine(`[Tool] Using live capture file: ${liveFile}`);
+        return liveFile;
+    }
+
+    // 2. Visible/focused panel or the only open panel (unambiguous)
     const activeFile = CaptureWebviewPanel.getActiveCaptureFile();
     if (activeFile) {
         outputChannel.appendLine(`[Tool] Using active viewer capture: ${activeFile}`);
         return activeFile;
     }
 
+    // 3. Multiple panels open but none focused — caller must return buildNoCaptureError()
+    const openPanels = CaptureWebviewPanel.getOpenCapturePanels();
+    if (openPanels.length > 1) {
+        outputChannel.appendLine(
+            `[Tool] ${openPanels.length} capture panels open but none focused — returning undefined (caller will error)`
+        );
+        return undefined;
+    }
+
     const captures = capturesTree.getCaptures();
 
-    // 2. In dual-capture mode with no active panel, default to the client-role capture
+    // 4. In dual-capture mode with no active panel, default to the client-role capture
     const clientCapture = captures.find(c => c.role === 'client');
     if (clientCapture) {
         outputChannel.appendLine(`[Tool] No active viewer — using client-role capture: ${clientCapture.filePath}`);
         return clientCapture.filePath;
     }
 
-    // 3. Final fallback: first capture in tree
-    if (captures.length > 0) {
-        outputChannel.appendLine(`[Tool] No active viewer — falling back to first capture: ${captures[0].filePath}`);
+    // 5. Single capture in tree with no viewer open — only safe fallback
+    if (captures.length === 1) {
+        outputChannel.appendLine(`[Tool] Single capture in tree (no viewer): ${captures[0].filePath}`);
         return captures[0].filePath;
     }
 
-    outputChannel.appendLine(`[Tool] No capture file available`);
+    outputChannel.appendLine(`[Tool] No unambiguous capture file — returning undefined`);
     return undefined;
 }

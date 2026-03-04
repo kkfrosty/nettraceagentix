@@ -19,6 +19,66 @@ export interface CaptureFile {
     role?: 'client' | 'server';
 }
 
+// ─── Live Capture Types ───────────────────────────────────────────────────
+
+/**
+ * A network interface available for live packet capture.
+ * Populated by `tshark -D`.
+ */
+export interface NetworkInterface {
+    /** tshark interface index (1-based, as reported by tshark -D) */
+    id: number;
+    /** Raw interface name used with tshark -i (e.g. \Device\NPF_{GUID} or eth0) */
+    name: string;
+    /** Human-readable description (e.g. "Intel(R) Wi-Fi 6 AX201 160MHz") */
+    displayName: string;
+    /** Whether this is a loopback interface */
+    isLoopback: boolean;
+}
+
+export interface LivePreviewPacket {
+    num: number;
+    time: string;
+    src: string;
+    dst: string;
+    proto: string;
+    len: string;
+    info: string;
+    stream?: string;
+}
+
+/**
+ * A live packet capture session managed by the extension.
+ * The ChildProcess handle is kept inside TsharkRunner — this type
+ * captures only the user-visible state.
+ */
+export interface LiveCaptureSession {
+    /** Unique session identifier (used to look up the child process in TsharkRunner) */
+    id: string;
+    /** tshark interface name used for capture */
+    interfaceName: string;
+    /** Friendly display name for the interface */
+    interfaceDisplayName: string;
+    /** BPF capture filter applied at OS level (empty string = no filter) */
+    captureFilter: string;
+    /** Display filter applied to the live viewer (not the OS capture) */
+    displayFilter: string;
+    /** Absolute path of the output pcapng file being written */
+    outputFilePath: string;
+    /** Current state of the capture process */
+    status: 'starting' | 'capturing' | 'stopping' | 'stopped' | 'error';
+    /** Total packets captured so far (updated via tshark stderr progress lines) */
+    packetCount: number;
+    /** When the capture started */
+    startTime: Date;
+    /** When the capture stopped (only set after stop) */
+    stopTime?: Date;
+    /** Error message if status === 'error' */
+    errorMessage?: string;
+    /** Optional rolling live packet preview parsed from tshark stdout while capture is running */
+    livePreviewPackets?: LivePreviewPacket[];
+}
+
 export interface CaptureSummary {
     /** Total number of packets */
     packetCount: number;
