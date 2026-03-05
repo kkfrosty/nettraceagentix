@@ -106,6 +106,76 @@ export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTree
         return this.captures;
     }
 
+    // ─── Panel Registry (single source of truth) ─────────────────────────
+
+    /**
+     * Mark a capture as open in a specific panel type.
+     * If the file isn't in the tree yet (e.g. live capture), it's added automatically.
+     */
+    markOpenInPanel(filePath: string, panelType: 'viewer' | 'live', sizeBytes?: number): void {
+        const path = require('path') as typeof import('path');
+
+        // Only one live capture can be active at a time.
+        // Clear openInPanel on any previous live entry so getActiveCapture()
+        // always returns the LATEST live capture, not a stale empty one.
+        if (panelType === 'live') {
+            for (const c of this.captures) {
+                if (c.openInPanel === 'live' && c.filePath !== filePath) {
+                    c.openInPanel = undefined;
+                }
+            }
+        }
+
+        let capture = this.captures.find(c => c.filePath === filePath);
+        if (!capture) {
+            capture = {
+                filePath,
+                name: path.basename(filePath),
+                sizeBytes: sizeBytes ?? 0,
+                parsed: false,
+            };
+            this.captures.push(capture);
+            this._persistCaptures();
+        }
+        capture.openInPanel = panelType;
+        this.refresh();
+    }
+
+    /**
+     * Mark a capture as no longer open in any panel.
+     */
+    markClosedInPanel(filePath: string): void {
+        const capture = this.captures.find(c => c.filePath === filePath);
+        if (capture) {
+            capture.openInPanel = undefined;
+            this.refresh();
+        }
+    }
+
+    /**
+     * Get the single unambiguous active capture.
+     * Returns the CaptureFile when exactly one capture is open in a panel,
+     * or when a live-panel capture exists (live takes priority).
+     * Returns undefined when zero or 2+ captures are open.
+     */
+    getActiveCapture(): CaptureFile | undefined {
+        const openCaptures = this.captures.filter(c => c.openInPanel);
+        // Live panel always takes priority
+        const liveCapture = openCaptures.find(c => c.openInPanel === 'live');
+        if (liveCapture) { return liveCapture; }
+        // Exactly one viewer panel → unambiguous
+        if (openCaptures.length === 1) { return openCaptures[0]; }
+        // Zero or 2+ → ambiguous
+        return undefined;
+    }
+
+    /**
+     * Get all captures that are currently open in any panel.
+     */
+    getOpenCaptures(): CaptureFile[] {
+        return this.captures.filter(c => c.openInPanel);
+    }
+
     getTreeItem(element: CaptureTreeItem): vscode.TreeItem {
         return element;
     }
@@ -187,13 +257,18 @@ export class CapturesTreeProvider implements vscode.TreeDataProvider<CaptureTree
         // Note: Do NOT set item.resourceUri — it causes VS Code to try opening
         // the binary .pcap file as text on double-click instead of using our command.
 
-        // Description shows size and role
+        // Description shows size, role and panel state
         const sizeMB = (capture.sizeBytes / (1024 * 1024)).toFixed(1);
         const roleLabel = capture.role ? ` [${capture.role}]` : '';
-        item.description = `${sizeMB} MB${roleLabel}`;
+        const panelLabel = capture.openInPanel === 'live' ? ' ⏺ live'
+            : capture.openInPanel === 'viewer' ? ' 👁 open'
+            : '';
+        item.description = `${sizeMB} MB${roleLabel}${panelLabel}`;
 
-        // Icon based on parse state and role
-        if (capture.role === 'client') {
+        // Icon based on parse state, role, and panel state
+        if (capture.openInPanel === 'live') {
+            item.iconPath = new vscode.ThemeIcon('record', new vscode.ThemeColor('charts.red'));
+        } else if (capture.role === 'client') {
             item.iconPath = new vscode.ThemeIcon('vm');
         } else if (capture.role === 'server') {
             item.iconPath = new vscode.ThemeIcon('server');

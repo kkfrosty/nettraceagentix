@@ -17,6 +17,13 @@ export interface CaptureFile {
     summary?: CaptureSummary;
     /** Role in client/server comparison */
     role?: 'client' | 'server';
+    /**
+     * Which panel this capture is currently open in.
+     *  - 'viewer'  → regular CaptureWebviewPanel
+     *  - 'live'    → LiveCaptureWebviewPanel
+     *  - undefined → not open in any panel
+     */
+    openInPanel?: 'viewer' | 'live';
 }
 
 // ─── Live Capture Types ───────────────────────────────────────────────────

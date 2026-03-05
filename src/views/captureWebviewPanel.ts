@@ -12,6 +12,12 @@ export class CaptureWebviewPanel {
     public static readonly viewType = 'nettrace.captureViewer';
     private static panels = new Map<string, CaptureWebviewPanel>();
 
+    /**
+     * Callback fired when a viewer panel opens or closes.
+     * Set once by extension.ts so the captures tree stays in sync.
+     */
+    public static onPanelChange: ((filePath: string, event: 'opened' | 'closed', panelType: 'viewer') => void) | undefined;
+
     private readonly panel: vscode.WebviewPanel;
     private readonly extensionUri: vscode.Uri;
     private disposables: vscode.Disposable[] = [];
@@ -46,6 +52,7 @@ export class CaptureWebviewPanel {
 
         const viewer = new CaptureWebviewPanel(panel, extensionUri, capture, tsharkRunner, outputChannel);
         CaptureWebviewPanel.panels.set(capture.filePath, viewer);
+        CaptureWebviewPanel.onPanelChange?.(capture.filePath, 'opened', 'viewer');
         return viewer;
     }
 
@@ -116,6 +123,7 @@ export class CaptureWebviewPanel {
         this.panel.onDidDispose(
             () => {
                 CaptureWebviewPanel.panels.delete(capture.filePath);
+                CaptureWebviewPanel.onPanelChange?.(capture.filePath, 'closed', 'viewer');
                 this.dispose();
             },
             null,

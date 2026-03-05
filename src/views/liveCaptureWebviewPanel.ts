@@ -34,6 +34,12 @@ export class LiveCaptureWebviewPanel {
     /** Last output file path from any live capture session — persists after panel loses focus. */
     private static lastCaptureFilePath: string | undefined;
 
+    /**
+     * Callback fired when a live panel's capture file changes.
+     * Set once by extension.ts so the captures tree stays in sync.
+     */
+    public static onPanelChange: ((filePath: string, event: 'opened' | 'closed', panelType: 'live') => void) | undefined;
+
     private readonly panel: vscode.WebviewPanel;
     private readonly extensionUri: vscode.Uri;
     private disposables: vscode.Disposable[] = [];
@@ -142,6 +148,10 @@ export class LiveCaptureWebviewPanel {
 
         this.panel.onDidDispose(() => {
             this.teardown();
+            // Notify tree that this file is no longer open
+            if (LiveCaptureWebviewPanel.lastCaptureFilePath) {
+                LiveCaptureWebviewPanel.onPanelChange?.(LiveCaptureWebviewPanel.lastCaptureFilePath, 'closed', 'live');
+            }
             LiveCaptureWebviewPanel.instance = undefined;
             LiveCaptureWebviewPanel.lastCaptureFilePath = undefined;
         }, null, this.disposables);
@@ -302,6 +312,7 @@ export class LiveCaptureWebviewPanel {
                 if (!captureStartedNotified) {
                     captureStartedNotified = true;
                     LiveCaptureWebviewPanel.lastCaptureFilePath = s.outputFilePath;
+                    LiveCaptureWebviewPanel.onPanelChange?.(s.outputFilePath, 'opened', 'live');
                     this.postMessage({ command: 'captureStarted', sessionId: s.id, outputFile: s.outputFilePath });
                     vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', true);
                     this.startRefreshTimer();
@@ -355,6 +366,15 @@ export class LiveCaptureWebviewPanel {
             this.tsharkRunner.stopLiveCapture(this.session.id);
             vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', false);
         }
+
+        // Notify the tree that the previous capture file is no longer active
+        // in this panel. Without this, the stale entry keeps openInPanel='live'
+        // and getActiveCapture() returns the wrong (old/empty) file.
+        if (LiveCaptureWebviewPanel.lastCaptureFilePath) {
+            LiveCaptureWebviewPanel.onPanelChange?.(LiveCaptureWebviewPanel.lastCaptureFilePath, 'closed', 'live');
+            LiveCaptureWebviewPanel.lastCaptureFilePath = undefined;
+        }
+
         const prev = this.session;
         this.session = undefined;
         this.startTime = undefined;
@@ -454,6 +474,18 @@ export class LiveCaptureWebviewPanel {
         const query = `@nettrace /diagnose${contextStr}`;
 
         await vscode.commands.executeCommand('workbench.action.chat.open', { query });
+    }
+
+    /**
+     * Apply a display filter from an external source (e.g. LM tools).
+     * Mirrors CaptureWebviewPanel.applyFilterToActive().
+     */
+    public static applyFilterToActive(filter: string): boolean {
+        const inst = LiveCaptureWebviewPanel.instance;
+        if (!inst || !inst.session?.outputFilePath) { return false; }
+        inst.lastDisplayFilter = filter;
+        inst.applyDisplayFilterToPanel();
+        return true;
     }
 
     private async applyDisplayFilterToPanel(): Promise<void> {

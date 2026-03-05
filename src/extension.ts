@@ -184,6 +184,25 @@ async function activateInternal(context: vscode.ExtensionContext) {
 
         // Refresh knowledge tree when knowledge files change
         configLoader.onKnowledgeChanged(() => knowledgeTree.refresh());
+
+        // ─── Wire panel ↔ tree synchronization ───────────────────────────
+        // Both panel types notify the tree when they open/close a capture file.
+        // The tree is the single source of truth for "what's open and where."
+        CaptureWebviewPanel.onPanelChange = (filePath, event) => {
+            if (event === 'opened') {
+                capturesTree.markOpenInPanel(filePath, 'viewer');
+            } else {
+                capturesTree.markClosedInPanel(filePath);
+            }
+        };
+        LiveCaptureWebviewPanel.onPanelChange = (filePath, event) => {
+            if (event === 'opened') {
+                capturesTree.markOpenInPanel(filePath, 'live');
+            } else {
+                capturesTree.markClosedInPanel(filePath);
+            }
+        };
+
         logger.endStep('TreeView Providers', true, '5 tree providers registered');
     } catch (e) {
         logger.endStep('TreeView Providers', false, String(e));
