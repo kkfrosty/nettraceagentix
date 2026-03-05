@@ -5,8 +5,6 @@ import { ContextAssembler } from '../contextAssembler';
 import { CapturesTreeProvider } from '../views/capturesTreeProvider';
 import { AgentsTreeProvider } from '../views/agentsTreeProvider';
 import { StreamsTreeProvider } from '../views/streamsTreeProvider';
-import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
-import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
 import { AgentDefinition, AssembledContext, CaptureFile } from '../types';
 
 /**
@@ -90,11 +88,15 @@ export class NetTraceParticipant {
 
         try {
             const agent = this.agentsTree.getActiveAgent();
-            const isFollowUp = context.history.length > 0;
 
-            // Ensure all captures have been parsed before analysis
+            // Ensure all captures have been parsed before analysis.
+            // Track which were freshly parsed — if any capture is new to this
+            // conversation, the model has never seen its packet data and we
+            // MUST use the full first-turn path even if there's chat history.
+            let anyFreshlyParsed = false;
             for (const capture of capturesToAnalyze) {
                 if (!capture.parsed || !capture.summary) {
+                    anyFreshlyParsed = true;
                     const roleLabel = capture.role ? ` [${capture.role}]` : '';
                     this.outputChannel.appendLine(`[ChatParticipant] Capture not yet parsed, parsing summary for ${capture.name}...`);
                     stream.progress(`Parsing ${capture.name}${roleLabel}...`);
@@ -110,6 +112,17 @@ export class NetTraceParticipant {
                     }
                 }
             }
+
+            // Only use lightweight follow-up path when BOTH conditions are true:
+            // 1. There IS previous chat history (user has spoken to @nettrace before)
+            // 2. ALL captures were already parsed — the model received their full
+            //    packet data in a previous turn. If any capture was freshly parsed
+            //    this turn, the model has never seen its data (e.g., user asked
+            //    to "start a capture" first, then asks to analyze the result).
+            const isFollowUp = context.history.length > 0 && !anyFreshlyParsed;
+            this.outputChannel.appendLine(
+                `[ChatParticipant] isFollowUp=${isFollowUp} (history=${context.history.length}, freshlyParsed=${anyFreshlyParsed})`
+            );
 
             // Get streams for all captures — vital for anomaly-aware context assembly
             let captureStreams = this.streamsTree.getStreams().filter(s =>
@@ -154,11 +167,12 @@ export class NetTraceParticipant {
                 const scenarioContext = this.contextAssembler.buildScenarioContextPublic();
                 const knowledgeContext = await this.contextAssembler.buildKnowledgeContextPublic(capturesToAnalyze, captureStreams, agent);
 
+                const cpt = NetTraceParticipant.CHARS_PER_TOKEN;
                 const lightweightTokens =
-                    Math.ceil(systemPrompt.length / 4) +
-                    Math.ceil(captureSummary.length / 4) +
-                    Math.ceil(scenarioContext.length / 4) +
-                    Math.ceil(knowledgeContext.length / 4);
+                    Math.ceil(systemPrompt.length / cpt) +
+                    Math.ceil(captureSummary.length / cpt) +
+                    Math.ceil(scenarioContext.length / cpt) +
+                    Math.ceil(knowledgeContext.length / cpt);
 
                 const totalPacketsFollowUp = capturesToAnalyze.reduce(
                     (sum, c) => sum + (c.summary?.packetCount || 0), 0
@@ -199,7 +213,7 @@ export class NetTraceParticipant {
     // ─── Model Communication ──────────────────────────────────────────────
 
     private static readonly MAX_TOOL_ROUNDTRIPS = 25;
-    private static readonly CHARS_PER_TOKEN = 4;
+    private static readonly CHARS_PER_TOKEN = 3;
 
     private estimateMessageTokens(messages: vscode.LanguageModelChatMessage[]): number {
         let totalChars = 0;
@@ -242,6 +256,230 @@ export class NetTraceParticipant {
         }
 
         return resolved;
+    }
+
+    // ── Message Sanitization ──────────────────────────────────────────────
+    // Ensures the messages array conforms to the LLM API's strict rules:
+    //   1. Strict role alternation (user, assistant, user, ...)
+    //   2. First message is always User
+    //   3. Every tool_result references a tool_use in the immediately preceding assistant message
+    //   4. Every tool_use has a corresponding tool_result in the immediately following user message
+    // Prevents 400 errors like "unexpected tool_use_id found in tool_result blocks".
+
+    private sanitizeMessagesForApi(
+        messages: vscode.LanguageModelChatMessage[]
+    ): vscode.LanguageModelChatMessage[] {
+        if (messages.length === 0) { return []; }
+
+        // ── Step 1: Merge consecutive same-role messages ──────────────────
+        // The Claude API rejects non-alternating roles. Even if VS Code's proxy
+        // attempts to merge them, the result can be unpredictable when tool_result
+        // or tool_use parts are involved. We take control of the merge here.
+        const merged: vscode.LanguageModelChatMessage[] = [];
+        for (const msg of messages) {
+            const last = merged[merged.length - 1];
+            if (last && last.role === msg.role) {
+                const existingParts = [...last.content];
+                const newParts = [...msg.content];
+                const allParts = [...existingParts, ...newParts];
+
+                if (msg.role === vscode.LanguageModelChatMessageRole.User) {
+                    const userParts = allParts.filter(
+                        p => p instanceof vscode.LanguageModelTextPart || p instanceof vscode.LanguageModelToolResultPart
+                    ) as (vscode.LanguageModelTextPart | vscode.LanguageModelToolResultPart)[];
+                    merged[merged.length - 1] = vscode.LanguageModelChatMessage.User(userParts);
+                } else {
+                    const assistantParts = allParts.filter(
+                        p => p instanceof vscode.LanguageModelTextPart || p instanceof vscode.LanguageModelToolCallPart
+                    ) as (vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart)[];
+                    merged[merged.length - 1] = vscode.LanguageModelChatMessage.Assistant(assistantParts);
+                }
+                this.outputChannel.appendLine(
+                    `[Sanitize] Merged consecutive ${msg.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant'} messages`
+                );
+            } else {
+                merged.push(msg);
+            }
+        }
+
+        // ── Step 2: Ensure first message is User ──────────────────────────
+        if (merged.length > 0 && merged[0].role !== vscode.LanguageModelChatMessageRole.User) {
+            merged.unshift(vscode.LanguageModelChatMessage.User('Begin analysis.'));
+            this.outputChannel.appendLine('[Sanitize] Prepended User message to fix first-message role');
+        }
+
+        // ── Step 3: Validate tool_use / tool_result pairing ──────────────
+        for (let i = 0; i < merged.length; i++) {
+            const msg = merged[i];
+            const parts = [...msg.content];
+
+            if (msg.role === vscode.LanguageModelChatMessageRole.Assistant) {
+                // Collect tool_use callIds from this assistant message
+                const toolCallIds = new Set<string>();
+                for (const p of parts) {
+                    if (p instanceof vscode.LanguageModelToolCallPart) {
+                        toolCallIds.add(p.callId);
+                    }
+                }
+
+                if (toolCallIds.size > 0) {
+                    if (i + 1 < merged.length && merged[i + 1].role === vscode.LanguageModelChatMessageRole.User) {
+                        const nextParts = [...merged[i + 1].content];
+                        const resultIds = new Set<string>();
+                        for (const p of nextParts) {
+                            if (p instanceof vscode.LanguageModelToolResultPart) {
+                                resultIds.add(p.callId);
+                            }
+                        }
+
+                        // Remove tool_results that don't match any tool_use in this assistant message
+                        let stripped = 0;
+                        const cleanedParts = nextParts.filter(p => {
+                            if (p instanceof vscode.LanguageModelToolResultPart) {
+                                if (!toolCallIds.has(p.callId)) {
+                                    stripped++;
+                                    return false;
+                                }
+                            }
+                            return true;
+                        });
+
+                        // Pad missing tool_results for tool_uses that have no result
+                        const missingIds: string[] = [];
+                        const cleanedResultIds = new Set(
+                            cleanedParts
+                                .filter(p => p instanceof vscode.LanguageModelToolResultPart)
+                                .map(p => (p as vscode.LanguageModelToolResultPart).callId)
+                        );
+                        for (const id of toolCallIds) {
+                            if (!cleanedResultIds.has(id)) {
+                                missingIds.push(id);
+                                cleanedParts.push(new vscode.LanguageModelToolResultPart(id, [
+                                    new vscode.LanguageModelTextPart('Error: Tool call was not completed (cancelled or failed).')
+                                ]));
+                            }
+                        }
+
+                        if (stripped > 0 || missingIds.length > 0) {
+                            const userParts = cleanedParts.filter(
+                                p => p instanceof vscode.LanguageModelTextPart || p instanceof vscode.LanguageModelToolResultPart
+                            ) as (vscode.LanguageModelTextPart | vscode.LanguageModelToolResultPart)[];
+                            merged[i + 1] = vscode.LanguageModelChatMessage.User(userParts);
+                            if (stripped > 0) {
+                                this.outputChannel.appendLine(`[Sanitize] Removed ${stripped} orphaned tool_result(s) from message ${i + 1}`);
+                            }
+                            if (missingIds.length > 0) {
+                                this.outputChannel.appendLine(`[Sanitize] Added ${missingIds.length} missing tool_result(s) to message ${i + 1}`);
+                            }
+                        }
+                    } else {
+                        // No following User message with tool_results — strip tool_uses
+                        // so the API doesn't expect results that will never come.
+                        const cleaned = parts.filter(p => !(p instanceof vscode.LanguageModelToolCallPart));
+                        if (cleaned.length === 0) {
+                            cleaned.push(new vscode.LanguageModelTextPart('(Analysis in progress)'));
+                        }
+                        const assistantParts = cleaned.filter(
+                            p => p instanceof vscode.LanguageModelTextPart || p instanceof vscode.LanguageModelToolCallPart
+                        ) as (vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart)[];
+                        merged[i] = vscode.LanguageModelChatMessage.Assistant(assistantParts);
+                        this.outputChannel.appendLine(
+                            `[Sanitize] Stripped ${toolCallIds.size} unresolved tool_call(s) from assistant message ${i}`
+                        );
+                    }
+                }
+            } else if (msg.role === vscode.LanguageModelChatMessageRole.User) {
+                // Check for tool_results in User messages not preceded by an assistant with tool_uses
+                const hasToolResults = parts.some(p => p instanceof vscode.LanguageModelToolResultPart);
+                if (hasToolResults) {
+                    const prevMsg = i > 0 ? merged[i - 1] : null;
+                    let prevHasToolCalls = false;
+                    if (prevMsg && prevMsg.role === vscode.LanguageModelChatMessageRole.Assistant) {
+                        prevHasToolCalls = prevMsg.content.some(p => p instanceof vscode.LanguageModelToolCallPart);
+                    }
+
+                    if (!prevHasToolCalls) {
+                        // Orphaned tool_results — strip them
+                        const cleaned = parts.filter(p => !(p instanceof vscode.LanguageModelToolResultPart));
+                        if (cleaned.length === 0) {
+                            cleaned.push(new vscode.LanguageModelTextPart('(Previous tool interaction completed)'));
+                        }
+                        const userParts = cleaned.filter(
+                            p => p instanceof vscode.LanguageModelTextPart || p instanceof vscode.LanguageModelToolResultPart
+                        ) as (vscode.LanguageModelTextPart | vscode.LanguageModelToolResultPart)[];
+                        merged[i] = vscode.LanguageModelChatMessage.User(userParts);
+                        this.outputChannel.appendLine(`[Sanitize] Stripped orphaned tool_result(s) from user message ${i}`);
+                    }
+                }
+            }
+        }
+
+        // ── Final assertion: messages[0] must be text-only User ───────────
+        // The Claude API (via Copilot proxy) requires the first message to be a
+        // user message with text content. If it has tool_result blocks, the API
+        // will reject with "unexpected tool_use_id". This is our last line of
+        // defense — if something above failed to clean properly, force-strip here.
+        if (merged.length > 0) {
+            const first = merged[0];
+            const firstParts = [...first.content];
+            const hasToolContent = firstParts.some(
+                p => p instanceof vscode.LanguageModelToolResultPart ||
+                     p instanceof vscode.LanguageModelToolCallPart
+            );
+            if (hasToolContent) {
+                this.outputChannel.appendLine(
+                    `[Sanitize] CRITICAL: messages[0] contained tool content! Force-stripping.`
+                );
+                const textOnly = firstParts.filter(p => p instanceof vscode.LanguageModelTextPart);
+                if (textOnly.length === 0) {
+                    textOnly.push(new vscode.LanguageModelTextPart('Analyze the network capture.'));
+                }
+                merged[0] = vscode.LanguageModelChatMessage.User(
+                    textOnly as vscode.LanguageModelTextPart[]
+                );
+            }
+
+            // Also ensure first message is User role
+            if (first.role !== vscode.LanguageModelChatMessageRole.User) {
+                this.outputChannel.appendLine(
+                    `[Sanitize] CRITICAL: messages[0] was not User role! Prepending text User message.`
+                );
+                merged.unshift(vscode.LanguageModelChatMessage.User('Analyze the network capture.'));
+            }
+        }
+
+        return merged;
+    }
+
+    /**
+     * Log the message structure for debugging, then send to the model.
+     * Unlike the previous sendToModelApi approach, this does NOT re-sanitize —
+     * we trust the single sanitize pass before the tool loop and the loop's own
+     * correct construction. Re-sanitizing on every send created new message
+     * objects that could confuse the VS Code proxy.
+     */
+    private async logAndSend(
+        model: vscode.LanguageModelChat,
+        messages: vscode.LanguageModelChatMessage[],
+        options: vscode.LanguageModelChatRequestOptions,
+        token: vscode.CancellationToken,
+        label: string
+    ): Promise<vscode.LanguageModelChatResponse> {
+        this.outputChannel.appendLine(`[SendToModel] ${label} — sending ${messages.length} messages:`);
+        for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
+            const role = msg.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant';
+            const parts = Array.isArray(msg.content) ? msg.content : [];
+            const desc = parts.map(p => {
+                if (p instanceof vscode.LanguageModelTextPart) { return `Text(${p.value.length})`; }
+                if (p instanceof vscode.LanguageModelToolResultPart) { return `ToolResult(${p.callId})`; }
+                if (p instanceof vscode.LanguageModelToolCallPart) { return `ToolCall(${p.name}/${p.callId})`; }
+                return `Unknown(${(p as any)?.constructor?.name || typeof p})`;
+            }).join(', ');
+            this.outputChannel.appendLine(`  [${i}] ${role}: [${desc}]`);
+        }
+
+        return model.sendRequest(messages, options, token);
     }
 
     private async sendToModel(
@@ -315,11 +553,21 @@ export class NetTraceParticipant {
         }
 
         // ── Build messages with strict role alternation ─────────────────────
-        // Some LLM APIs require alternating user/assistant messages and that
-        // every tool_result has a matching tool_use in the immediately preceding
-        // assistant message. We consolidate all initial context into a SINGLE user
-        // message to avoid consecutive same-role messages that the proxy may
-        // merge unpredictably.
+        // The Claude API requires:
+        //   1. Strictly alternating user/assistant messages
+        //   2. First message must be user role with text content (NOT tool_result)
+        //   3. Every tool_result must reference a tool_use in the immediately preceding
+        //      assistant message
+        //
+        // VS Code's Copilot proxy may extract the first User message as the Claude
+        // "system" parameter. If that happens, the second message becomes messages[0]
+        // in the Claude API. We must ensure that even after such extraction, the
+        // remaining messages start with a text-only User and maintain alternation.
+        //
+        // Strategy:
+        //   - Combine context + user query into ONE User message (no consecutive Users)
+        //   - Build clean history with proper alternation
+        //   - After all construction, sanitize in-place before the tool loop starts
 
         const contextParts = [context.systemPrompt];
 
@@ -339,40 +587,60 @@ export class NetTraceParticipant {
             contextParts.push(context.packetData);
         }
 
-        const messages: vscode.LanguageModelChatMessage[] = [
-            vscode.LanguageModelChatMessage.User(contextParts.join('\n\n---\n\n')),
-        ];
+        // Build the initial messages array — context is ALWAYS the first message
+        // and must be a text-only User message. We add a separator to keep the
+        // context distinct from the user's actual question.
+        const contextBlock = contextParts.join('\n\n---\n\n');
 
-        // Conversation history for multi-turn
-        // Only extract text content — drop any tool_use/tool_result artifacts
-        // from previous turns to prevent orphaned tool blocks in the API request.
-        for (const turn of chatContext.history) {
-            if (turn instanceof vscode.ChatRequestTurn) {
-                messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
-                // Ensure alternation: if next turn is also User, insert a placeholder Assistant
-            } else if (turn instanceof vscode.ChatResponseTurn) {
-                let responseText = '';
-                for (const part of turn.response) {
-                    if (part instanceof vscode.ChatResponseMarkdownPart) {
-                        responseText += part.value.value;
+        let messages: vscode.LanguageModelChatMessage[] = [];
+
+        if (chatContext.history.length === 0) {
+            // ── First turn: combine context + user query in ONE User message ──
+            // This ensures messages[0] is a single text-only User message.
+            // No consecutive Users. No merge needed. Clean for any proxy behavior.
+            messages.push(vscode.LanguageModelChatMessage.User(
+                contextBlock + '\n\n---\n\n## User Query\n\n' + userMessage
+            ));
+        } else {
+            // ── Follow-up turn: context, then history, then user query ────────
+            messages.push(vscode.LanguageModelChatMessage.User(contextBlock));
+
+            // Conversation history for multi-turn — extract text-only content.
+            // Drop any tool_use/tool_result artifacts from previous turns to prevent
+            // orphaned tool blocks in the API request.
+            // ALWAYS insert an Assistant message for every response turn — skipping
+            // empty responses would create consecutive User messages.
+            for (const turn of chatContext.history) {
+                if (turn instanceof vscode.ChatRequestTurn) {
+                    messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
+                } else if (turn instanceof vscode.ChatResponseTurn) {
+                    let responseText = '';
+                    for (const part of turn.response) {
+                        if (part instanceof vscode.ChatResponseMarkdownPart) {
+                            responseText += part.value.value;
+                        }
                     }
-                }
-                if (responseText) {
-                    messages.push(vscode.LanguageModelChatMessage.Assistant(responseText));
+                    messages.push(vscode.LanguageModelChatMessage.Assistant(
+                        responseText || '(Analysis performed using tool calls)'
+                    ));
                 }
             }
+
+            // Ensure the last message before the user's prompt is not also User role
+            const lastMsg = messages[messages.length - 1];
+            if (lastMsg && lastMsg.role === vscode.LanguageModelChatMessageRole.User) {
+                messages.push(vscode.LanguageModelChatMessage.Assistant(
+                    'Understood. What would you like me to analyze?'
+                ));
+            }
+
+            messages.push(vscode.LanguageModelChatMessage.User(userMessage));
         }
 
-        // Ensure the last message before the user's prompt is not also User role
-        // (would happen if history had a request with no captured response)
-        const lastMsg = messages[messages.length - 1];
-        const lastIsUser = lastMsg && (lastMsg.role === vscode.LanguageModelChatMessageRole.User);
-        if (lastIsUser && chatContext.history.length > 0) {
-            // Insert a minimal assistant acknowledgment to maintain alternation
-            messages.push(vscode.LanguageModelChatMessage.Assistant('Understood. What would you like me to analyze?'));
-        }
-
-        messages.push(vscode.LanguageModelChatMessage.User(userMessage));
+        // ── Sanitize in-place BEFORE the tool loop starts ─────────────────
+        // This ensures the working messages array is always clean. The tool loop
+        // pushes new entries to THIS sanitized array, keeping it consistent.
+        messages = this.sanitizeMessagesForApi(messages);
 
         const toolNames = this.agentsTree.getActiveAgent().tools || [];
         // Always include nettrace-startCapture so the LLM can start/set up a live
@@ -383,7 +651,7 @@ export class NetTraceParticipant {
         const tools = this.resolveTools(allToolNames);
 
         // Log message structure for debugging API errors
-        this.outputChannel.appendLine(`[ChatParticipant] Message structure (${messages.length} messages):`);
+        this.outputChannel.appendLine(`[ChatParticipant] Message structure after sanitize (${messages.length} messages):`);
         for (let i = 0; i < messages.length; i++) {
             const msg = messages[i];
             const role = msg.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant';
@@ -400,10 +668,34 @@ export class NetTraceParticipant {
 
         // ── Agentic tool-calling loop with token budget tracking ──────────
         // Track accumulated tokens to prevent exceeding the model's context limit.
-        // Use the same 10% reserve the context assembler used — NOT an additional 15%.
-        // The assembler already budgeted within (maxTokens * 0.9), so we honor that boundary
-        // and only need a small additional margin for tool responses accumulating.
-        const tokenLimit = Math.floor(modelMax * 0.95); // 5% reserve for tool overhead; assembler already reserved 10%
+        // The context assembler reserves a fraction of the model's context for tool-loop
+        // overhead. We must use the SAME fraction here — not a flat 5% — or we'll be
+        // more permissive than the assembler intended and risk overflowing on large captures.
+        //
+        // Reserve fractions (mirroring contextAssembler.ts):
+        //   complete mode: 10%  — all packets loaded, tools are optional extras
+        //   sampled mode:  15-35% depending on model size — tools MUST page uncovered ranges
+        //
+        // We derive the fraction from the coverage mode already in the assembled context.
+        const isSampled = context.coverage?.mode === 'sampled';
+        let toolReserveFraction: number;
+        if (!isSampled) {
+            toolReserveFraction = 0.10;
+        } else if (modelMax < 200000) {
+            toolReserveFraction = 0.35;
+        } else if (modelMax > 500000) {
+            toolReserveFraction = 0.15;
+        } else {
+            toolReserveFraction = 0.20;
+        }
+        // Subtract the assembler's reserve from the model max — that's our hard ceiling.
+        // Then add a small margin (half the reserve) for the tool responses themselves.
+        // Net effect: tool loop gets headroom WITHOUT exceeding what the assembler planned.
+        const tokenLimit = Math.floor(modelMax * (1 - toolReserveFraction / 2));
+        this.outputChannel.appendLine(
+            `[ChatParticipant] Tool loop budget: mode=${isSampled ? 'sampled' : 'complete'}, ` +
+            `reserve=${Math.round(toolReserveFraction * 100)}%, tokenLimit=${tokenLimit}`
+        );
         let roundTrip = 0;
 
         while (roundTrip < NetTraceParticipant.MAX_TOOL_ROUNDTRIPS) {
@@ -412,6 +704,35 @@ export class NetTraceParticipant {
 
             // Pre-flight check: estimate total tokens before sending
             const estimatedTokens = this.estimateMessageTokens(messages);
+
+            // On round 1, validate with model's actual tokenizer as a safety net.
+            // The context assembler calibrates packet data, but this catches any
+            // remaining estimation errors before hitting the API.
+            if (roundTrip === 1) {
+                try {
+                    const realCounts = await Promise.all(
+                        messages.map(m => model.countTokens(m, token))
+                    );
+                    const realTotal = realCounts.reduce((a, b) => a + b, 0);
+                    if (realTotal > modelMax) {
+                        this.outputChannel.appendLine(
+                            `[ChatParticipant] ⚠ Pre-flight: ${realTotal} real tokens exceeds model limit ${modelMax} ` +
+                            `(char estimate was ${estimatedTokens}).`
+                        );
+                        stream.markdown(
+                            `\n\n⚠️ **Context too large** (~${Math.round(realTotal / 1000)}K tokens, ` +
+                            `model limit is ${Math.round(modelMax / 1000)}K). ` +
+                            `Try a model with a larger context window or a smaller capture.\n`
+                        );
+                        return { metadata: { command: 'error' } };
+                    }
+                    this.outputChannel.appendLine(
+                        `[ChatParticipant] Pre-flight: ${realTotal} real tokens ` +
+                        `(char estimate ${estimatedTokens}), limit ${modelMax} — OK`
+                    );
+                } catch { /* countTokens unavailable — proceed with estimate */ }
+            }
+
             const remainingBudget = tokenLimit - estimatedTokens;
 
             // On the FIRST roundtrip, always send with tools — the model needs them
@@ -434,7 +755,8 @@ export class NetTraceParticipant {
                 stream.markdown('\n\n*Context limit approaching — finalizing analysis with data gathered so far.*\n\n');
 
                 // Send one final request WITHOUT tools so the model wraps up
-                const finalResponse = await model.sendRequest(messages, {}, token);
+                messages = this.sanitizeMessagesForApi(messages);
+                const finalResponse = await this.logAndSend(model, messages, {}, token, 'budget-cap final');
                 for await (const part of finalResponse.stream) {
                     if (part instanceof vscode.LanguageModelTextPart) {
                         stream.markdown(part.value);
@@ -448,26 +770,51 @@ export class NetTraceParticipant {
                 `[ChatParticipant] Round ${roundTrip}: ~${estimatedTokens} tokens used, ~${remainingBudget} remaining`
             );
 
+            // Re-sanitize before every send — the tool loop appends messages
+            // that may create structural issues the proxy can't handle.
+            messages = this.sanitizeMessagesForApi(messages);
+
             let chatResponse;
             try {
-                chatResponse = await model.sendRequest(messages, { tools }, token);
+                chatResponse = await this.logAndSend(model, messages, { tools }, token, `round ${roundTrip}`);
             } catch (sendError: any) {
                 // If we get a 400 error (often tool_use/tool_result mismatch),
                 // retry WITHOUT tools as a fallback so the user still gets analysis
                 const errMsg = sendError?.message || String(sendError);
                 if (errMsg.includes('400') || errMsg.includes('invalid_request_error') || errMsg.includes('tool_use_id')) {
+                    // Log the FULL message structure that caused the error for diagnosis
                     this.outputChannel.appendLine(
-                        `[ChatParticipant] Tool-related API error: ${errMsg}. Retrying without tools.`
+                        `[ChatParticipant] ═══ API ERROR (round ${roundTrip}) ═══\n` +
+                        `  Error: ${errMsg}\n` +
+                        `  Messages array (${messages.length} items) at time of failure:`
                     );
+                    for (let i = 0; i < messages.length; i++) {
+                        const m = messages[i];
+                        const role = m.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant';
+                        const parts = Array.isArray(m.content) ? m.content : [];
+                        const desc = parts.map(p => {
+                            if (p instanceof vscode.LanguageModelTextPart) { return `Text(${p.value.length})`; }
+                            if (p instanceof vscode.LanguageModelToolResultPart) { return `ToolResult(id=${p.callId})`; }
+                            if (p instanceof vscode.LanguageModelToolCallPart) { return `ToolCall(${p.name},id=${p.callId})`; }
+                            return `Unknown(${(p as any)?.constructor?.name || typeof p})`;
+                        }).join(', ');
+                        this.outputChannel.appendLine(`    [${i}] ${role}: [${desc}]`);
+                    }
+                    this.outputChannel.appendLine(`  ═══ END ERROR DUMP ═══`);
+
                     stream.markdown('\n\n*Tool calling encountered an API error — analyzing without tools.*\n\n');
-                    const fallbackResponse = await model.sendRequest(messages.filter(m => {
-                        // Strip any messages containing tool result/call parts
+                    // Strip messages containing tool result/call parts, then sanitize
+                    const textOnlyMessages = messages.filter(m => {
                         if (!Array.isArray(m.content)) { return true; }
                         return !m.content.some(p =>
                             p instanceof vscode.LanguageModelToolResultPart ||
                             p instanceof vscode.LanguageModelToolCallPart
                         );
-                    }), {}, token);
+                    });
+                    const sanitizedFallback = this.sanitizeMessagesForApi(textOnlyMessages);
+                    const fallbackResponse = await this.logAndSend(
+                        model, sanitizedFallback, {}, token, 'error fallback'
+                    );
                     for await (const part of fallbackResponse.stream) {
                         if (part instanceof vscode.LanguageModelTextPart) {
                             stream.markdown(part.value);
@@ -557,6 +904,21 @@ export class NetTraceParticipant {
                 }
             }
 
+            // ── Ensure every tool_call has a matching tool_result ─────────
+            // If cancellation broke the inner loop, some tool calls won't have
+            // results yet. The API requires 1:1 pairing — pad any missing ones.
+            for (const toolCall of toolCallParts) {
+                const hasResult = toolResultParts.some(r => r.callId === toolCall.callId);
+                if (!hasResult) {
+                    toolResultParts.push(new vscode.LanguageModelToolResultPart(toolCall.callId, [
+                        new vscode.LanguageModelTextPart('Error: Tool execution was cancelled.'),
+                    ]));
+                    this.outputChannel.appendLine(
+                        `[ChatParticipant] Padded missing result for cancelled tool ${toolCall.name} (${toolCall.callId})`
+                    );
+                }
+            }
+
             messages.push(vscode.LanguageModelChatMessage.User(toolResultParts));
         }
 
@@ -636,16 +998,14 @@ export class NetTraceParticipant {
     /**
      * Determine which captures to analyze.
      *
+     * Single source of truth: CapturesTreeProvider.openInPanel tracks
+     * which captures are open and in which panel type.
+     *
      * Priority:
      * 1. Both client + server role captures assigned → dual-capture mode
-     * 2. Active live-capture session (panel open or recently stopped) → single mode
-     * 3. Explicitly opened CaptureWebviewPanel → single mode
+     * 2. Unambiguous active capture (live > single viewer) from the tree
+     * 3. Multiple panels open → QuickPick to disambiguate
      * 4. Empty → no-capture mode (handled by handleNoCaptureRequest)
-     *
-     * The allCaptures[0] fallback was intentionally removed. Automatically picking
-     * an arbitrary capture from the tree causes the wrong file to be loaded when
-     * the user's request is unrelated to any open capture (e.g., asking the model
-     * to start a live capture, configure settings, answer general questions).
      */
     private async getCapturesToAnalyze(): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
         const allCaptures = this.capturesTree.getCaptures();
@@ -657,44 +1017,25 @@ export class NetTraceParticipant {
             return { captures: [clientCapture, serverCapture], mode: 'dual' };
         }
 
-        // Live capture session takes absolute priority — the user ran a live capture
-        // and we must analyze that file regardless of what other panels are open.
-        const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
-        if (livePath) {
-            const path = require('path') as typeof import('path');
-            const liveCapture: CaptureFile = {
-                filePath: livePath,
-                name: path.basename(livePath),
-                sizeBytes: 0,
-                parsed: true,
-            };
-            this.outputChannel.appendLine(`[ChatParticipant] Live capture in use: ${livePath}`);
-            return { captures: [liveCapture], mode: 'single' };
+        // Ask the tree — it knows which captures are open and in which panel
+        const active = this.capturesTree.getActiveCapture();
+        if (active) {
+            this.outputChannel.appendLine(`[ChatParticipant] Active capture (${active.openInPanel ?? 'tree'}): ${active.filePath}`);
+            return { captures: [active], mode: 'single' };
         }
 
-        // Use the visible/focused panel, or the only open panel if exactly one exists.
-        const activePath = CaptureWebviewPanel.getActiveCaptureFile();
-        if (activePath) {
-            const activeCapture = allCaptures.find(c => c.filePath === activePath);
-            if (activeCapture) {
-                return { captures: [activeCapture], mode: 'single' };
-            }
-        }
-
-        // Multiple panels are open but none is currently focused (user switched to Chat).
-        // Show a QuickPick so the user explicitly chooses which capture to analyze.
-        // Never silently pick one — analyzing the wrong file is worse than asking.
-        const openPanels = CaptureWebviewPanel.getOpenCapturePanels();
-        if (openPanels.length > 1) {
+        // Multiple panels open but none unambiguous → QuickPick
+        const openCaptures = this.capturesTree.getOpenCaptures();
+        if (openCaptures.length > 1) {
             this.outputChannel.appendLine(
-                `[ChatParticipant] ${openPanels.length} capture panels open, none focused — showing QuickPick`
+                `[ChatParticipant] ${openCaptures.length} captures open, none unambiguous — showing QuickPick`
             );
-            type PanelPick = vscode.QuickPickItem & { filePath: string };
-            const pick = await vscode.window.showQuickPick<PanelPick>(
-                openPanels.map(p => ({
-                    label: p.name,
-                    description: p.filePath,
-                    filePath: p.filePath,
+            type CapturePick = vscode.QuickPickItem & { filePath: string };
+            const pick = await vscode.window.showQuickPick<CapturePick>(
+                openCaptures.map(c => ({
+                    label: c.name,
+                    description: `${c.openInPanel === 'live' ? '⏺ live' : '👁 viewer'} — ${c.filePath}`,
+                    filePath: c.filePath,
                 })),
                 {
                     placeHolder: 'Which capture should @nettrace analyze?',
@@ -702,7 +1043,6 @@ export class NetTraceParticipant {
                 }
             );
             if (!pick) {
-                // User dismissed — treat as no capture (model gets no-capture guidance)
                 return { captures: [], mode: 'single' };
             }
             const chosen = allCaptures.find(c => c.filePath === pick.filePath);
@@ -712,8 +1052,7 @@ export class NetTraceParticipant {
             }
         }
 
-        // No panel open at all — return empty so handleRequest delegates to
-        // handleNoCaptureRequest. This prevents silently loading allCaptures[0].
+        // No panel open — return empty so handleRequest delegates to handleNoCaptureRequest
         return { captures: [], mode: 'single' };
     }
 

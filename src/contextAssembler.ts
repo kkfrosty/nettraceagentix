@@ -12,8 +12,10 @@ import { ConfigLoader } from './configLoader';
 export class ContextAssembler {
     private outputChannel: vscode.OutputChannel;
 
-    // Approximate chars per token (conservative estimate)
-    private static readonly CHARS_PER_TOKEN = 4;
+    // Approximate chars per token — conservative for mixed content.
+    // Network trace data tokenizes worse (~2 chars/token) but model.countTokens()
+    // calibration in assembleContext handles that dynamically.
+    private static readonly CHARS_PER_TOKEN = 3;
 
     constructor(
         private tsharkRunner: TsharkRunner,
@@ -114,8 +116,61 @@ export class ContextAssembler {
         //    If the agent defines autoFilters.displayFilter, pre-filter packets to relevant traffic
         const packetBudget = availableTokens - usedTokens - this.estimateTokens(userQuery) - 5000; // 5K buffer
         const agentDisplayFilter = agent.autoFilters?.displayFilter;
-        const packetResult = await this.buildPacketDataWithCoverage(captures, packetBudget, streams, agentDisplayFilter);
+        let packetResult = await this.buildPacketDataWithCoverage(captures, packetBudget, streams, agentDisplayFilter);
         usedTokens += this.estimateTokens(packetResult.data);
+
+        // ── Token calibration: validate with model's actual tokenizer ──────────
+        // The char-based estimate (CHARS_PER_TOKEN ≈ 3) works for prose but can
+        // undercount network trace data by 50-100% because IPs, ports, numbers,
+        // and delimiters tokenize at ~2 chars/token rather than 3-4.
+        // If the real count exceeds the budget, rebuild with a corrected budget.
+        if (model && packetResult.data.length > 0) {
+            try {
+                const estPktTokens = this.estimateTokens(packetResult.data);
+                const realPktTokens = await model.countTokens(packetResult.data);
+
+                if (realPktTokens > packetBudget) {
+                    // Real tokens exceed budget — compute corrected budget that the
+                    // internal functions (which still use CHARS_PER_TOKEN) will honor.
+                    const realRatio = packetResult.data.length / realPktTokens;
+                    const correctedBudget = Math.floor(
+                        packetBudget * (realRatio / ContextAssembler.CHARS_PER_TOKEN) * 0.95
+                    );
+
+                    this.outputChannel.appendLine(
+                        `[ContextAssembler] ⚠ Token calibration: packet data is ${realPktTokens} real tokens ` +
+                        `(estimated ${estPktTokens}, budget ${packetBudget}). ` +
+                        `Real ratio: ${realRatio.toFixed(2)} chars/token. ` +
+                        `Rebuilding with corrected budget ${correctedBudget}.`
+                    );
+
+                    usedTokens -= estPktTokens;
+                    packetResult = await this.buildPacketDataWithCoverage(
+                        captures, correctedBudget, streams, agentDisplayFilter
+                    );
+
+                    const rebuiltTokens = packetResult.data.length > 0
+                        ? await model.countTokens(packetResult.data)
+                        : 0;
+                    usedTokens += rebuiltTokens;
+
+                    this.outputChannel.appendLine(
+                        `[ContextAssembler] After rebuild: ${rebuiltTokens} real tokens ` +
+                        `(${packetResult.coverage.packetsIncluded}/${packetResult.coverage.totalPackets} packets, ` +
+                        `${packetResult.coverage.mode} mode)`
+                    );
+                } else {
+                    // Within budget — use real count instead of estimate
+                    usedTokens += (realPktTokens - estPktTokens);
+                    this.outputChannel.appendLine(
+                        `[ContextAssembler] Token calibration OK: ${realPktTokens} real tokens ` +
+                        `(estimated ${estPktTokens}). Within budget of ${packetBudget}.`
+                    );
+                }
+            } catch (e) {
+                this.outputChannel.appendLine(`[ContextAssembler] Token calibration skipped: ${e}`);
+            }
+        }
 
         // 7. User query tokens
         usedTokens += this.estimateTokens(userQuery);

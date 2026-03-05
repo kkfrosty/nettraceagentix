@@ -2,6 +2,27 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
+## [0.1.8] - 2026-03-05
+
+### Fixed
+- **Immediate token-limit failures on moderate captures** — Analysis could fail on first request with `Message exceeds token limit` even when logs reported headroom. Root cause was character-based token estimation undercounting dense packet text (IPs, ports, numeric fields, separators)
+- **Token estimation drift between context and send phases** — Follow-up token math and chat message token estimation used an overly optimistic ratio, which could pass internal checks but still overflow at model send time
+- **False first-turn follow-up optimization** — Newly parsed captures were sometimes treated as follow-up turns when chat history existed, causing the model to miss full packet context for the new capture
+- **Tool-loop budget mismatch** — Tool-loop safety reserve could diverge from context assembly assumptions, increasing risk of context exhaustion in multi-round analysis
+- **Orphaned/misaligned tool message structures** — Added robust sanitization and pairing enforcement to prevent strict API validation failures related to tool call/result ordering
+- **Live capture stale source selection** — After live session transitions (including clear/stop flows), stale live references could be chosen as the active capture
+- **Wrong panel target for tool-applied filters** — Display filters could be pushed to the wrong panel type in mixed live/viewer workflows
+
+### Improved
+- **Real-token calibration during context assembly** — Packet data is now validated with `model.countTokens()` and automatically rebuilt with corrected sampling budget when real usage exceeds plan
+- **Round-1 preflight token validation** — Before the first send, message totals are checked with the model tokenizer to fail fast with actionable guidance instead of opaque API errors
+- **More conservative baseline token heuristics** — Updated `CHARS_PER_TOKEN` assumptions for both context and participant token accounting to reduce underestimation risk
+- **Capture routing unified around tree state** — `CapturesTreeProvider` is now the single source of truth for active/open captures across viewer and live panels
+- **Panel lifecycle synchronization** — Viewer and live panels now emit open/close events that update tree state in real time
+- **Deterministic capture disambiguation** — When multiple captures are open and none is unambiguous, selection is explicit instead of falling back to stale/default files
+- **Filter dispatch correctness across panel types** — LM tools now route filter updates to the correct active panel (live or viewer)
+- **Richer diagnostics for send/tool failures** — Added structured message-shape logging to speed root-cause analysis when model/API validation fails
+
 ## [0.1.7] - 2026-03-04
 
 ### Fixed
