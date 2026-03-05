@@ -12,6 +12,7 @@ All notable changes to **NetTrace Agentix** will be documented in this file.
 - **Orphaned/misaligned tool message structures** — Added robust sanitization and pairing enforcement to prevent strict API validation failures related to tool call/result ordering
 - **Live capture stale source selection** — After live session transitions (including clear/stop flows), stale live references could be chosen as the active capture
 - **Wrong panel target for tool-applied filters** — Display filters could be pushed to the wrong panel type in mixed live/viewer workflows
+- **Open-capture recognition regression in chat analysis** — When multiple capture panels were open but no single panel was marked active, `@nettrace` could incorrectly fall back to no-capture mode (`analyzing no capture loaded`). Selection now uses deterministic open-panel fallback (1 open -> single, 2 open -> dual) instead of dropping to no-capture
 
 ### Improved
 - **Real-token calibration during context assembly** — Packet data is now validated with `model.countTokens()` and automatically rebuilt with corrected sampling budget when real usage exceeds plan

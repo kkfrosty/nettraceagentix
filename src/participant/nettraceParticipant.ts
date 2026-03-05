@@ -1004,8 +1004,11 @@ export class NetTraceParticipant {
      * Priority:
      * 1. Both client + server role captures assigned → dual-capture mode
      * 2. Unambiguous active capture (live > single viewer) from the tree
-     * 3. Multiple panels open → QuickPick to disambiguate
-     * 4. Empty → no-capture mode (handled by handleNoCaptureRequest)
+    * 3. Open panels fallback:
+    *    - exactly 1 open panel  -> single-capture mode
+    *    - exactly 2 open panels -> dual-capture mode
+    *    - 3+ open panels        -> QuickPick (with safe fallback)
+    * 4. Empty -> no-capture mode (handled by handleNoCaptureRequest)
      */
     private async getCapturesToAnalyze(): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
         const allCaptures = this.capturesTree.getCaptures();
@@ -1024,9 +1027,25 @@ export class NetTraceParticipant {
             return { captures: [active], mode: 'single' };
         }
 
-        // Multiple panels open but none unambiguous → QuickPick
         const openCaptures = this.capturesTree.getOpenCaptures();
-        if (openCaptures.length > 1) {
+
+        // Deterministic open-panel fallback: avoid dropping to no-capture when
+        // captures are clearly open but no single panel is marked "active".
+        if (openCaptures.length === 1) {
+            const only = openCaptures[0];
+            this.outputChannel.appendLine(`[ChatParticipant] Single open panel fallback: ${only.name}`);
+            return { captures: [only], mode: 'single' };
+        }
+
+        if (openCaptures.length === 2) {
+            this.outputChannel.appendLine(
+                `[ChatParticipant] Two open panels fallback -> dual mode: ${openCaptures[0].name}, ${openCaptures[1].name}`
+            );
+            return { captures: [openCaptures[0], openCaptures[1]], mode: 'dual' };
+        }
+
+        // 3+ open captures but none unambiguous -> ask user which one.
+        if (openCaptures.length > 2) {
             this.outputChannel.appendLine(
                 `[ChatParticipant] ${openCaptures.length} captures open, none unambiguous — showing QuickPick`
             );
@@ -1043,7 +1062,11 @@ export class NetTraceParticipant {
                 }
             );
             if (!pick) {
-                return { captures: [], mode: 'single' };
+                // Safe fallback: never degrade to no-capture when captures are open.
+                this.outputChannel.appendLine(
+                    `[ChatParticipant] QuickPick dismissed with ${openCaptures.length} open captures — using first open capture`
+                );
+                return { captures: [openCaptures[0]], mode: 'single' };
             }
             const chosen = allCaptures.find(c => c.filePath === pick.filePath);
             if (chosen) {
