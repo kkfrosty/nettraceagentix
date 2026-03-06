@@ -84,6 +84,11 @@ export class NetTraceParticipant {
             if (controlResult) {
                 return controlResult;
             }
+
+            const filterResult = await this.tryHandleFilterIntent(request, context, stream, token, userPrompt);
+            if (filterResult) {
+                return filterResult;
+            }
         }
 
         // Determine which captures to analyze — dual-capture mode if both roles assigned
@@ -282,6 +287,16 @@ export class NetTraceParticipant {
         }
 
         return resolved;
+    }
+
+    private isDisplayFilterIntent(prompt: string): boolean {
+        const p = prompt.trim().toLowerCase();
+        if (!p) { return false; }
+        if (this.isAnalyzeIntent(p)) { return false; }
+
+        return /^(?:please\s+)?(?:apply|set|change|update|use|clear|remove)\s+(?:the\s+|a\s+)?(?:(?:wireshark|display)\s+)?filter\b/.test(p)
+            || /^(?:please\s+)?(?:(?:wireshark|display)\s+)?filter\b/.test(p)
+            || /^show\s+only\b/.test(p);
     }
 
     // ── Message Sanitization ──────────────────────────────────────────────
@@ -704,7 +719,7 @@ export class NetTraceParticipant {
         // pushes new entries to THIS sanitized array, keeping it consistent.
         messages = this.sanitizeMessagesForApi(messages);
 
-        const toolNames = this.agentsTree.getActiveAgent().tools || [];
+        const toolNames = agent.tools || [];
         // Always include live-capture control tools regardless of active agent.
         const requiredTools = ['nettrace-startCapture', 'nettrace-stopCapture', 'nettrace-getLiveCaptureStatus'];
         const allToolNames = [...toolNames];
@@ -1075,6 +1090,75 @@ export class NetTraceParticipant {
             request, chatContext, stream, token,
             assembledContext, userPrompt,
             /*captures=*/[], agent, /*isFirstTurn=*/true
+        );
+    }
+
+    private async tryHandleFilterIntent(
+        request: vscode.ChatRequest,
+        chatContext: vscode.ChatContext,
+        stream: vscode.ChatResponseStream,
+        token: vscode.CancellationToken,
+        userPrompt: string
+    ): Promise<vscode.ChatResult | undefined> {
+        if (!this.isDisplayFilterIntent(userPrompt)) {
+            return undefined;
+        }
+
+        this.outputChannel.appendLine(`[ChatParticipant] Filter intent detected — using lightweight tool-only path`);
+        stream.progress('Applying display filter...');
+
+        const activeAgent = this.agentsTree.getActiveAgent();
+        const filterAgent: AgentDefinition = {
+            ...activeAgent,
+            tools: ['nettrace-setDisplayFilter', 'nettrace-applyFilter'],
+        };
+
+        const filterModePrompt = [
+            'You are handling a display-filter request for the active NetTrace capture panel.',
+            'Do NOT analyze the whole capture and do NOT request full packet context.',
+            'If the user wants to change what is shown in the viewer, call `nettrace-setDisplayFilter`.',
+            'If the user explicitly asks for matching packets or filtered data returned in chat, call `nettrace-applyFilter` with `applyToPanel: true`.',
+            'Translate natural-language requests into valid Wireshark display filter syntax when possible.',
+            'After applying the filter, respond briefly with the filter that was used.',
+        ].join('\n');
+
+        const filterModeNote = [
+            '## Filter Request Mode',
+            '',
+            'The user is asking to set or clear a Wireshark display filter in the active capture panel.',
+            '',
+            'Rules:',
+            '- Prefer `nettrace-setDisplayFilter` for panel-only filter changes',
+            '- Use `nettrace-applyFilter` only when the user explicitly wants filtered packet data back in chat',
+            '- Do not load or summarize the whole trace for this request',
+            '- If no capture panel is open, explain that clearly',
+        ].join('\n');
+
+        const estimatedTokens =
+            Math.ceil(filterModePrompt.length / 4) +
+            Math.ceil(filterModeNote.length / 4);
+
+        const assembledContext: AssembledContext = {
+            systemPrompt: filterModePrompt,
+            captureSummary: filterModeNote,
+            streamDetails: '',
+            scenarioContext: '',
+            packetData: '',
+            knowledgeContext: '',
+            estimatedTokens,
+            coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 },
+        };
+
+        return await this.sendToModel(
+            request,
+            chatContext,
+            stream,
+            token,
+            assembledContext,
+            userPrompt,
+            /*captures=*/[],
+            filterAgent,
+            /*isFirstTurn=*/true
         );
     }
 

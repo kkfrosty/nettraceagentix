@@ -833,7 +833,15 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 });
             }
             if (filter !== undefined) {
-                CaptureWebviewPanel.applyFilterToActive(filter);
+                const activeCapture = capturesTree.getActiveCapture();
+                if (activeCapture?.openInPanel === 'live') {
+                    const applied = LiveCaptureWebviewPanel.applyFilterToActive(filter);
+                    if (!applied) {
+                        CaptureWebviewPanel.applyFilterToActive(filter);
+                    }
+                } else {
+                    CaptureWebviewPanel.applyFilterToActive(filter);
+                }
             }
         })
     );

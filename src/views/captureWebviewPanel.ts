@@ -199,6 +199,11 @@ export class CaptureWebviewPanel {
         }
     }
 
+    private async applyDisplayFilterToPanel(filter: string): Promise<void> {
+        this.panel.webview.postMessage({ command: 'applyFilterExt', filter });
+        await this.applyFilter(filter);
+    }
+
     private async loadStreamPackets(streamIndex: number): Promise<void> {
         try {
             const detail = await this.tsharkRunner.getStreamDetail(
@@ -320,14 +325,14 @@ export class CaptureWebviewPanel {
     public static applyFilterToActive(filter: string): void {
         for (const [, viewer] of CaptureWebviewPanel.panels) {
             if (viewer.panel.visible) {
-                viewer.panel.webview.postMessage({ command: 'applyFilterExt', filter });
+                void viewer.applyDisplayFilterToPanel(filter);
                 return;
             }
         }
         // Fallback: apply to first panel
         const first = CaptureWebviewPanel.panels.values().next();
         if (!first.done) {
-            first.value.panel.webview.postMessage({ command: 'applyFilterExt', filter });
+            void first.value.applyDisplayFilterToPanel(filter);
         }
     }
 
@@ -1226,9 +1231,10 @@ export class CaptureWebviewPanel {
                     break;
                 }
                 case 'applyFilterExt': {
-                    // Applied from chat or external command
+                    // Applied from chat or external command. Backend owns the re-query.
                     filterInput.value = msg.filter || '';
-                    if (msg.filter) { applyFilter(); } else { clearFilter(); }
+                    document.getElementById('filterStatus').textContent = '';
+                    document.getElementById('filterInput').classList.remove('filter-error');
                     break;
                 }
             }
