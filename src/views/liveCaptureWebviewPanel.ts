@@ -799,10 +799,7 @@ export class LiveCaptureWebviewPanel {
         if (elapsed) { contextParts.push(`duration: ${mins}:${secs}`); }
 
         const contextStr = contextParts.length > 0 ? ` [Live capture — ${contextParts.join(' | ')}]` : '';
-        const marker = this.session?.outputFilePath
-            ? `[[nettrace:captureFile=${encodeURIComponent(this.session.outputFilePath)}]] `
-            : '';
-        const query = `@nettrace ${marker}/diagnose${contextStr}`;
+        const query = `@nettrace /diagnose Analyze the current open capture context.${contextStr}`;
 
         await vscode.commands.executeCommand('workbench.action.chat.open', { query });
     }

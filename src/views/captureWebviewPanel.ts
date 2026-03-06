@@ -86,10 +86,9 @@ export class CaptureWebviewPanel {
                         break;
                     case 'analyzeWithAI':
                         {
-                            const marker = `[[nettrace:captureFile=${encodeURIComponent(this.currentCapture.filePath)}]]`;
-                            const prompt = message.prompt || 'Analyze this capture.';
+                            const prompt = message.prompt || 'Analyze the current open capture context and diagnose any issues.';
                             await vscode.commands.executeCommand('workbench.action.chat.open', {
-                                query: `@nettrace ${marker} ${prompt}`,
+                                query: `@nettrace ${prompt}`,
                             });
                         }
                         break;

@@ -93,7 +93,7 @@ export class NetTraceParticipant {
         }
 
         // Determine which captures to analyze — dual-capture mode if both roles assigned
-        const { captures: capturesToAnalyze, mode: captureMode } = await this.getCapturesToAnalyze(captureFileOverride);
+        const { captures: capturesToAnalyze, mode: captureMode } = await this.getCapturesToAnalyze(userPrompt, captureFileOverride);
 
         if (capturesToAnalyze.length === 0) {
             // No capture is currently open in a viewer panel.
@@ -193,32 +193,11 @@ export class NetTraceParticipant {
                     : primaryCapture.name;
                 stream.progress(`Follow-up on ${followUpLabel}...`);
                 this.outputChannel.appendLine(`[ChatParticipant] Follow-up turn — using lightweight context (no packet data re-send)`);
-
-                const systemPrompt = this.contextAssembler.buildSystemPromptPublic(agent);
-                const captureSummary = await this.contextAssembler.buildCaptureSummaryPublic(capturesToAnalyze);
-                const scenarioContext = this.contextAssembler.buildScenarioContextPublic();
-                const knowledgeContext = await this.contextAssembler.buildKnowledgeContextPublic(capturesToAnalyze, captureStreams, agent);
-
-                const cpt = NetTraceParticipant.CHARS_PER_TOKEN;
-                const lightweightTokens =
-                    Math.ceil(systemPrompt.length / cpt) +
-                    Math.ceil(captureSummary.length / cpt) +
-                    Math.ceil(scenarioContext.length / cpt) +
-                    Math.ceil(knowledgeContext.length / cpt);
-
-                const totalPacketsFollowUp = capturesToAnalyze.reduce(
-                    (sum, c) => sum + (c.summary?.packetCount || 0), 0
+                assembledContext = await this.contextAssembler.assembleFollowUpContext(
+                    capturesToAnalyze,
+                    captureStreams,
+                    agent
                 );
-                assembledContext = {
-                    systemPrompt,
-                    captureSummary,
-                    streamDetails: '', // Not needed — model has this from previous turn
-                    scenarioContext,
-                    packetData: '',    // Not needed — model has its analysis. Use tools if it needs to revisit.
-                    knowledgeContext,
-                    estimatedTokens: lightweightTokens,
-                    coverage: { mode: 'complete' as const, totalPackets: totalPacketsFollowUp, packetsIncluded: totalPacketsFollowUp },
-                };
             } else {
                 // ── First turn: full context with all packets ─────────────
                 const firstTurnLabel = captureMode === 'dual'
@@ -1048,9 +1027,6 @@ export class NetTraceParticipant {
 
         const agent = this.agentsTree.getActiveAgent();
 
-        const systemPrompt = this.contextAssembler.buildSystemPromptPublic(agent);
-        const scenarioContext = this.contextAssembler.buildScenarioContextPublic();
-
         const noCaptureNote = [
             '## No Capture Currently Open',
             '',
@@ -1071,21 +1047,7 @@ export class NetTraceParticipant {
             'If the user is asking to analyze an existing file, instruct them to open it first.',
         ].join('\n');
 
-        const estimatedTokens =
-            Math.ceil(systemPrompt.length / 4) +
-            Math.ceil(scenarioContext.length / 4) +
-            Math.ceil(noCaptureNote.length / 4);
-
-        const assembledContext: import('../types').AssembledContext = {
-            systemPrompt,
-            captureSummary: noCaptureNote,
-            streamDetails: '',
-            scenarioContext,
-            packetData: '',
-            knowledgeContext: '',
-            estimatedTokens,
-            coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 },
-        };
+        const assembledContext = this.contextAssembler.assembleToolOnlyContext(agent, noCaptureNote);
 
         return await this.sendToModel(
             request, chatContext, stream, token,
@@ -1135,20 +1097,15 @@ export class NetTraceParticipant {
             '- If no capture panel is open, explain that clearly',
         ].join('\n');
 
-        const estimatedTokens =
-            Math.ceil(filterModePrompt.length / 4) +
-            Math.ceil(filterModeNote.length / 4);
+        const assembledContext = this.contextAssembler.assembleToolOnlyContext(
+            filterAgent,
+            filterModeNote,
+            {
+                scenarioContext: '',
+            }
+        );
 
-        const assembledContext: AssembledContext = {
-            systemPrompt: filterModePrompt,
-            captureSummary: filterModeNote,
-            streamDetails: '',
-            scenarioContext: '',
-            packetData: '',
-            knowledgeContext: '',
-            estimatedTokens,
-            coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 },
-        };
+        assembledContext.systemPrompt = filterModePrompt;
 
         return await this.sendToModel(
             request,
@@ -1469,12 +1426,12 @@ export class NetTraceParticipant {
      * 1. Both client + server role captures assigned → dual-capture mode
      * 2. Unambiguous active capture (live > single viewer) from the tree
     * 3. Open panels fallback:
+    *    - exactly 2 open panels with dual-capture intent -> dual-capture mode
     *    - exactly 1 open panel  -> single-capture mode
-    *    - exactly 2 open panels -> dual-capture mode
     *    - 3+ open panels        -> QuickPick (with safe fallback)
     * 4. Empty -> no-capture mode (handled by handleNoCaptureRequest)
      */
-    private async getCapturesToAnalyze(captureFileOverride?: string): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
+    private async getCapturesToAnalyze(userPrompt: string, captureFileOverride?: string): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
         const allCaptures = this.capturesTree.getCaptures();
 
         // Explicit capture binding from panel-originated action always wins.
@@ -1509,11 +1466,18 @@ export class NetTraceParticipant {
         }
 
         const routing = resolveOpenCaptures(this.capturesTree, this.outputChannel, 'ChatParticipant');
+        const openCaptures = routing.openCaptures;
+
+        if (openCaptures.length === 2 && this.shouldPreferDualOpenCaptureMode(userPrompt, openCaptures)) {
+            this.outputChannel.appendLine(
+                `[ChatParticipant] Dual-capture intent detected -> using two open panels: ${openCaptures[0].name}, ${openCaptures[1].name}`
+            );
+            return { captures: [openCaptures[0], openCaptures[1]], mode: 'dual' };
+        }
+
         if (routing.activeCapture) {
             return { captures: [routing.activeCapture], mode: 'single' };
         }
-
-        const openCaptures = routing.openCaptures;
 
         // Deterministic open-panel fallback: avoid dropping to no-capture when
         // captures are clearly open but no single panel is marked "active".
@@ -1563,6 +1527,58 @@ export class NetTraceParticipant {
 
         // No panel open — return empty so handleRequest delegates to handleNoCaptureRequest
         return { captures: [], mode: 'single' };
+    }
+
+    private shouldPreferDualOpenCaptureMode(userPrompt: string, openCaptures: CaptureFile[]): boolean {
+        const prompt = userPrompt.toLowerCase();
+        const normalizedPrompt = this.normalizeCaptureIntentText(prompt);
+
+        const explicitDualPhrases = [
+            'open capture context',
+            'open captures',
+            'both captures',
+            'these captures',
+            'client and server',
+            'server and client',
+            'compare',
+            'correlate both',
+            'match the traffic',
+            'match traffic',
+            'analyze both',
+            'evaluate both',
+            'look at both',
+            'as well',
+        ];
+
+        if (explicitDualPhrases.some(phrase => normalizedPrompt.includes(phrase))) {
+            return true;
+        }
+
+        const namedCapturesMentioned = openCaptures.filter(capture => {
+            const normalizedName = this.normalizeCaptureIntentText(capture.name.replace(/\.[^.]+$/, ''));
+            return normalizedName.length > 0 && normalizedPrompt.includes(normalizedName);
+        }).length;
+
+        if (namedCapturesMentioned >= 2) {
+            return true;
+        }
+
+        const mentionsClient = /\bclient\b/.test(normalizedPrompt);
+        const mentionsServer = /\bserver\b/.test(normalizedPrompt);
+        if (mentionsClient && mentionsServer) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private normalizeCaptureIntentText(value: string): string {
+        return value
+            .toLowerCase()
+            .replace(/\.[a-z0-9]+\b/g, ' ')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
     // ─── Followup Suggestions ─────────────────────────────────────────────

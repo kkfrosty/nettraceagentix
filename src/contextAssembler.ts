@@ -222,25 +222,71 @@ ${followed}
 
     // ─── Public accessors for lightweight follow-up context ───────────────
 
-    /** Build the system prompt (public for follow-up turns). */
-    buildSystemPromptPublic(agent: AgentDefinition): string {
-        return this.buildSystemPrompt(agent);
+    async assembleFollowUpContext(
+        captures: CaptureFile[],
+        streams: TcpStream[],
+        agent: AgentDefinition
+    ): Promise<AssembledContext> {
+        const systemPrompt = this.buildSystemPrompt(agent);
+        const captureSummary = await this.buildCaptureSummary(captures);
+        const scenarioContext = this.buildScenarioContext();
+        const knowledgeResult = await this.buildKnowledgeContext(captures, streams, agent);
+        const knowledgeContext = knowledgeResult.content;
+
+        const estimatedTokens =
+            this.estimateTokens(systemPrompt) +
+            this.estimateTokens(captureSummary) +
+            this.estimateTokens(scenarioContext) +
+            this.estimateTokens(knowledgeContext);
+
+        const totalPackets = captures.reduce((sum, capture) => sum + (capture.summary?.packetCount || 0), 0);
+
+        return {
+            systemPrompt,
+            captureSummary,
+            streamDetails: '',
+            scenarioContext,
+            packetData: '',
+            knowledgeContext,
+            knowledgeManifest: knowledgeResult.manifest,
+            estimatedTokens,
+            coverage: {
+                mode: 'complete',
+                totalPackets,
+                packetsIncluded: totalPackets,
+            },
+        };
     }
 
-    /** Build the capture summary with expert info (public for follow-up turns). */
-    async buildCaptureSummaryPublic(captures: CaptureFile[]): Promise<string> {
-        return this.buildCaptureSummary(captures);
-    }
+    assembleToolOnlyContext(
+        agent: AgentDefinition,
+        captureSummary: string,
+        options?: {
+            scenarioContext?: string;
+            knowledgeContext?: string;
+            knowledgeManifest?: AssembledContext['knowledgeManifest'];
+        }
+    ): AssembledContext {
+        const systemPrompt = this.buildSystemPrompt(agent);
+        const scenarioContext = options?.scenarioContext ?? this.buildScenarioContext();
+        const knowledgeContext = options?.knowledgeContext ?? '';
+        const estimatedTokens =
+            this.estimateTokens(systemPrompt) +
+            this.estimateTokens(captureSummary) +
+            this.estimateTokens(scenarioContext) +
+            this.estimateTokens(knowledgeContext);
 
-    /** Build the scenario context (public for follow-up turns). */
-    buildScenarioContextPublic(): string {
-        return this.buildScenarioContext();
-    }
-
-    /** Build the knowledge context (public for follow-up turns). */
-    async buildKnowledgeContextPublic(captures: CaptureFile[], streams: TcpStream[], agent: AgentDefinition): Promise<string> {
-        const result = await this.buildKnowledgeContext(captures, streams, agent);
-        return result.content;
+        return {
+            systemPrompt,
+            captureSummary,
+            streamDetails: '',
+            scenarioContext,
+            packetData: '',
+            knowledgeContext,
+            knowledgeManifest: options?.knowledgeManifest,
+            estimatedTokens,
+            coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 },
+        };
     }
 
     // ─── Prompt Builders ──────────────────────────────────────────────────
