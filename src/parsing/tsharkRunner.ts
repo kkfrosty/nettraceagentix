@@ -559,11 +559,21 @@ export class TsharkRunner {
                 }
             }
 
-            // Parse "Packets: N" progress lines
-            const countMatch = text.match(/Packets(?:\s+captured)?:\s*(\d+)/i);
-            if (countMatch) {
-                session.packetCount = parseInt(countMatch[1]);
-                if (session.status === 'capturing') {
+            // Parse packet count progress lines. tshark emits different formats across versions:
+            // - "Packets: 1234"
+            // - "Packets captured: 5678"
+            // - "2880 packets captured"
+            const colonStyle = text.match(/Packets(?:\s+captured)?:\s*(\d+)/i);
+            const trailingStyle = text.match(/\b(\d+)\s+packets\s+captured\b/i);
+            const parsedCount = colonStyle
+                ? parseInt(colonStyle[1], 10)
+                : trailingStyle
+                    ? parseInt(trailingStyle[1], 10)
+                    : undefined;
+
+            if (parsedCount !== undefined && !Number.isNaN(parsedCount)) {
+                session.packetCount = parsedCount;
+                if (session.status === 'capturing' || session.status === 'stopping') {
                     onUpdate(session);
                 }
             }
@@ -577,88 +587,6 @@ export class TsharkRunner {
             }
         });
 
-        // Separate preview process for real-time decoded packet rows.
-        const previewArgs: string[] = [
-            '-l',
-            '-n',
-            '-i', session.interfaceName,
-            '-T', 'fields',
-            '-e', 'frame.number',
-            '-e', 'frame.time_relative',
-            '-e', '_ws.col.Source',
-            '-e', '_ws.col.Destination',
-            '-e', '_ws.col.Protocol',
-            '-e', 'frame.len',
-            '-e', '_ws.col.Info',
-            '-e', 'tcp.stream',
-            '-E', 'header=n',
-            '-E', 'separator=|',
-        ];
-        if (session.captureFilter.trim()) {
-            previewArgs.push('-f', session.captureFilter.trim());
-        }
-
-        this.outputChannel.appendLine(`[TsharkRunner] startLivePreview: ${this.tsharkPath} ${previewArgs.join(' ')}`);
-        const previewProc = cp.spawn(this.tsharkPath, previewArgs, {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            windowsHide: true,
-        });
-        const entry = this.liveCaptures.get(session.id);
-        if (entry) {
-            entry.previewProc = previewProc;
-        }
-
-        let previewStdoutBuf = '';
-        previewProc.stdout?.on('data', (chunk: Buffer) => {
-            const text = chunk.toString();
-            previewStdoutBuf += text;
-
-            let lineBreak = previewStdoutBuf.indexOf('\n');
-            while (lineBreak >= 0) {
-                const line = previewStdoutBuf.slice(0, lineBreak).trim();
-                previewStdoutBuf = previewStdoutBuf.slice(lineBreak + 1);
-
-                const packet = this.parseLivePreviewPacket(line);
-                if (packet) {
-                    if (!session.livePreviewPackets) {
-                        session.livePreviewPackets = [];
-                    }
-                    session.livePreviewPackets.push(packet);
-                    if (session.livePreviewPackets.length <= 3) {
-                        this.outputChannel.appendLine(
-                            `[LiveCapture] preview parsed #${packet.num} ${packet.src} -> ${packet.dst} ${packet.proto} ${packet.len}`
-                        );
-                    }
-                    if (session.livePreviewPackets.length > 3000) {
-                        session.livePreviewPackets = session.livePreviewPackets.slice(-3000);
-                    }
-                    if (packet.num > session.packetCount) {
-                        session.packetCount = packet.num;
-                    }
-                    if (session.status === 'capturing') {
-                        onUpdate(session);
-                    }
-                }
-
-                lineBreak = previewStdoutBuf.indexOf('\n');
-            }
-        });
-
-        previewProc.stderr?.on('data', (chunk: Buffer) => {
-            const text = chunk.toString().trimEnd();
-            if (text) {
-                this.outputChannel.appendLine(`[LiveCapture] preview stderr: ${text}`);
-            }
-        });
-
-        previewProc.on('error', (err) => {
-            this.outputChannel.appendLine(`[LiveCapture] Preview spawn error: ${err.message}`);
-        });
-
-        previewProc.on('close', (code) => {
-            this.outputChannel.appendLine(`[LiveCapture] Preview process closed (code ${code}), session ${session.id}`);
-        });
-
         proc.on('error', (err) => {
             this.outputChannel.appendLine(`[LiveCapture] Spawn error: ${err.message}`);
             this.liveCaptures.delete(session.id);
@@ -669,6 +597,7 @@ export class TsharkRunner {
 
         proc.on('close', (code) => {
             this.outputChannel.appendLine(`[LiveCapture] Process closed (code ${code}), session ${session.id}`);
+
             this.liveCaptures.delete(session.id);
             if (session.status !== 'error') {
                 session.status = 'stopped';
@@ -700,16 +629,38 @@ export class TsharkRunner {
                 if (proc.stdin && !proc.stdin.destroyed) {
                     proc.stdin.end();
                 }
-                proc.kill();
+                // Windows: tshark often launches dumpcap as a child process.
+                // proc.kill() may terminate tshark but leave dumpcap running.
+                // Use taskkill /T /F to terminate the full process tree.
+                if (process.platform === 'win32' && proc.pid) {
+                    const killer = cp.spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+                        windowsHide: true,
+                        stdio: ['ignore', 'pipe', 'pipe'],
+                    });
+                    let errOut = '';
+                    killer.stderr?.on('data', (d: Buffer) => { errOut += d.toString(); });
+                    killer.on('close', (code) => {
+                        if (code === 0) {
+                            this.outputChannel.appendLine(
+                                `[TsharkRunner] stopLiveCapture: ${label} tree kill OK (pid=${proc.pid})`
+                            );
+                        } else {
+                            this.outputChannel.appendLine(
+                                `[TsharkRunner] stopLiveCapture: ${label} tree kill exit=${code} (pid=${proc.pid}) ${errOut.trim()}`
+                            );
+                            // Fallback to normal kill attempt.
+                            try { proc.kill(); } catch { /* ignore */ }
+                        }
+                    });
+                } else {
+                    proc.kill();
+                }
             } catch (e) {
                 this.outputChannel.appendLine(`[TsharkRunner] stopLiveCapture: ${label} stop error: ${e}`);
             }
         };
 
         stopProc(entry.proc, 'capture');
-        if (entry.previewProc) {
-            stopProc(entry.previewProc, 'preview');
-        }
     }
 
     /** Whether a live capture session is currently running. */

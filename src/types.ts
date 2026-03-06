@@ -72,6 +72,8 @@ export interface LiveCaptureSession {
     displayFilter: string;
     /** Absolute path of the output pcapng file being written */
     outputFilePath: string;
+    /** Optional native tshark auto-stop duration in seconds (-a duration:N) */
+    autoStopSeconds?: number;
     /** Current state of the capture process */
     status: 'starting' | 'capturing' | 'stopping' | 'stopped' | 'error';
     /** Total packets captured so far (updated via tshark stderr progress lines) */

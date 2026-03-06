@@ -64,7 +64,7 @@
         "name": "nettrace",
         "fullName": "Network Trace Analyzer",
         "description": "Analyze the network capture open in the viewer. Just ask a question.",
-        "isSticky": false
+        "isSticky": true
       }
     ],
     "languageModelTools": [
@@ -334,7 +334,7 @@
             "tools": {
               "type": "array",
               "items": { "type": "string" },
-              "description": "Tool names this agent can use. Available: nettrace-getStreamDetail, nettrace-getPacketRange, nettrace-applyFilter, nettrace-getConversations, nettrace-followStream, nettrace-getExpertInfo, nettrace-compareCaptures, nettrace-runTshark, nettrace-setDisplayFilter"
+              "description": "Tool names this agent can use. Available: nettrace-getStreamDetail, nettrace-getPacketRange, nettrace-applyFilter, nettrace-getConversations, nettrace-followStream, nettrace-getExpertInfo, nettrace-compareCaptures, nettrace-runTshark, nettrace-setDisplayFilter, nettrace-startCapture, nettrace-stopCapture, nettrace-getLiveCaptureStatus"
             },
             "followups": {
               "type": "array",
@@ -388,7 +388,7 @@
         "name": "nettrace-startCapture",
         "displayName": "Start Live Capture",
         "description": "Opens the Live Capture panel to capture network traffic in real-time",
-        "modelDescription": "Opens a Wireshark-style Live Capture panel that lets the user capture live network traffic via tshark. Use this when the user asks to capture, record, sniff, monitor, or start a trace. Resolves the best network interface from the hint provided. If autoStart=true, the capture begins immediately. If autoStart=false, the panel opens pre-filled and the user clicks Start. Always prefer this over manual interface selection when you can derive an interface or filter from the user's request.",
+        "modelDescription": "Opens a Wireshark-style Live Capture panel that lets the user capture live network traffic via tshark. Use this when the user asks to capture, record, sniff, monitor, or start a trace. Resolves the best network interface from the hint provided. If autoStart=true, the capture begins immediately. If autoStart=false, the panel opens pre-filled and the user clicks Start. Optional durationSeconds schedules automatic stop after N seconds. Optional triggerDisplayFilter + postTriggerSeconds enables event-driven capture (continue N seconds after trigger match). Optional autoAnalyzeOnStop opens @nettrace diagnosis automatically when stop completes.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -403,8 +403,48 @@
             "autoStart": {
               "type": "boolean",
               "description": "If true, start the capture immediately after the panel opens. Set to true when the user says 'start' or 'capture now'. Set to false when the user says 'set up' or 'prepare'."
+            },
+            "durationSeconds": {
+              "type": "number",
+              "description": "Optional auto-stop timer in seconds (e.g., 120). Capture is stopped automatically after this duration once capture begins."
+            },
+            "autoAnalyzeOnStop": {
+              "type": "boolean",
+              "description": "If true, automatically open @nettrace diagnosis when an auto-stopped capture finishes."
+            },
+            "triggerDisplayFilter": {
+              "type": "string",
+              "description": "Optional Wireshark display filter used as a trigger condition while capture is running (for example: 'tcp.flags.reset == 1' or 'tcp.analysis.retransmission')."
+            },
+            "postTriggerSeconds": {
+              "type": "number",
+              "description": "Optional number of seconds to continue capture after triggerDisplayFilter matches. Requires triggerDisplayFilter."
+            },
+            "triggerMinMatches": {
+              "type": "number",
+              "description": "Optional minimum number of trigger matches before trigger is considered hit (default 1)."
             }
           }
+        }
+      },
+      {
+        "name": "nettrace-stopCapture",
+        "displayName": "Stop Live Capture",
+        "description": "Stops the currently running live capture session",
+        "modelDescription": "Stops the currently active live capture session in the Live Capture panel. Use this when the user asks to stop, end, or finish capture before analysis.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "nettrace-getLiveCaptureStatus",
+        "displayName": "Get Live Capture Status",
+        "description": "Returns current live capture state including packet counts, trigger status, and timing",
+        "modelDescription": "Returns current live capture state from the Live Capture panel, including status, packet count, elapsed time, trigger match progress, and trigger/post-trigger settings. Use this to poll progress during timed or trigger-based captures before deciding to stop or analyze.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
         }
       }
     ],
@@ -497,22 +537,10 @@
         "icon": "$(search)"
       },
       {
-        "command": "nettrace.analyzeAll",
-        "title": "Analyze All Captures",
-        "category": "NetTrace",
-        "icon": "$(sparkle)"
-      },
-      {
         "command": "nettrace.openCapture",
         "title": "Open Capture Viewer",
         "category": "NetTrace",
         "icon": "$(open-preview)"
-      },
-      {
-        "command": "nettrace.askAI",
-        "title": "Chat with AI about Traces",
-        "category": "NetTrace",
-        "icon": "$(comment-discussion)"
       },
       {
         "command": "nettrace.editScenarioDetails",
@@ -655,24 +683,14 @@
     "menus": {
       "view/title": [
         {
-          "command": "nettrace.askAI",
+          "command": "nettrace.importCapture",
           "when": "view == nettrace.captures",
           "group": "navigation@0"
         },
         {
-          "command": "nettrace.analyzeAll",
-          "when": "view == nettrace.captures",
-          "group": "navigation@1"
-        },
-        {
-          "command": "nettrace.importCapture",
-          "when": "view == nettrace.captures",
-          "group": "navigation@2"
-        },
-        {
           "command": "nettrace.openLiveCapture",
           "when": "view == nettrace.captures",
-          "group": "navigation@3"
+          "group": "navigation@1"
         },
         {
           "command": "nettrace.editScenarioDetails",
@@ -823,8 +841,17 @@
           "default": "",
           "description": "Directory where live capture .pcapng files are saved. Leave empty to use .nettrace/captures/live/ inside the workspace folder.",
           "scope": "machine"
+        },
+        "nettrace.defaultCaptureInterface": {
+          "type": "string",
+          "default": "",
+          "description": "Default network interface to use for live capture when no interface hint is provided. Accepts interface name, display name, or partial match (for example: 'Wi-Fi', 'Ethernet', 'eth0').",
+          "scope": "machine"
         }
       }
+    },
+    "configurationDefaults": {
+      "workbench.view.alwaysShowHeaderActions": true
     }
   },
   "scripts": {

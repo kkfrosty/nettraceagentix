@@ -771,20 +771,6 @@ async function activateInternal(context: vscode.ExtensionContext) {
         })
     );
 
-    // Analyze All — opens Copilot Chat to analyze all loaded captures
-    context.subscriptions.push(
-        vscode.commands.registerCommand('nettrace.analyzeAll', async () => {
-            const count = capturesTree.getCaptures().length;
-            if (count === 0) {
-                vscode.window.showInformationMessage('No captures loaded. Import a capture file first.');
-                return;
-            }
-            await vscode.commands.executeCommand('workbench.action.chat.open', {
-                query: `@nettrace /diagnose Analyze all ${count} loaded capture(s). What issues do you see? What's the root cause?`,
-            });
-        })
-    );
-
     // Open Capture Viewer — opens the webview panel for a capture
     context.subscriptions.push(
         vscode.commands.registerCommand('nettrace.openCapture', async (item: any) => {
@@ -852,22 +838,6 @@ async function activateInternal(context: vscode.ExtensionContext) {
         })
     );
 
-    // Ask AI — generic entry point to start a conversation
-    context.subscriptions.push(
-        vscode.commands.registerCommand('nettrace.askAI', async () => {
-            const captures = capturesTree.getCaptures();
-            if (captures.length === 0) {
-                await vscode.commands.executeCommand('workbench.action.chat.open', {
-                    query: `@nettrace I want to analyze a network capture. Help me get started.`,
-                });
-            } else {
-                await vscode.commands.executeCommand('workbench.action.chat.open', {
-                    query: `@nettrace `,
-                });
-            }
-        })
-    );
-
     // ── Live Capture commands ──────────────────────────────────────────
 
     // Open Live Capture panel
@@ -882,7 +852,19 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 });
                 return;
             }
-            await LiveCaptureWebviewPanel.createOrShow(context.extensionUri, tsharkRunner, outputChannel, prefill);
+            const defaultInterface = vscode.workspace
+                .getConfiguration('nettrace')
+                .get<string>('defaultCaptureInterface', '')
+                .trim();
+
+            const effectivePrefill = {
+                ...(prefill || {}),
+            };
+            if (!effectivePrefill.suggestedInterface && defaultInterface) {
+                effectivePrefill.suggestedInterface = defaultInterface;
+            }
+
+            await LiveCaptureWebviewPanel.createOrShow(context.extensionUri, tsharkRunner, outputChannel, effectivePrefill);
         })
     );
 
@@ -915,7 +897,10 @@ async function activateInternal(context: vscode.ExtensionContext) {
     // Open in Wireshark
     context.subscriptions.push(
         vscode.commands.registerCommand('nettrace.openInWireshark', async (item: any) => {
-            const filePath = item?.capture?.filePath || item?.resourceUri?.fsPath || (typeof item === 'string' ? item : undefined);
+            const filePath = item?.capture?.filePath
+                || item?.resourceUri?.fsPath
+                || (typeof item === 'string' ? item : undefined)
+                || capturesTree.getActiveCapture()?.filePath;
             if (!filePath) { return; }
 
             if (!fs.existsSync(filePath)) {
@@ -923,30 +908,70 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const configured = vscode.workspace.getConfiguration('nettrace').get<string>('wiresharkPath', '').trim();
+            const configuredRaw = vscode.workspace.getConfiguration('nettrace').get<string>('wiresharkPath', '').trim();
+            const configured = configuredRaw.replace(/^"|"$/g, '');
             const candidates = configured
                 ? [configured]
-                : [
-                    'wireshark',
-                    'C:\\Program Files\\Wireshark\\Wireshark.exe',
-                    'C:\\Program Files (x86)\\Wireshark\\Wireshark.exe',
-                ];
+                : process.platform === 'win32'
+                    ? [
+                        'wireshark',
+                        'Wireshark.exe',
+                        'C:\\Program Files\\Wireshark\\Wireshark.exe',
+                        'C:\\Program Files (x86)\\Wireshark\\Wireshark.exe',
+                    ]
+                    : process.platform === 'darwin'
+                        ? [
+                            'wireshark',
+                            '/Applications/Wireshark.app/Contents/MacOS/Wireshark',
+                        ]
+                        : [
+                            'wireshark',
+                            '/usr/bin/wireshark',
+                            '/usr/local/bin/wireshark',
+                        ];
+
+            const tryLaunchWireshark = async (candidate: string, capturePath: string): Promise<{ ok: boolean; error?: string }> => {
+                return new Promise((resolve) => {
+                    let settled = false;
+                    const finish = (ok: boolean, error?: string) => {
+                        if (!settled) {
+                            settled = true;
+                            resolve({ ok, error });
+                        }
+                    };
+
+                    try {
+                        const child = cp.spawn(candidate, [capturePath], {
+                            detached: true,
+                            stdio: 'ignore',
+                            windowsHide: true,
+                        });
+
+                        child.once('error', (err) => {
+                            finish(false, err instanceof Error ? err.message : String(err));
+                        });
+
+                        child.once('spawn', () => {
+                            child.unref();
+                            finish(true);
+                        });
+                    } catch (e) {
+                        finish(false, e instanceof Error ? e.message : String(e));
+                    }
+                });
+            };
 
             let launched = false;
             let lastErr: string | undefined;
             for (const candidate of candidates) {
-                try {
-                    const child = cp.spawn(candidate, [filePath], {
-                        detached: true,
-                        stdio: 'ignore',
-                        windowsHide: true,
-                    });
-                    child.unref();
+                const result = await tryLaunchWireshark(candidate, filePath);
+                if (result.ok) {
                     launched = true;
                     outputChannel.appendLine(`[Wireshark] Opened ${filePath} using ${candidate}`);
                     break;
-                } catch (e) {
-                    lastErr = String(e);
+                } else {
+                    lastErr = result.error;
+                    outputChannel.appendLine(`[Wireshark] Failed using ${candidate}: ${lastErr ?? 'unknown error'}`);
                 }
             }
 

@@ -17,6 +17,18 @@ import { ConfigLoader } from '../configLoader';
 // Max characters per tool response (~25K tokens). Keeps room for multiple tool calls.
 const MAX_TOOL_RESPONSE_CHARS = 100000;
 
+function splitCliArgs(input: string): string[] {
+    // Keep quoted arguments intact (e.g. -Y "tcp.port == 443")
+    const out: string[] = [];
+    const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(input)) !== null) {
+        const token = m[1] ?? m[2] ?? m[3] ?? '';
+        if (token) { out.push(token); }
+    }
+    return out;
+}
+
 function truncateResponse(text: string, label: string): string {
     if (text.length <= MAX_TOOL_RESPONSE_CHARS) { return text; }
     const truncated = text.substring(0, MAX_TOOL_RESPONSE_CHARS);
@@ -145,12 +157,12 @@ export function registerLMTools(
                     ]);
                 }
 
-                outputChannel.appendLine(`[Tool] applyFilter: filter="${filter}", max=${maxPackets || 100}, applyToPanel=${applyToPanel !== false}, file=${file}`);
+                outputChannel.appendLine(`[Tool] applyFilter: filter="${filter}", max=${maxPackets || 100}, applyToPanel=${applyToPanel === true}, file=${file}`);
 
                 // ALWAYS push filter to the capture viewer panel FIRST so the user
                 // sees the filter change immediately, even if the tshark data query
                 // takes time or fails.
-                if (applyToPanel !== false) {
+                if (applyToPanel === true) {
                     try {
                         applyFilterToAnyPanel(filter, capturesTree, outputChannel);
                     } catch (panelErr) {
@@ -167,7 +179,7 @@ export function registerLMTools(
                         // Only header row or empty — no matching packets
                         return new vscode.LanguageModelToolResult([
                             new vscode.LanguageModelTextPart(
-                                `Filter "${filter}" applied successfully${applyToPanel !== false ? ' (viewer panel updated)' : ''}.\n` +
+                                `Filter "${filter}" applied successfully${applyToPanel === true ? ' (viewer panel updated)' : ''}.\n` +
                                 `Result: 0 packets matched this filter in the capture. ` +
                                 `This means no packets in the capture match the Wireshark display filter "${filter}". ` +
                                 `Try a broader filter or check available protocols with nettrace-runTshark using "-q -z io,phs".`
@@ -179,7 +191,7 @@ export function registerLMTools(
                     const response = truncateResponse(result, 'filter results');
                     return new vscode.LanguageModelToolResult([
                         new vscode.LanguageModelTextPart(
-                            `Filter "${filter}" applied successfully${applyToPanel !== false ? ' (viewer panel updated)' : ''} — ${lineCount} matching packets:\n\`\`\`\n${response}\n\`\`\``
+                            `Filter "${filter}" applied successfully${applyToPanel === true ? ' (viewer panel updated)' : ''} — ${lineCount} matching packets:\n\`\`\`\n${response}\n\`\`\``
                         )
                     ]);
                 } catch (e) {
@@ -187,7 +199,7 @@ export function registerLMTools(
                     const errMsg = String(e);
                     return new vscode.LanguageModelToolResult([
                         new vscode.LanguageModelTextPart(
-                            `Filter "${filter}" was applied to the viewer panel${applyToPanel !== false ? '' : ' (panel update skipped)'}.\n` +
+                            `Filter "${filter}" was applied to the viewer panel${applyToPanel === true ? '' : ' (panel update skipped)'}.\n` +
                             `However, tshark returned an error when extracting data: ${errMsg}\n` +
                             `This usually means the filter syntax is invalid. Use standard Wireshark display filter syntax ` +
                             `(e.g., "dns", "tcp.port == 443", "http", "ip.addr == 10.0.0.1").`
@@ -396,7 +408,7 @@ export function registerLMTools(
                     ]);
                 }
 
-                const argsList = args.split(/\s+/).filter(a => a.length > 0);
+                const argsList = splitCliArgs(args);
                 for (const blocked of BLOCKED_FLAGS) {
                     if (argsList.some(a => a.toLowerCase() === blocked.toLowerCase())) {
                         return new vscode.LanguageModelToolResult([
@@ -417,7 +429,7 @@ export function registerLMTools(
                     // This ensures whatever filter the model uses via runTshark also
                     // updates the user's capture viewer, keeping the UI in sync.
                     let appliedFilter: string | undefined;
-                    if (applyToPanel !== false) {
+                    if (applyToPanel === true) {
                         const yIndex = filteredArgs.findIndex(a => a === '-Y');
                         if (yIndex !== -1 && yIndex + 1 < filteredArgs.length) {
                             appliedFilter = filteredArgs[yIndex + 1];
@@ -582,10 +594,54 @@ export function registerLMTools(
                 captureFilter?: string;
                 interfaceHint?: string;
                 autoStart?: boolean;
+                durationSeconds?: number;
+                autoAnalyzeOnStop?: boolean;
+                triggerDisplayFilter?: string;
+                postTriggerSeconds?: number;
+                triggerMinMatches?: number;
             }>, token) {
-                const { captureFilter = '', interfaceHint = '', autoStart = false } = options.input;
+                const {
+                    captureFilter = '',
+                    interfaceHint = '',
+                    autoStart = false,
+                    durationSeconds,
+                    autoAnalyzeOnStop = false,
+                    triggerDisplayFilter = '',
+                    postTriggerSeconds,
+                    triggerMinMatches,
+                } = options.input;
 
-                outputChannel.appendLine(`[Tool] startCapture: filter="${captureFilter}", interfaceHint="${interfaceHint}", autoStart=${autoStart}`);
+                const normalizedDuration = typeof durationSeconds === 'number' && durationSeconds > 0
+                    ? Math.floor(durationSeconds)
+                    : undefined;
+                const normalizedPostTrigger = typeof postTriggerSeconds === 'number' && postTriggerSeconds > 0
+                    ? Math.floor(postTriggerSeconds)
+                    : undefined;
+                const normalizedTriggerMinMatches = typeof triggerMinMatches === 'number' && triggerMinMatches > 0
+                    ? Math.floor(triggerMinMatches)
+                    : 1;
+                const normalizedTriggerFilter = triggerDisplayFilter.trim();
+                const configuredDefaultInterface = vscode.workspace
+                    .getConfiguration('nettrace')
+                    .get<string>('defaultCaptureInterface', '')
+                    .trim();
+                const effectiveInterfaceHint = interfaceHint.trim() || configuredDefaultInterface;
+
+                outputChannel.appendLine(
+                    `[Tool] startCapture: filter="${captureFilter}", interfaceHint="${interfaceHint}", ` +
+                    `autoStart=${autoStart}, durationSeconds=${normalizedDuration ?? 0}, autoAnalyzeOnStop=${autoAnalyzeOnStop}, ` +
+                    `triggerDisplayFilter="${normalizedTriggerFilter}", postTriggerSeconds=${normalizedPostTrigger ?? 0}, ` +
+                    `triggerMinMatches=${normalizedTriggerMinMatches}, defaultInterface="${configuredDefaultInterface}"`
+                );
+
+                if (normalizedPostTrigger && !normalizedTriggerFilter) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(
+                            'Invalid input: postTriggerSeconds requires triggerDisplayFilter. ' +
+                            'Provide both to enable event-driven capture stop.'
+                        )
+                    ]);
+                }
 
                 // Make sure tshark is available before trying to list interfaces.
                 if (!tsharkRunner.isAvailable()) {
@@ -621,14 +677,16 @@ export function registerLMTools(
                 const nonLoopback = interfaces.filter(i => !i.isLoopback);
                 let resolved: import('../types').NetworkInterface | undefined;
 
-                if (interfaceHint.trim()) {
-                    const hintLower = interfaceHint.toLowerCase();
+                if (effectiveInterfaceHint) {
+                    const hintLower = effectiveInterfaceHint.toLowerCase();
                     // Exact name match
                     resolved = interfaces.find(i => i.name.toLowerCase() === hintLower);
                     // Friendly display name match
                     if (!resolved) { resolved = interfaces.find(i => i.displayName.toLowerCase() === hintLower); }
                     // Substring match in display name
                     if (!resolved) { resolved = interfaces.find(i => i.displayName.toLowerCase().includes(hintLower)); }
+                    // Substring match in raw name
+                    if (!resolved) { resolved = interfaces.find(i => i.name.toLowerCase().includes(hintLower)); }
                     // IP fragment match (user said 'capture on 192.168.1.x')
                     if (!resolved) { resolved = nonLoopback[0]; }
                 } else {
@@ -646,6 +704,11 @@ export function registerLMTools(
                     suggestedInterface: resolved?.name,
                     captureFilter,
                     autoStart,
+                    autoStopSeconds: normalizedDuration,
+                    autoAnalyzeOnStop,
+                    triggerDisplayFilter: normalizedTriggerFilter || undefined,
+                    postTriggerSeconds: normalizedPostTrigger,
+                    triggerMinMatches: normalizedTriggerMinMatches,
                 });
 
                 const actionLine = autoStart
@@ -655,6 +718,22 @@ export function registerLMTools(
                 const filterLine = captureFilter
                     ? `\n- **Capture filter (BPF):** \`${captureFilter}\``
                     : '';
+                const defaultIfaceLine = (!interfaceHint.trim() && configuredDefaultInterface)
+                    ? `\n- **Default interface setting used:** \`${configuredDefaultInterface}\``
+                    : '';
+
+                const timerLine = normalizedDuration
+                    ? `\n- **Auto-stop timer:** ${normalizedDuration}s`
+                    : '';
+                const analyzeLine = autoAnalyzeOnStop
+                    ? `\n- **Auto-analyze on stop:** enabled`
+                    : '';
+                const triggerLine = normalizedTriggerFilter
+                    ? `\n- **Trigger monitor:** \`${normalizedTriggerFilter}\` (min matches: ${normalizedTriggerMinMatches})`
+                    : '';
+                const postTriggerLine = normalizedPostTrigger
+                    ? `\n- **Post-trigger capture:** continue ${normalizedPostTrigger}s after trigger`
+                    : '';
 
                 const ifaceList = interfaces.slice(0, 6)
                     .map(i => `  ${i.id}. ${i.displayName}${i.isLoopback ? ' (loopback)' : ''}`)
@@ -663,9 +742,78 @@ export function registerLMTools(
                 return new vscode.LanguageModelToolResult([
                     new vscode.LanguageModelTextPart(
                         `${actionLine}${filterLine}\n\n` +
+                        `${timerLine}${analyzeLine}${triggerLine}${postTriggerLine}${defaultIfaceLine}\n\n` +
                         `Available interfaces (${interfaces.length} total):\n${ifaceList}\n\n` +
-                        `The capture panel allows you to stop, clear, and re-capture at any time. ` +
+                        `You can stop capture either by calling \`nettrace-stopCapture\` or from the panel controls. ` +
+                        `The panel also allows clear/re-capture at any time. ` +
                         `When stopped, click **🤖 Analyze with AI** to diagnose the captured traffic.`
+                    )
+                ]);
+            }
+        })
+    );
+
+    // ─── Live Capture Status ──────────────────────────────────────────────
+    context.subscriptions.push(
+        vscode.lm.registerTool('nettrace-getLiveCaptureStatus', {
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<{}>, token) {
+                const panel = LiveCaptureWebviewPanel.getActivePanel();
+                if (!panel) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('No live capture panel is active.')
+                    ]);
+                }
+
+                const status = panel.getStatusSnapshot();
+                const lines: string[] = [];
+                lines.push(`hasSession: ${status.hasSession}`);
+                if (status.sessionStatus) { lines.push(`status: ${status.sessionStatus}`); }
+                if (status.captureFile) { lines.push(`captureFile: ${status.captureFile}`); }
+                lines.push(`packetCount: ${status.packetCount}`);
+                lines.push(`elapsedSeconds: ${status.elapsedSeconds}`);
+                lines.push(`autoAnalyzeOnStop: ${status.autoAnalyzeOnStop}`);
+
+                if (status.triggerDisplayFilter) {
+                    lines.push(`triggerDisplayFilter: ${status.triggerDisplayFilter}`);
+                    lines.push(`triggerMinMatches: ${status.triggerMinMatches ?? 1}`);
+                    lines.push(`triggerMatchCount: ${status.triggerMatchCount}`);
+                    lines.push(`triggerMatched: ${status.triggerMatched}`);
+                    if (status.triggerMatchedFrame !== undefined) {
+                        lines.push(`triggerMatchedFrame: ${status.triggerMatchedFrame}`);
+                    }
+                    if (status.triggerMatchedAt) {
+                        lines.push(`triggerMatchedAt: ${status.triggerMatchedAt}`);
+                    }
+                    if (status.postTriggerSeconds !== undefined) {
+                        lines.push(`postTriggerSeconds: ${status.postTriggerSeconds}`);
+                    }
+                }
+
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(lines.join('\n'))
+                ]);
+            }
+        })
+    );
+
+    // ─── Stop Live Capture ────────────────────────────────────────────────
+    context.subscriptions.push(
+        vscode.lm.registerTool('nettrace-stopCapture', {
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<{}>, token) {
+                const panel = LiveCaptureWebviewPanel.getActivePanel();
+                if (!panel) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('No live capture panel is active, so there is nothing to stop.')
+                    ]);
+                }
+
+                const captureFile = LiveCaptureWebviewPanel.getActiveCaptureFile();
+                await vscode.commands.executeCommand('nettrace.stopLiveCapture');
+
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(
+                        `Stop signal sent to live capture.${captureFile ? ` Capture file: ${captureFile}` : ''} ` +
+                        `Once processing completes, analyze with @nettrace /diagnose.`
                     )
                 ]);
             }
@@ -718,8 +866,27 @@ function getDefaultCaptureFile(capturesTree: CapturesTreeProvider, outputChannel
         return active.filePath;
     }
 
+    // Safety-net rehydration: if tree says nothing is open but panel registries
+    // do have open captures, sync them back into tree state first.
+    let openCaptures = capturesTree.getOpenCaptures();
+    if (openCaptures.length === 0) {
+        const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
+        if (livePath) {
+            capturesTree.markOpenInPanel(livePath, 'live');
+        }
+
+        const viewerPanels = CaptureWebviewPanel.getOpenCapturePanels();
+        for (const p of viewerPanels) {
+            capturesTree.markOpenInPanel(p.filePath, 'viewer');
+        }
+
+        openCaptures = capturesTree.getOpenCaptures();
+        if (openCaptures.length > 0) {
+            outputChannel.appendLine(`[Tool] Rehydrated ${openCaptures.length} open capture(s) from panel registries`);
+        }
+    }
+
     // Multiple panels open but none unambiguously active
-    const openCaptures = capturesTree.getOpenCaptures();
     if (openCaptures.length > 1) {
         outputChannel.appendLine(
             `[Tool] ${openCaptures.length} captures open but none unambiguous — returning undefined`

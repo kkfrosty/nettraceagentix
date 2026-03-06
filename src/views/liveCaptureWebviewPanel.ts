@@ -15,6 +15,16 @@ export interface LiveCapturePrefill {
     displayFilter?: string;
     /** Auto-start the capture immediately after the panel opens */
     autoStart?: boolean;
+    /** Auto-stop capture after N seconds once capture starts */
+    autoStopSeconds?: number;
+    /** Auto-open @nettrace diagnosis when an auto-stopped capture finishes */
+    autoAnalyzeOnStop?: boolean;
+    /** Trigger expression (Wireshark display filter) to monitor while capturing */
+    triggerDisplayFilter?: string;
+    /** Continue capturing for N seconds after trigger is first matched */
+    postTriggerSeconds?: number;
+    /** Number of matching packets required before trigger is considered hit */
+    triggerMinMatches?: number;
 }
 
 /**
@@ -52,6 +62,22 @@ export class LiveCaptureWebviewPanel {
     private lastDisplayFilter: string = '';
     private lastPushedLivePreviewCount: number = 0;
     private lastLoggedLivePreviewCount: number = 0;
+    private autoStopTimer: ReturnType<typeof setTimeout> | undefined;
+    private pendingAutoStopSeconds: number | undefined;
+    private pendingAutoAnalyzeOnStop: boolean = false;
+    private activeAutoAnalyzeOnStop: boolean = false;
+    private pendingTriggerDisplayFilter: string | undefined;
+    private pendingPostTriggerSeconds: number | undefined;
+    private pendingTriggerMinMatches: number = 1;
+    private activeTriggerDisplayFilter: string | undefined;
+    private activePostTriggerSeconds: number | undefined;
+    private activeTriggerMinMatches: number = 1;
+    private triggerPollTimer: ReturnType<typeof setInterval> | undefined;
+    private triggerCheckInFlight: boolean = false;
+    private triggerLastCheckedFrame: number = 0;
+    private triggerMatchCount: number = 0;
+    private triggerMatchedFrame: number | undefined;
+    private triggerMatchedAt: Date | undefined;
 
     // ─── Static API ───────────────────────────────────────────────────────
 
@@ -64,10 +90,21 @@ export class LiveCaptureWebviewPanel {
         outputChannel: vscode.OutputChannel,
         prefill?: LiveCapturePrefill
     ): Promise<LiveCaptureWebviewPanel> {
+        const configuredDefaultInterface = vscode.workspace
+            .getConfiguration('nettrace')
+            .get<string>('defaultCaptureInterface', '')
+            .trim();
+        const effectivePrefill: LiveCapturePrefill | undefined = prefill
+            ? { ...prefill }
+            : (configuredDefaultInterface ? { suggestedInterface: configuredDefaultInterface } : undefined);
+        if (effectivePrefill && !effectivePrefill.suggestedInterface && configuredDefaultInterface) {
+            effectivePrefill.suggestedInterface = configuredDefaultInterface;
+        }
+
         if (LiveCaptureWebviewPanel.instance) {
             LiveCaptureWebviewPanel.instance.panel.reveal(vscode.ViewColumn.One);
-            if (prefill) {
-                LiveCaptureWebviewPanel.instance.applyPrefill(prefill);
+            if (effectivePrefill) {
+                LiveCaptureWebviewPanel.instance.applyPrefill(effectivePrefill);
             }
             return LiveCaptureWebviewPanel.instance;
         }
@@ -97,7 +134,7 @@ export class LiveCaptureWebviewPanel {
             }
         );
         const instance = new LiveCaptureWebviewPanel(
-            panel, extensionUri, tsharkRunner, outputChannel, prefill,
+            panel, extensionUri, tsharkRunner, outputChannel, effectivePrefill,
             initialInterfaces, initialError
         );
         LiveCaptureWebviewPanel.instance = instance;
@@ -118,6 +155,42 @@ export class LiveCaptureWebviewPanel {
         return LiveCaptureWebviewPanel.lastCaptureFilePath;
     }
 
+    public getStatusSnapshot(): {
+        hasSession: boolean;
+        sessionStatus?: LiveCaptureSession['status'];
+        captureFile?: string;
+        packetCount: number;
+        elapsedSeconds: number;
+        autoAnalyzeOnStop: boolean;
+        triggerDisplayFilter?: string;
+        triggerMinMatches?: number;
+        triggerMatchCount: number;
+        triggerMatched: boolean;
+        triggerMatchedFrame?: number;
+        triggerMatchedAt?: string;
+        postTriggerSeconds?: number;
+    } {
+        const nowMs = Date.now();
+        const elapsedSeconds = this.startTime
+            ? Math.floor((nowMs - this.startTime.getTime()) / 1000)
+            : 0;
+        return {
+            hasSession: !!this.session,
+            sessionStatus: this.session?.status,
+            captureFile: this.session?.outputFilePath,
+            packetCount: this.session?.packetCount ?? 0,
+            elapsedSeconds,
+            autoAnalyzeOnStop: this.activeAutoAnalyzeOnStop || this.pendingAutoAnalyzeOnStop,
+            triggerDisplayFilter: this.activeTriggerDisplayFilter || this.pendingTriggerDisplayFilter,
+            triggerMinMatches: this.activeTriggerMinMatches,
+            triggerMatchCount: this.triggerMatchCount,
+            triggerMatched: !!this.triggerMatchedAt,
+            triggerMatchedFrame: this.triggerMatchedFrame,
+            triggerMatchedAt: this.triggerMatchedAt?.toISOString(),
+            postTriggerSeconds: this.activePostTriggerSeconds,
+        };
+    }
+
     // ─── Constructor ──────────────────────────────────────────────────────
 
     private constructor(
@@ -131,6 +204,12 @@ export class LiveCaptureWebviewPanel {
     ) {
         this.panel = panel;
         this.extensionUri = extensionUri;
+
+        // Prime backend-only prefill state immediately so timed/trigger options
+        // are available even on first panel open before any webview roundtrip.
+        if (this.prefill) {
+            this.primePrefillState(this.prefill);
+        }
 
         // Register the message listener BEFORE setting html to avoid any race.
         this.panel.webview.onDidReceiveMessage(
@@ -157,15 +236,55 @@ export class LiveCaptureWebviewPanel {
         }, null, this.disposables);
     }
 
+    private primePrefillState(prefill: LiveCapturePrefill): void {
+        this.pendingAutoStopSeconds =
+            typeof prefill.autoStopSeconds === 'number' && prefill.autoStopSeconds > 0
+                ? Math.floor(prefill.autoStopSeconds)
+                : undefined;
+        this.pendingAutoAnalyzeOnStop = !!prefill.autoAnalyzeOnStop;
+        this.pendingTriggerDisplayFilter = prefill.triggerDisplayFilter?.trim() || undefined;
+        this.pendingPostTriggerSeconds =
+            typeof prefill.postTriggerSeconds === 'number' && prefill.postTriggerSeconds > 0
+                ? Math.floor(prefill.postTriggerSeconds)
+                : undefined;
+        this.pendingTriggerMinMatches =
+            typeof prefill.triggerMinMatches === 'number' && prefill.triggerMinMatches > 0
+                ? Math.floor(prefill.triggerMinMatches)
+                : 1;
+    }
+
     private applyPrefill(prefill: LiveCapturePrefill): void {
         this.prefill = prefill;
+        this.primePrefillState(prefill);
+
+        // If capture is already running, apply timer/analyze settings immediately.
+        if (this.session && (this.session.status === 'capturing' || this.session.status === 'starting')) {
+            if (this.pendingAutoStopSeconds && this.pendingAutoStopSeconds > 0) {
+                this.scheduleAutoStop(this.pendingAutoStopSeconds);
+            }
+            this.activeAutoAnalyzeOnStop = this.pendingAutoAnalyzeOnStop;
+            this.activeTriggerDisplayFilter = this.pendingTriggerDisplayFilter;
+            this.activePostTriggerSeconds = this.pendingPostTriggerSeconds;
+            this.activeTriggerMinMatches = this.pendingTriggerMinMatches;
+            this.triggerLastCheckedFrame = this.session.packetCount;
+            this.triggerMatchCount = 0;
+            this.triggerMatchedAt = undefined;
+            this.triggerMatchedFrame = undefined;
+            this.startTriggerMonitor();
+            this.pendingAutoStopSeconds = undefined;
+            this.pendingAutoAnalyzeOnStop = false;
+            this.pendingTriggerDisplayFilter = undefined;
+            this.pendingPostTriggerSeconds = undefined;
+            this.pendingTriggerMinMatches = 1;
+        }
+
         this.postMessage({
             command: 'applyPrefill',
             suggestedInterface: prefill.suggestedInterface,
             captureFilter: prefill.captureFilter ?? '',
             displayFilter: prefill.displayFilter ?? '',
         });
-        if (prefill.autoStart && prefill.suggestedInterface) {
+        if (prefill.autoStart) {
             setTimeout(() => this.postMessage({ command: 'triggerAutoStart' }), 300);
         }
     }
@@ -204,7 +323,39 @@ export class LiveCaptureWebviewPanel {
             case 'refreshInterfaces': {
                 let ifaces: NetworkInterface[] = [];
                 try { ifaces = await this.tsharkRunner.listNetworkInterfaces(); } catch (e) { /* ignore */ }
-                this.postMessage({ command: 'setInterfaces', interfaces: ifaces });
+                const configuredDefaultInterface = vscode.workspace
+                    .getConfiguration('nettrace')
+                    .get<string>('defaultCaptureInterface', '')
+                    .trim();
+                this.postMessage({ command: 'setInterfaces', interfaces: ifaces, suggestedInterface: configuredDefaultInterface });
+                break;
+            }
+            case 'setDefaultInterface': {
+                const ifaceName = String(msg.interfaceName ?? '').trim();
+                const ifaceDisplayName = String(msg.interfaceDisplayName ?? '').trim();
+                if (!ifaceName) {
+                    vscode.window.showWarningMessage('No interface selected to set as default.');
+                    break;
+                }
+
+                await vscode.workspace.getConfiguration('nettrace').update(
+                    'defaultCaptureInterface',
+                    ifaceName,
+                    vscode.ConfigurationTarget.Global
+                );
+
+                this.postMessage({
+                    command: 'defaultInterfaceUpdated',
+                    defaultInterface: ifaceName,
+                    defaultInterfaceDisplayName: ifaceDisplayName,
+                });
+
+                this.outputChannel.appendLine(
+                    `[LiveCapture] Default capture interface set: ${ifaceDisplayName || ifaceName} (${ifaceName})`
+                );
+                vscode.window.showInformationMessage(
+                    `NetTrace default capture interface set to ${ifaceDisplayName || ifaceName}`
+                );
                 break;
             }
             case 'updateDisplayFilter':
@@ -215,14 +366,22 @@ export class LiveCaptureWebviewPanel {
                 await this.analyzeWithAI(msg);
                 break;
             case 'analyzePacket':
-                await vscode.commands.executeCommand('workbench.action.chat.open', {
-                    query: `@nettrace Look at packet #${msg.packetNumber} in detail. What's happening and is there an issue?`,
-                });
+                {
+                    const filePath = this.session?.outputFilePath || LiveCaptureWebviewPanel.lastCaptureFilePath;
+                    const marker = filePath ? `[[nettrace:captureFile=${encodeURIComponent(filePath)}]] ` : '';
+                    await vscode.commands.executeCommand('workbench.action.chat.open', {
+                        query: `@nettrace ${marker}Look at packet #${msg.packetNumber} in detail. What's happening and is there an issue?`,
+                    });
+                }
                 break;
             case 'analyzeStream':
-                await vscode.commands.executeCommand('workbench.action.chat.open', {
-                    query: `@nettrace /stream ${msg.streamIndex} Analyze this stream in detail.`,
-                });
+                {
+                    const filePath = this.session?.outputFilePath || LiveCaptureWebviewPanel.lastCaptureFilePath;
+                    const marker = filePath ? `[[nettrace:captureFile=${encodeURIComponent(filePath)}]] ` : '';
+                    await vscode.commands.executeCommand('workbench.action.chat.open', {
+                        query: `@nettrace ${marker}/stream ${msg.streamIndex} Analyze this stream in detail.`,
+                    });
+                }
                 break;
             case 'getPacketDetail':
                 if (this.session?.outputFilePath) {
@@ -281,6 +440,7 @@ export class LiveCaptureWebviewPanel {
 
         this.lastDisplayFilter = displayFilter;
         this.startTime = new Date();
+        const autoStopSeconds = this.pendingAutoStopSeconds;
 
         const session: LiveCaptureSession = {
             id: sessionId,
@@ -289,6 +449,7 @@ export class LiveCaptureWebviewPanel {
             captureFilter,
             displayFilter,
             outputFilePath: outputFile,
+            autoStopSeconds,
             status: 'starting',
             packetCount: 0,
             startTime: this.startTime,
@@ -297,6 +458,19 @@ export class LiveCaptureWebviewPanel {
         this.session = session;
         this.lastPushedLivePreviewCount = 0;
         this.lastLoggedLivePreviewCount = 0;
+        this.activeAutoAnalyzeOnStop = this.pendingAutoAnalyzeOnStop;
+        this.activeTriggerDisplayFilter = this.pendingTriggerDisplayFilter;
+        this.activePostTriggerSeconds = this.pendingPostTriggerSeconds;
+        this.activeTriggerMinMatches = this.pendingTriggerMinMatches;
+        this.triggerLastCheckedFrame = 0;
+        this.triggerMatchCount = 0;
+        this.triggerMatchedAt = undefined;
+        this.triggerMatchedFrame = undefined;
+        this.pendingAutoStopSeconds = undefined;
+        this.pendingAutoAnalyzeOnStop = false;
+        this.pendingTriggerDisplayFilter = undefined;
+        this.pendingPostTriggerSeconds = undefined;
+        this.pendingTriggerMinMatches = 1;
 
         this.outputChannel.appendLine(`[LiveCapture] Starting capture on ${interfaceName} → ${outputFile}`);
 
@@ -316,22 +490,9 @@ export class LiveCaptureWebviewPanel {
                     this.postMessage({ command: 'captureStarted', sessionId: s.id, outputFile: s.outputFilePath });
                     vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', true);
                     this.startRefreshTimer();
-                }
-            }
-
-            if (s.livePreviewPackets && s.livePreviewPackets.length > 0) {
-                if (s.livePreviewPackets.length !== this.lastPushedLivePreviewCount) {
-                    this.lastPushedLivePreviewCount = s.livePreviewPackets.length;
-                    this.postMessage({ command: 'updatePackets', packets: s.livePreviewPackets, isFinal: false });
-
-                    if (
-                        s.livePreviewPackets.length <= 5 ||
-                        s.livePreviewPackets.length - this.lastLoggedLivePreviewCount >= 50
-                    ) {
-                        this.lastLoggedLivePreviewCount = s.livePreviewPackets.length;
-                        this.outputChannel.appendLine(
-                            `[LiveCapture] Sent updatePackets: ${s.livePreviewPackets.length} packet row(s) to webview`
-                        );
+                    this.startTriggerMonitor();
+                    if (autoStopSeconds && autoStopSeconds > 0) {
+                        this.scheduleAutoStop(autoStopSeconds);
                     }
                 }
             }
@@ -339,9 +500,13 @@ export class LiveCaptureWebviewPanel {
             if (s.status === 'stopped') {
                 this.onCaptureStopped();
             }
-            // Always push the packet count update.
-            const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
-            this.postMessage({ command: 'packetCountUpdate', count: s.packetCount, elapsed });
+                // Only push live counter updates while actively capturing.
+                // Once stop begins, freeze the live UI and let captureComplete
+                // publish the final post-flush count.
+                if (s.status === 'starting' || s.status === 'capturing') {
+                    const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
+                    this.postMessage({ command: 'packetCountUpdate', count: s.packetCount, elapsed });
+                }
         });
     }
 
@@ -352,8 +517,13 @@ export class LiveCaptureWebviewPanel {
     public stopCapture(): void {
         if (!this.session || (this.session.status !== 'starting' && this.session.status !== 'capturing' && this.session.status !== 'stopping')) { return; }
         this.outputChannel.appendLine(`[LiveCapture] Stopping capture session ${this.session.id}`);
+        this.clearAutoStopTimer();
+        this.clearTriggerMonitor();
         this.session.status = 'stopping';
         this.clearRefreshTimer();
+            this.postMessage({ command: 'captureStopping' });
+            // Stop the active session. The tshark runner also tears down its paired
+            // preview process when the capture process exits.
         this.tsharkRunner.stopLiveCapture(this.session.id);
         vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', false);
         // The 'close' event on the process will call onCaptureStopped via the onUpdate callback.
@@ -362,6 +532,16 @@ export class LiveCaptureWebviewPanel {
     /** Reset the panel back to configure state (New Capture). */
     public newCapture(): void {
         this.clearRefreshTimer();
+        this.clearAutoStopTimer();
+        this.clearTriggerMonitor();
+        this.activeAutoAnalyzeOnStop = false;
+        this.activeTriggerDisplayFilter = undefined;
+        this.activePostTriggerSeconds = undefined;
+        this.activeTriggerMinMatches = 1;
+        this.triggerLastCheckedFrame = 0;
+        this.triggerMatchCount = 0;
+        this.triggerMatchedAt = undefined;
+        this.triggerMatchedFrame = undefined;
         if (this.session?.status === 'capturing') {
             this.tsharkRunner.stopLiveCapture(this.session.id);
             vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', false);
@@ -392,6 +572,8 @@ export class LiveCaptureWebviewPanel {
 
     private async onCaptureStopped(): Promise<void> {
         this.clearRefreshTimer();
+        this.clearAutoStopTimer();
+        this.clearTriggerMonitor();
         vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', false);
 
         const outputFile = this.session?.outputFilePath;
@@ -402,6 +584,17 @@ export class LiveCaptureWebviewPanel {
 
         // Tell the webview capture is complete so it enables the Analyze button.
         this.postMessage({ command: 'captureComplete', packetCount, elapsed, outputFile });
+
+        if (this.activeAutoAnalyzeOnStop) {
+            this.activeAutoAnalyzeOnStop = false;
+            await this.analyzeWithAI({
+                captureFilter: this.session?.captureFilter,
+                displayFilter: this.lastDisplayFilter,
+                interface: this.session?.interfaceDisplayName,
+                packetCount,
+                durationSec: elapsed,
+            });
+        }
 
         if (!outputFile) { return; }
 
@@ -437,6 +630,7 @@ export class LiveCaptureWebviewPanel {
                 if (packets.length > 0) {
                     const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
                     this.postMessage({ command: 'updatePackets', packets, elapsed, isFinal: false });
+                    this.postMessage({ command: 'packetCountUpdate', count: packets.length, elapsed });
                 }
             } catch (e) {
                 this.outputChannel.appendLine(`[LiveCapture] refresh read error: ${e}`);
@@ -448,6 +642,130 @@ export class LiveCaptureWebviewPanel {
         if (this.refreshTimer !== undefined) {
             clearInterval(this.refreshTimer);
             this.refreshTimer = undefined;
+        }
+    }
+
+    private startTriggerMonitor(): void {
+        this.clearTriggerMonitor();
+        if (!this.activeTriggerDisplayFilter || !this.activeTriggerDisplayFilter.trim()) {
+            return;
+        }
+        this.outputChannel.appendLine(
+            `[LiveCapture] Trigger monitor armed: "${this.activeTriggerDisplayFilter}" ` +
+            `(minMatches=${this.activeTriggerMinMatches}, postTriggerSeconds=${this.activePostTriggerSeconds ?? 0})`
+        );
+        this.triggerPollTimer = setInterval(() => {
+            this.checkTriggerProgress().catch((e) => {
+                this.outputChannel.appendLine(`[LiveCapture] Trigger monitor error: ${e}`);
+            });
+        }, 2000);
+    }
+
+    private clearTriggerMonitor(): void {
+        if (this.triggerPollTimer !== undefined) {
+            clearInterval(this.triggerPollTimer);
+            this.triggerPollTimer = undefined;
+        }
+        this.triggerCheckInFlight = false;
+    }
+
+    private async checkTriggerProgress(): Promise<void> {
+        if (this.triggerCheckInFlight) { return; }
+        if (!this.session?.outputFilePath) { return; }
+        if (!this.activeTriggerDisplayFilter || !this.activeTriggerDisplayFilter.trim()) { return; }
+        if (this.triggerMatchedAt) { return; }
+        if (this.session.status !== 'capturing' && this.session.status !== 'starting') { return; }
+
+        const captureFile = this.session.outputFilePath;
+        if (!fs.existsSync(captureFile)) { return; }
+
+        const currentFrame = Math.max(this.session.packetCount || 0, 0);
+        if (currentFrame <= this.triggerLastCheckedFrame) { return; }
+
+        this.triggerCheckInFlight = true;
+        try {
+            let start = this.triggerLastCheckedFrame + 1;
+            const end = currentFrame;
+
+            while (start <= end) {
+                const batchEnd = Math.min(end, start + 499);
+                const raw = await this.tsharkRunner.getPacketRange(
+                    captureFile,
+                    start,
+                    batchEnd,
+                    this.activeTriggerDisplayFilter
+                );
+
+                const { count, firstFrame } = this.countPacketRows(raw);
+                if (count > 0) {
+                    this.triggerMatchCount += count;
+                    if (this.triggerMatchedFrame === undefined && firstFrame !== undefined) {
+                        this.triggerMatchedFrame = firstFrame;
+                    }
+                }
+
+                if (this.triggerMatchCount >= this.activeTriggerMinMatches) {
+                    this.triggerMatchedAt = new Date();
+                    this.outputChannel.appendLine(
+                        `[LiveCapture] Trigger matched at frame ${this.triggerMatchedFrame ?? 'unknown'} ` +
+                        `(matches=${this.triggerMatchCount}).`
+                    );
+
+                    this.clearTriggerMonitor();
+
+                    const postSeconds = this.activePostTriggerSeconds ?? 0;
+                    if (postSeconds > 0) {
+                        this.scheduleAutoStop(postSeconds);
+                    } else {
+                        this.stopCapture();
+                    }
+                    this.triggerLastCheckedFrame = batchEnd;
+                    return;
+                }
+
+                this.triggerLastCheckedFrame = batchEnd;
+                start = batchEnd + 1;
+            }
+        } finally {
+            this.triggerCheckInFlight = false;
+        }
+    }
+
+    private countPacketRows(raw: string): { count: number; firstFrame?: number } {
+        if (!raw) { return { count: 0 }; }
+        const lines = raw.split('\n').map(l => l.trim()).filter(l => !!l);
+        let count = 0;
+        let firstFrame: number | undefined;
+        for (const line of lines) {
+            if (line.startsWith('frame.number|')) { continue; }
+            const field = line.split('|')[0];
+            const frameNum = Number.parseInt((field || '').trim(), 10);
+            if (!Number.isNaN(frameNum)) {
+                count++;
+                if (firstFrame === undefined) {
+                    firstFrame = frameNum;
+                }
+            }
+        }
+        return { count, firstFrame };
+    }
+
+    private scheduleAutoStop(seconds: number): void {
+        this.clearAutoStopTimer();
+        this.outputChannel.appendLine(`[LiveCapture] Auto-stop scheduled in ${seconds}s`);
+        this.autoStopTimer = setTimeout(() => {
+            if (!this.session || (this.session.status !== 'capturing' && this.session.status !== 'starting')) {
+                return;
+            }
+            this.outputChannel.appendLine('[LiveCapture] Auto-stop timer elapsed, calling stopCapture() directly...');
+            this.stopCapture();
+        }, seconds * 1000);
+    }
+
+    private clearAutoStopTimer(): void {
+        if (this.autoStopTimer !== undefined) {
+            clearTimeout(this.autoStopTimer);
+            this.autoStopTimer = undefined;
         }
     }
 
@@ -471,7 +789,10 @@ export class LiveCaptureWebviewPanel {
         if (elapsed) { contextParts.push(`duration: ${mins}:${secs}`); }
 
         const contextStr = contextParts.length > 0 ? ` [Live capture — ${contextParts.join(' | ')}]` : '';
-        const query = `@nettrace /diagnose${contextStr}`;
+        const marker = this.session?.outputFilePath
+            ? `[[nettrace:captureFile=${encodeURIComponent(this.session.outputFilePath)}]] `
+            : '';
+        const query = `@nettrace ${marker}/diagnose${contextStr}`;
 
         await vscode.commands.executeCommand('workbench.action.chat.open', { query });
     }
@@ -572,6 +893,16 @@ export class LiveCaptureWebviewPanel {
 
     private teardown(): void {
         this.clearRefreshTimer();
+        this.clearAutoStopTimer();
+        this.clearTriggerMonitor();
+        this.activeAutoAnalyzeOnStop = false;
+        this.activeTriggerDisplayFilter = undefined;
+        this.activePostTriggerSeconds = undefined;
+        this.activeTriggerMinMatches = 1;
+        this.triggerLastCheckedFrame = 0;
+        this.triggerMatchCount = 0;
+        this.triggerMatchedAt = undefined;
+        this.triggerMatchedFrame = undefined;
         if (this.session?.status === 'capturing') {
             this.tsharkRunner.stopLiveCapture(this.session.id);
             vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', false);
@@ -584,6 +915,11 @@ export class LiveCaptureWebviewPanel {
 
     private getHtml(interfaces: NetworkInterface[], error?: string): string {
         const webview = this.panel.webview;
+        const configuredDefaultInterface = vscode.workspace
+            .getConfiguration('nettrace')
+            .get<string>('defaultCaptureInterface', '')
+            .trim();
+        const selectedInterface = this.prefill?.suggestedInterface || configuredDefaultInterface;
         return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -702,6 +1038,53 @@ body {
 }
 #btn-refresh:hover:not(:disabled) { background: var(--row-hover); }
 #btn-refresh:disabled { opacity: 0.4; }
+#btn-iface-menu {
+    height: 24px;
+    min-width: 26px;
+    padding: 0 6px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    color: var(--fg);
+    font-size: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+#btn-iface-menu:hover:not(:disabled) { background: var(--row-hover); }
+#iface-menu {
+    position: fixed;
+    z-index: 30;
+    display: none;
+    min-width: 220px;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+    padding: 4px;
+}
+#iface-menu.visible { display: block; }
+.iface-menu-item {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: var(--fg);
+    text-align: left;
+    padding: 6px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.iface-menu-item:hover:not(:disabled) { background: var(--row-hover); }
+.iface-menu-item:disabled { opacity: 0.5; cursor: default; }
+#default-iface-label {
+    font-size: 11px;
+    color: var(--desc);
+    margin-left: 4px;
+    white-space: nowrap;
+}
 
 #capture-name-wrap { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 #capture-name-label,
@@ -989,12 +1372,15 @@ col.c-info { width: auto; }
                     const label = iface.isLoopback
                         ? `${iface.id}. [Loopback]`
                         : `${iface.id}. ${iface.displayName}`;
-                    const sel   = (this.prefill?.suggestedInterface === iface.name || this.prefill?.suggestedInterface === iface.displayName) ? ' selected' : '';
-                    return `<option value="${he(iface.name)}" data-dn="${he(iface.displayName)}"${sel}>${he(label)}</option>`;
+                    const sel = (selectedInterface === iface.name || selectedInterface === iface.displayName) ? ' selected' : '';
+                    return `<option value="${he(iface.name)}" data-dn="${he(iface.displayName)}" data-base-label="${he(label)}"${sel}>${he(label)}</option>`;
                 }).join('\n            ');
             })()}
         </select>
+        <button id="btn-default-iface" title="Set selected interface as default">☆</button>
+        <button id="btn-iface-menu" title="Interface actions">▾</button>
         <button id="btn-refresh" title="Refresh interfaces">&#8635;</button>
+        <span id="default-iface-label">${configuredDefaultInterface ? `Default: ${configuredDefaultInterface}` : 'Default: (not set)'}</span>
     </div>
     <div id="capture-name-wrap">
         <span id="capture-name-label">Name:</span>
@@ -1088,6 +1474,10 @@ col.c-info { width: auto; }
     </div>
 </div>
 
+<div id="iface-menu" role="menu" aria-label="Interface actions menu">
+    <button id="iface-menu-set-default" class="iface-menu-item" role="menuitem">Set selected interface as default</button>
+</div>
+
 <script>
 const vscode = acquireVsCodeApi();
 
@@ -1101,6 +1491,7 @@ window.onerror = function(msg, src, line, col, err) {
 const INITIAL_CAP_FILTER  = ${JSON.stringify(this.prefill?.captureFilter  ?? '')};
 const INITIAL_DISP_FILTER = ${JSON.stringify(this.prefill?.displayFilter  ?? '')};
 const INITIAL_AUTO_START  = ${JSON.stringify(this.prefill?.autoStart      ?? false)};
+let INITIAL_DEFAULT_IFACE = ${JSON.stringify(configuredDefaultInterface)};
 
 // ── State ────────────────────────────────────────────────────────────
 let isCapturing   = false;
@@ -1132,7 +1523,12 @@ const btnStop         = document.getElementById('btn-stop');
 const btnNew          = document.getElementById('btn-new');
 const btnClear        = document.getElementById('btn-clear');
 const btnAnalyze      = document.getElementById('btn-analyze');
+const btnDefaultIface = document.getElementById('btn-default-iface');
+const btnIfaceMenu    = document.getElementById('btn-iface-menu');
 const btnRefresh      = document.getElementById('btn-refresh');
+const defaultIfaceLabel = document.getElementById('default-iface-label');
+const ifaceMenu = document.getElementById('iface-menu');
+const ifaceMenuSetDefault = document.getElementById('iface-menu-set-default');
 const btnClearDf      = document.getElementById('btn-clear-df');
 const statusDot       = document.getElementById('status-dot');
 const statusText      = document.getElementById('status-text');
@@ -1204,6 +1600,50 @@ function initializeUiState() {
     btnAnalyze.style.display = 'none';
     lockCaptureControls(false);
 }
+
+function updateDefaultInterfaceUi() {
+    if (!btnDefaultIface || !ifaceSelect) { return; }
+    if (defaultIfaceLabel) {
+        const defaultOpt = [...ifaceSelect.options].find(o =>
+            o.value === INITIAL_DEFAULT_IFACE || (o.dataset?.dn || '') === INITIAL_DEFAULT_IFACE
+        );
+        const label = defaultOpt ? (defaultOpt.dataset?.dn || defaultOpt.value) : (INITIAL_DEFAULT_IFACE || '(not set)');
+        defaultIfaceLabel.textContent = 'Default: ' + label;
+    }
+    const selected = ifaceSelect.value || '';
+    const isDefault = !!selected && !!INITIAL_DEFAULT_IFACE &&
+        (selected === INITIAL_DEFAULT_IFACE || (ifaceSelect.selectedOptions[0]?.dataset?.dn || '') === INITIAL_DEFAULT_IFACE);
+    btnDefaultIface.textContent = isDefault ? '★' : '☆';
+    btnDefaultIface.title = isDefault
+        ? 'Selected interface is default'
+        : 'Set selected interface as default';
+}
+
+function refreshInterfaceDefaultTags() {
+    if (!ifaceSelect) { return; }
+    for (const opt of ifaceSelect.options) {
+        const baseLabel = (opt.dataset?.baseLabel || (opt.textContent || '').replace(/\s★ default/g, '')).trim();
+        if (opt.dataset) {
+            opt.dataset.baseLabel = baseLabel;
+        }
+        const isDefault = !!INITIAL_DEFAULT_IFACE &&
+            (opt.value === INITIAL_DEFAULT_IFACE || (opt.dataset?.dn || '') === INITIAL_DEFAULT_IFACE);
+        opt.textContent = isDefault ? (baseLabel + ' ★ default') : baseLabel;
+    }
+}
+
+function closeInterfaceMenu() {
+    if (!ifaceMenu) { return; }
+    ifaceMenu.classList.remove('visible');
+}
+
+function openInterfaceMenu() {
+    if (!ifaceMenu || !btnIfaceMenu) { return; }
+    const rect = btnIfaceMenu.getBoundingClientRect();
+    ifaceMenu.style.left = Math.max(8, rect.left - 180) + 'px';
+    ifaceMenu.style.top = (rect.bottom + 4) + 'px';
+    ifaceMenu.classList.add('visible');
+}
 // Signal the script has started executing (fires before any DOM work)
 log('Script started — DOM ready, acquireVsCodeApi OK');
 
@@ -1219,9 +1659,12 @@ if (ifaceSelect) {
         if (captureNameInput && !nameTouched) {
             captureNameInput.value = suggestCaptureNameMain();
         }
+        updateDefaultInterfaceUi();
     });
 }
 initializeUiState();
+refreshInterfaceDefaultTags();
+updateDefaultInterfaceUi();
 if (INITIAL_AUTO_START && ifaceSelect.value) {
     setTimeout(() => startCapture(ifaceSelect.value, ifaceSelect.selectedOptions[0]?.dataset?.dn || ifaceSelect.value), 300);
 }
@@ -1298,6 +1741,57 @@ btnAnalyze.addEventListener('click', () => {
 btnRefresh.addEventListener('click', () => {
     ifaceSelect.innerHTML = '<option value="">⌛ Refreshing…</option>';
     vscode.postMessage({ command: 'refreshInterfaces' });
+});
+
+function saveSelectedInterfaceAsDefault() {
+    const iface = ifaceSelect.value;
+    if (!iface) {
+        showBanner('Select an interface first, then set it as default.');
+        return;
+    }
+    const dispName = ifaceSelect.selectedOptions[0]?.dataset?.dn || iface;
+    INITIAL_DEFAULT_IFACE = iface;
+    if (defaultIfaceLabel) {
+        defaultIfaceLabel.textContent = 'Default: ' + dispName;
+    }
+    updateDefaultInterfaceUi();
+    vscode.postMessage({
+        command: 'setDefaultInterface',
+        interfaceName: iface,
+        interfaceDisplayName: dispName,
+    });
+}
+
+if (btnDefaultIface) {
+    btnDefaultIface.addEventListener('click', saveSelectedInterfaceAsDefault);
+}
+
+if (btnIfaceMenu) {
+    btnIfaceMenu.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (ifaceMenu && ifaceMenu.classList.contains('visible')) {
+            closeInterfaceMenu();
+        } else {
+            openInterfaceMenu();
+        }
+    });
+}
+
+if (ifaceMenuSetDefault) {
+    ifaceMenuSetDefault.addEventListener('click', () => {
+        closeInterfaceMenu();
+        saveSelectedInterfaceAsDefault();
+    });
+}
+
+document.addEventListener('click', (e) => {
+    if (!ifaceMenu || !btnIfaceMenu) { return; }
+    if (!ifaceMenu.classList.contains('visible')) { return; }
+    const target = e.target;
+    if (!(target instanceof Node)) { return; }
+    if (!ifaceMenu.contains(target) && !btnIfaceMenu.contains(target)) {
+        closeInterfaceMenu();
+    }
 });
 
 // ── Display filter bar ────────────────────────────────────────────────
@@ -1575,11 +2069,13 @@ function populateInterfaces(ifaces, suggested) {
     }
     for (const iface of ifaces) {
         const o  = document.createElement('option');
-        o.value  = iface.name;
-        o.textContent = iface.isLoopback
+        const baseLabel = iface.isLoopback
             ? '[Loopback]  ' + iface.displayName
             : iface.displayName;
+        o.value  = iface.name;
+        o.textContent = baseLabel;
         o.dataset.dn = iface.displayName;
+        o.dataset.baseLabel = baseLabel;
         ifaceSelect.appendChild(o);
     }
     if (suggested) {
@@ -1588,6 +2084,8 @@ function populateInterfaces(ifaces, suggested) {
         );
         if (found) { found.selected = true; }
     }
+    refreshInterfaceDefaultTags();
+    updateDefaultInterfaceUi();
 }
 
 // ── Message bus ───────────────────────────────────────────────────────
@@ -1608,18 +2106,47 @@ window.addEventListener('message', e => {
             }
             break;
 
+        case 'defaultInterfaceUpdated':
+            if (msg.defaultInterface) {
+                INITIAL_DEFAULT_IFACE = msg.defaultInterface;
+            }
+            if (defaultIfaceLabel) {
+                const label = msg.defaultInterfaceDisplayName || msg.defaultInterface || '(not set)';
+                defaultIfaceLabel.textContent = 'Default: ' + label;
+            }
+            refreshInterfaceDefaultTags();
+            updateDefaultInterfaceUi();
+            break;
+
         case 'applyPrefill':
             if (msg.suggestedInterface) {
-                const o = [...ifaceSelect.options].find(x => x.value === msg.suggestedInterface);
+                const o = [...ifaceSelect.options].find(x =>
+                    x.value === msg.suggestedInterface || (x.dataset?.dn || '') === msg.suggestedInterface
+                );
                 if (o) { o.selected = true; }
             }
             if (msg.captureFilter !== undefined) { capFilterInput.value  = msg.captureFilter; }
             if (msg.displayFilter !== undefined) { dispFilterInput.value = msg.displayFilter; displayFilter = msg.displayFilter; }
+            refreshInterfaceDefaultTags();
+            updateDefaultInterfaceUi();
             break;
 
         case 'triggerAutoStart':
-            if (!isCapturing && ifaceSelect.value) {
-                startCapture(ifaceSelect.value, ifaceSelect.selectedOptions[0]?.dataset?.dn || ifaceSelect.value);
+            if (!isCapturing) {
+                let iface = ifaceSelect.value;
+                if (!iface) {
+                    const firstValid = [...ifaceSelect.options].find(o => !!o.value && o.value.trim().length > 0);
+                    if (firstValid) {
+                        firstValid.selected = true;
+                        iface = firstValid.value;
+                    }
+                }
+                if (iface) {
+                    startCapture(iface, ifaceSelect.selectedOptions[0]?.dataset?.dn || iface);
+                } else {
+                    showBanner('Auto-start could not begin because no capture interface is available.');
+                    log('triggerAutoStart: no valid interface to start capture');
+                }
             }
             break;
 
@@ -1638,7 +2165,34 @@ window.addEventListener('message', e => {
             btnStop.disabled = false;
             break;
 
+        case 'captureStopping':
+            if (stopSafetyTimer) { clearTimeout(stopSafetyTimer); }
+            isCapturing = false;
+            isPausedMain = false;
+            if (btnPause) {
+                btnPause.disabled = true;
+                btnPause.innerHTML = '&#10074;&#10074;';
+                btnPause.title = 'Pause Live Trace';
+            }
+            btnStop.disabled = true;
+            btnNew.disabled = false;
+            if (btnClear) { btnClear.disabled = false; }
+            lockCaptureControls(false);
+            setStatus('stopping', 'Stopping…', '◉', '#ccc');
+            stopSafetyTimer = setTimeout(() => {
+                stopSafetyTimer = null;
+                if (!isCapturing) {
+                    btnStart.disabled = false;
+                    btnStop.disabled = true;
+                    btnNew.disabled = false;
+                    if (btnClear) { btnClear.disabled = false; }
+                    lockCaptureControls(false);
+                }
+            }, 5000);
+            break;
+
         case 'packetCountUpdate':
+            if (!isCapturing) { break; }
             packetCount = msg.count || 0;
             statPackets.textContent = packetCount.toLocaleString() + ' packets';
             if (packetCount > 0) {
@@ -1708,13 +2262,17 @@ window.addEventListener('message', e => {
         case 'resetPanel':
             if (msg.prefill) {
                 if (msg.prefill.suggestedInterface) {
-                    const o = [...ifaceSelect.options].find(x => x.value === msg.prefill.suggestedInterface);
+                    const o = [...ifaceSelect.options].find(x =>
+                        x.value === msg.prefill.suggestedInterface || (x.dataset?.dn || '') === msg.prefill.suggestedInterface
+                    );
                     if (o) { o.selected = true; }
                 }
                 capFilterInput.value  = msg.prefill.captureFilter  || '';
                 dispFilterInput.value = msg.prefill.displayFilter   || '';
                 displayFilter         = msg.prefill.displayFilter   || '';
             }
+            refreshInterfaceDefaultTags();
+            updateDefaultInterfaceUi();
             break;
 
         case 'packetDetail':

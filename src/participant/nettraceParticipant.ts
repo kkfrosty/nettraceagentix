@@ -1,10 +1,13 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { TsharkRunner } from '../parsing/tsharkRunner';
 import { ConfigLoader } from '../configLoader';
 import { ContextAssembler } from '../contextAssembler';
 import { CapturesTreeProvider } from '../views/capturesTreeProvider';
 import { AgentsTreeProvider } from '../views/agentsTreeProvider';
 import { StreamsTreeProvider } from '../views/streamsTreeProvider';
+import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
+import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
 import { AgentDefinition, AssembledContext, CaptureFile } from '../types';
 
 /**
@@ -53,6 +56,10 @@ export class NetTraceParticipant {
         token: vscode.CancellationToken
     ): Promise<vscode.ChatResult> {
         this.outputChannel.appendLine(`[ChatParticipant] Request: "${request.prompt}"`);
+        let { prompt: userPrompt, captureFileOverride } = this.extractCaptureOverride(request.prompt);
+        if (captureFileOverride) {
+            this.outputChannel.appendLine(`[ChatParticipant] Capture override from prompt: ${captureFileOverride}`);
+        }
 
         // Gate: tshark must be available
         if (!this.tsharkRunner.isAvailable()) {
@@ -60,8 +67,27 @@ export class NetTraceParticipant {
             return { metadata: { command: 'error' } };
         }
 
+        // Deterministic blocking workflow for "capture for N seconds, then analyze".
+        // This keeps the chat turn open with progress updates instead of returning early.
+        const timedWorkflow = await this.tryRunTimedCaptureAndAnalyzeWorkflow(userPrompt, stream, token);
+        if (timedWorkflow === null) {
+            return { metadata: { command: 'capture-control' } };
+        }
+        if (timedWorkflow) {
+            userPrompt = timedWorkflow.analysisPrompt;
+            captureFileOverride = timedWorkflow.captureFileOverride;
+            stream.markdown('🔎 Capture complete. Starting analysis now...\n\n');
+        } else {
+            // Deterministic capture-control fast path: execute explicit start/stop/status
+            // requests directly instead of entering the model/tool loop.
+            const controlResult = await this.tryHandleCaptureControlIntent(userPrompt, stream);
+            if (controlResult) {
+                return controlResult;
+            }
+        }
+
         // Determine which captures to analyze — dual-capture mode if both roles assigned
-        const { captures: capturesToAnalyze, mode: captureMode } = await this.getCapturesToAnalyze();
+        const { captures: capturesToAnalyze, mode: captureMode } = await this.getCapturesToAnalyze(captureFileOverride);
 
         if (capturesToAnalyze.length === 0) {
             // No capture is currently open in a viewer panel.
@@ -71,7 +97,7 @@ export class NetTraceParticipant {
             // any panel is open — the old code would fall back to allCaptures[0] and
             // wastefully assemble full context for the wrong file.
             this.outputChannel.appendLine('[ChatParticipant] No capture open — proceeding in no-capture mode');
-            return await this.handleNoCaptureRequest(request, context, stream, token);
+            return await this.handleNoCaptureRequest(request, context, stream, token, userPrompt);
         }
 
         // Primary capture: client in dual mode, or the only capture in single mode
@@ -194,11 +220,11 @@ export class NetTraceParticipant {
                     : primaryCapture.name;
                 stream.progress(`Analyzing ${firstTurnLabel}...`);
                 assembledContext = await this.contextAssembler.assembleContext(
-                    capturesToAnalyze, captureStreams, agent, request.prompt, request.model
+                    capturesToAnalyze, captureStreams, agent, userPrompt, request.model
                 );
             }
 
-            return await this.sendToModel(request, context, stream, token, assembledContext, request.prompt, capturesToAnalyze, agent, !isFollowUp);
+            return await this.sendToModel(request, context, stream, token, assembledContext, userPrompt, capturesToAnalyze, agent, !isFollowUp);
         } catch (error) {
             this.outputChannel.appendLine(`[ChatParticipant] Error: ${error}`);
             if (error instanceof vscode.LanguageModelError) {
@@ -497,29 +523,65 @@ export class NetTraceParticipant {
         const modelMax = model.maxInputTokens;
         this.outputChannel.appendLine(`[ChatParticipant] Model: ${model.name}, maxInput: ${modelMax}, context: ~${context.estimatedTokens} tokens`);
 
+        const liveStatus = LiveCaptureWebviewPanel.getActivePanel()?.getStatusSnapshot();
+
         // Build coverage string and stats line
         const pct = modelMax > 0 ? Math.round((context.estimatedTokens / modelMax) * 100) : 0;
         const coverageInfo = context.coverage
-            ? context.coverage.mode === 'complete'
-                ? `\u2705 All ${context.coverage.totalPackets.toLocaleString()} packets loaded`
-                : (() => {
-                    // Sampled mode: the initial load is intentionally sized to leave room in the
-                    // tool loop for range-paging calls. Surface this as a coverage plan, not a
-                    // limitation — "pre-loaded X%, tools will cover the rest" is more accurate
-                    // than implying only X% of the capture will be analyzed.
-                    const numRanges = context.coverage.uncoveredRanges?.length || 0;
-                    const uncoveredPct = context.coverage.totalPackets > 0
-                        ? Math.round(((context.coverage.totalPackets - context.coverage.packetsIncluded) / context.coverage.totalPackets) * 100)
-                        : 0;
-                    const rangeNote = numRanges > 0
-                        ? ` \u00b7 \ud83d\udd0d tools scanning remaining ${uncoveredPct}% via ${numRanges} range pass${numRanges > 1 ? 'es' : ''}`
-                        : '';
-                    return `\ud83d\udcca Pre-loaded ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${rangeNote}`;
+            ? captures.length === 0
+                ? (() => {
+                    if (!liveStatus?.hasSession) {
+                        return '\ud83e\uddf0 No capture preloaded yet (tool-driven mode)';
+                    }
+
+                    const livePackets = liveStatus.packetCount || 0;
+                    const status = liveStatus.sessionStatus;
+                    if ((status === 'starting' || status === 'capturing') && livePackets === 0) {
+                        return '\u23f3 Live capture is running — waiting for first packets';
+                    }
+                    if (status === 'stopping') {
+                        return '\u23f3 Live capture is stopping — finalizing capture file';
+                    }
+                    if (livePackets > 0) {
+                        return `\ud83d\udce1 Live capture has ${livePackets.toLocaleString()} packet${livePackets === 1 ? '' : 's'} available`;
+                    }
+                    return '\ud83d\udce1 Live capture session is ready';
                 })()
+                : context.coverage.mode === 'complete'
+                    ? `\u2705 All ${context.coverage.totalPackets.toLocaleString()} packets loaded`
+                    : (() => {
+                        // Sampled mode: the initial load is intentionally sized to leave room in the
+                        // tool loop for range-paging calls. Surface this as a coverage plan, not a
+                        // limitation — "pre-loaded X%, tools will cover the rest" is more accurate
+                        // than implying only X% of the capture will be analyzed.
+                        const numRanges = context.coverage.uncoveredRanges?.length || 0;
+                        const uncoveredPct = context.coverage.totalPackets > 0
+                            ? Math.round(((context.coverage.totalPackets - context.coverage.packetsIncluded) / context.coverage.totalPackets) * 100)
+                            : 0;
+                        const rangeNote = numRanges > 0
+                            ? ` \u00b7 \ud83d\udd0d tools scanning remaining ${uncoveredPct}% via ${numRanges} range pass${numRanges > 1 ? 'es' : ''}`
+                            : '';
+                        return `\ud83d\udcca Pre-loaded ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${rangeNote}`;
+                    })()
             : '';
         const captureLabel = captures.length > 1
             ? captures.map(c => `${c.name}${c.role ? ` [${c.role}]` : ''}`).join(' + ')
-            : captures.length === 1 ? captures[0].name : 'no capture loaded';
+            : captures.length === 1
+                ? captures[0].name
+                : (() => {
+                    if (!liveStatus?.hasSession) {
+                        return 'no capture selected yet';
+                    }
+                    const livePackets = liveStatus.packetCount || 0;
+                    const liveFile = liveStatus.captureFile ? path.basename(liveStatus.captureFile) : undefined;
+                    if (livePackets === 0 && (liveStatus.sessionStatus === 'starting' || liveStatus.sessionStatus === 'capturing')) {
+                        return 'active live capture (collecting packets)';
+                    }
+                    if (liveFile) {
+                        return `live capture (${liveFile})`;
+                    }
+                    return 'active live capture';
+                })();
         const statsLine = `*Using **${model.name}** \u2014 ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) \u00b7 ${coverageInfo} \u00b7 analyzing ${captureLabel}*`;
 
         if (isFirstTurn) {
@@ -643,11 +705,14 @@ export class NetTraceParticipant {
         messages = this.sanitizeMessagesForApi(messages);
 
         const toolNames = this.agentsTree.getActiveAgent().tools || [];
-        // Always include nettrace-startCapture so the LLM can start/set up a live
-        // capture regardless of which analysis agent is active.
-        const allToolNames = toolNames.includes('nettrace-startCapture')
-            ? toolNames
-            : [...toolNames, 'nettrace-startCapture'];
+        // Always include live-capture control tools regardless of active agent.
+        const requiredTools = ['nettrace-startCapture', 'nettrace-stopCapture', 'nettrace-getLiveCaptureStatus'];
+        const allToolNames = [...toolNames];
+        for (const required of requiredTools) {
+            if (!allToolNames.includes(required)) {
+                allToolNames.push(required);
+            }
+        }
         const tools = this.resolveTools(allToolNames);
 
         // Log message structure for debugging API errors
@@ -948,8 +1013,23 @@ export class NetTraceParticipant {
         request: vscode.ChatRequest,
         chatContext: vscode.ChatContext,
         stream: vscode.ChatResponseStream,
-        token: vscode.CancellationToken
+        token: vscode.CancellationToken,
+        userPrompt: string
     ): Promise<vscode.ChatResult> {
+        const livePanel = LiveCaptureWebviewPanel.getActivePanel();
+        const liveStatus = livePanel?.getStatusSnapshot();
+
+        // Reliability fallback: if user explicitly asks to stop capture, do it directly.
+        if (
+            livePanel &&
+            liveStatus?.hasSession &&
+            this.isStopCaptureIntent(userPrompt) &&
+            (liveStatus.sessionStatus === 'starting' || liveStatus.sessionStatus === 'capturing' || liveStatus.sessionStatus === 'stopping')
+        ) {
+            await vscode.commands.executeCommand('nettrace.stopLiveCapture');
+            stream.markdown('⏹️ Stopping the live capture now. I will analyze once capture finalization completes.\n\n');
+        }
+
         const agent = this.agentsTree.getActiveAgent();
 
         const systemPrompt = this.contextAssembler.buildSystemPromptPublic(agent);
@@ -961,12 +1041,17 @@ export class NetTraceParticipant {
             'There is no network capture currently loaded in a viewer panel.',
             '',
             'Available actions:',
-            '- Use the `nettrace-startCapture` tool to open the Live Capture panel and begin capturing',
+            '- Use `nettrace-startCapture` to open/start live capture (supports `durationSeconds` for auto-stop)',
+            '- Use `nettrace-stopCapture` to stop an active live capture session',
+            '- Use `nettrace-getLiveCaptureStatus` to check whether capture is running/stopping/stopped',
             '- Prompt the user to click a capture file in the **NetTrace** sidebar to open it',
             '- Prompt the user to run **NetTrace: Import Capture File** to load a .pcap/.pcapng file',
             '',
-            'If the user is asking to capture traffic ("start capturing", "capture on localhost", etc.),',
-            'call `nettrace-startCapture` with the appropriate filter and interface hint.',
+            'If the user asks to "capture for N seconds", call `nettrace-startCapture` with:',
+            '- `autoStart: true`',
+            '- `durationSeconds: N`',
+            '',
+            'If the user asks to stop capture now, call `nettrace-stopCapture`.',
             'If the user is asking to analyze an existing file, instruct them to open it first.',
         ].join('\n');
 
@@ -988,9 +1073,303 @@ export class NetTraceParticipant {
 
         return await this.sendToModel(
             request, chatContext, stream, token,
-            assembledContext, request.prompt,
+            assembledContext, userPrompt,
             /*captures=*/[], agent, /*isFirstTurn=*/true
         );
+    }
+
+    private isStopCaptureIntent(prompt: string): boolean {
+        const p = prompt.toLowerCase();
+        const asksToStop = /\b(stop|end|finish|terminate|halt)\b/.test(p);
+        const captureContext = /\b(capture|capturing|trace|recording|sniff)\b/.test(p);
+        return asksToStop && captureContext;
+    }
+
+    private isStartCaptureIntent(prompt: string): boolean {
+        const p = prompt.toLowerCase();
+        const asksToStart = /\b(start|begin|kick\s*off|initiate|run)\b/.test(p);
+        const captureContext = /\b(capture|capturing|trace|recording|sniff)\b/.test(p);
+        return asksToStart && captureContext;
+    }
+
+    private isStatusCaptureIntent(prompt: string): boolean {
+        const p = prompt.toLowerCase();
+        const asksStatus = /\b(status|progress|running|state|how\s+many\s+packets|how\s+long)\b/.test(p);
+        const captureContext = /\b(capture|capturing|trace|recording|sniff)\b/.test(p);
+        return asksStatus && captureContext;
+    }
+
+    private parseRequestedDurationSeconds(prompt: string): number | undefined {
+        const p = prompt.toLowerCase();
+        const m = p.match(/\b(?:for|after)\s+(\d+)\s*(seconds?|secs?|sec|minutes?|mins?|min|m|s)\b/);
+        if (!m) {
+            return undefined;
+        }
+        const value = Number.parseInt(m[1], 10);
+        if (!Number.isFinite(value) || value <= 0) {
+            return undefined;
+        }
+        const unit = m[2];
+        if (unit.startsWith('m')) {
+            return value * 60;
+        }
+        return value;
+    }
+
+    private isAnalyzeIntent(prompt: string): boolean {
+        const p = prompt.toLowerCase();
+        return /\b(analy[sz]e|analys[ei]s|anlysis|analzye|analize|diagnos[ei]s?|investigat(e|ion)|review|inspect|findings?|what'?s\s+wrong)\b/.test(p);
+    }
+
+    private async waitMs(ms: number, token: vscode.CancellationToken): Promise<boolean> {
+        if (token.isCancellationRequested) {
+            return false;
+        }
+
+        return await new Promise<boolean>((resolve) => {
+            const timer = setTimeout(() => {
+                disposable.dispose();
+                resolve(true);
+            }, ms);
+
+            const disposable = token.onCancellationRequested(() => {
+                clearTimeout(timer);
+                disposable.dispose();
+                resolve(false);
+            });
+        });
+    }
+
+    private async tryRunTimedCaptureAndAnalyzeWorkflow(
+        prompt: string,
+        stream: vscode.ChatResponseStream,
+        token: vscode.CancellationToken
+    ): Promise<{ captureFileOverride: string; analysisPrompt: string } | null | undefined> {
+        const durationSeconds = this.parseRequestedDurationSeconds(prompt);
+        const startIntent = this.isStartCaptureIntent(prompt);
+        const analyzeIntent = this.isAnalyzeIntent(prompt);
+        if (!startIntent || !analyzeIntent || !durationSeconds) {
+            return undefined;
+        }
+
+        this.outputChannel.appendLine(`[ChatParticipant] Timed capture workflow: ${durationSeconds}s then analyze`);
+        stream.progress(`Starting live capture for ${durationSeconds}s...`);
+
+        await vscode.commands.executeCommand('nettrace.openLiveCapture', {
+            autoStart: true,
+            autoStopSeconds: durationSeconds,
+            autoAnalyzeOnStop: false,
+        });
+
+        let status = LiveCaptureWebviewPanel.getActivePanel()?.getStatusSnapshot();
+        let started = !!status?.hasSession && (status.sessionStatus === 'starting' || status.sessionStatus === 'capturing');
+
+        for (let i = 0; i < 20 && !started; i++) {
+            const ok = await this.waitMs(500, token);
+            if (!ok) {
+                stream.markdown('Capture request canceled before start completed.\n\n');
+                return null;
+            }
+            status = LiveCaptureWebviewPanel.getActivePanel()?.getStatusSnapshot();
+            started = !!status?.hasSession && (status.sessionStatus === 'starting' || status.sessionStatus === 'capturing');
+        }
+
+        if (!started) {
+            stream.markdown('Could not confirm that live capture started.\n\n');
+            return null;
+        }
+
+        for (let sec = 1; sec <= durationSeconds; sec++) {
+            if (token.isCancellationRequested) {
+                LiveCaptureWebviewPanel.getActivePanel()?.stopCapture();
+                stream.markdown('Capture canceled. Sent stop signal.\n\n');
+                return null;
+            }
+
+            status = LiveCaptureWebviewPanel.getActivePanel()?.getStatusSnapshot();
+            const pktCount = status?.packetCount ?? 0;
+            stream.progress(`Capturing... ${sec}/${durationSeconds}s (${pktCount.toLocaleString()} packets)`);
+
+            const ok = await this.waitMs(1000, token);
+            if (!ok) {
+                LiveCaptureWebviewPanel.getActivePanel()?.stopCapture();
+                stream.markdown('Capture canceled. Sent stop signal.\n\n');
+                return null;
+            }
+        }
+
+            stream.progress('Waiting for timed stop and capture finalization...');
+
+        let captureFile = LiveCaptureWebviewPanel.getActiveCaptureFile();
+        let stopped = false;
+
+        for (let i = 0; i < 120; i++) {
+            const ok = await this.waitMs(500, token);
+            if (!ok) {
+                stream.markdown('Canceled while waiting for capture finalization.\n\n');
+                return null;
+            }
+
+            status = LiveCaptureWebviewPanel.getActivePanel()?.getStatusSnapshot();
+            captureFile = status?.captureFile || captureFile;
+            const state = status?.sessionStatus;
+            if (state === 'stopped' || state === 'error') {
+                stopped = true;
+                break;
+            }
+
+            // The panel owns the primary timer-based stop. Only intervene if it
+            // is still capturing shortly after the requested deadline.
+            if (i === 2) {
+                this.outputChannel.appendLine(
+                    `[ChatParticipant] Timed stop has not completed yet: ` +
+                    `status=${state ?? 'unknown'} — calling panel.stopCapture()`
+                );
+                const delayedPanel = LiveCaptureWebviewPanel.getActivePanel();
+                if (delayedPanel) {
+                    delayedPanel.stopCapture();
+                } else {
+                    await vscode.commands.executeCommand('nettrace.stopLiveCapture');
+                }
+            }
+
+            if (i === 10) {
+                this.outputChannel.appendLine(
+                    `[ChatParticipant] Stop command has not completed yet: ` +
+                    `status=${state ?? 'unknown'} — retrying nettrace.stopLiveCapture()`
+                );
+                const retryPanel = LiveCaptureWebviewPanel.getActivePanel();
+                if (retryPanel) {
+                    retryPanel.stopCapture();
+                } else {
+                    await vscode.commands.executeCommand('nettrace.stopLiveCapture');
+                }
+            }
+
+            if (i === 20) {
+                this.outputChannel.appendLine(
+                    `[ChatParticipant] Stop command still has not completed: ` +
+                    `status=${state ?? 'unknown'} — forcing stopAllLiveCaptures()`
+                );
+                this.tsharkRunner.stopAllLiveCaptures();
+            }
+        }
+
+        if (!stopped) {
+            stream.markdown(
+                'Capture stop timed out while waiting for finalization. ' +
+                'I sent a force-stop signal, but did not proceed to analysis to avoid reading a still-growing trace.\n\n'
+            );
+            return null;
+        }
+
+        if (!captureFile) {
+            stream.markdown('Capture finalized but no output file path was resolved for analysis.\n\n');
+            return null;
+        }
+
+        const lower = prompt.toLowerCase();
+        const suspiciousIntent = /\b(suspicious|malicious|threat|beacon|c2|exfiltration|intrusion|attack)\b/.test(lower);
+        const analysisPrompt = suspiciousIntent
+            ? 'Analyze this capture for suspicious traffic, top risks, and supporting packet evidence.'
+            : 'Analyze this capture and provide key findings, likely issues, and next steps.';
+
+        return {
+            captureFileOverride: captureFile,
+            analysisPrompt,
+        };
+    }
+
+    private async tryHandleCaptureControlIntent(
+        prompt: string,
+        stream: vscode.ChatResponseStream
+    ): Promise<vscode.ChatResult | undefined> {
+        const startIntent = this.isStartCaptureIntent(prompt);
+        const stopIntent = this.isStopCaptureIntent(prompt);
+        const statusIntent = this.isStatusCaptureIntent(prompt);
+        const durationSeconds = this.parseRequestedDurationSeconds(prompt);
+        const analyzeIntent = this.isAnalyzeIntent(prompt);
+
+        // Start intent takes priority over stop intent for combined requests like:
+        // "start capture for 1 minute, stop it, then analyze".
+        if (startIntent) {
+            const autoAnalyzeOnStop = !!durationSeconds && analyzeIntent;
+
+            await vscode.commands.executeCommand('nettrace.openLiveCapture', {
+                autoStart: true,
+                autoStopSeconds: durationSeconds,
+                autoAnalyzeOnStop,
+            });
+
+            const timerNote = durationSeconds
+                ? ` Auto-stop timer set for **${durationSeconds}s**.`
+                : '';
+            const analyzeNote = autoAnalyzeOnStop
+                ? ' I will automatically run analysis after the timer stop completes.'
+                : ' I will not run analysis automatically unless you ask.';
+
+            stream.markdown(
+                `▶️ Started live capture.${timerNote}${analyzeNote}\n\n`
+            );
+            return { metadata: { command: 'capture-control' } };
+        }
+
+        // Stop intent: always honor immediately when live panel exists.
+        if (stopIntent) {
+            const panel = LiveCaptureWebviewPanel.getActivePanel();
+            const status = panel?.getStatusSnapshot();
+            if (!panel || !status?.hasSession) {
+                stream.markdown('No live capture is active right now, so there is nothing to stop.\n\n');
+                return { metadata: { command: 'capture-control' } };
+            }
+
+            await vscode.commands.executeCommand('nettrace.stopLiveCapture');
+            stream.markdown('⏹️ Stop signal sent. Capture is being finalized now.\n\n');
+            return { metadata: { command: 'capture-control' } };
+        }
+
+        // Status intent: return deterministic panel status without invoking the model.
+        if (statusIntent) {
+            const panel = LiveCaptureWebviewPanel.getActivePanel();
+            const status = panel?.getStatusSnapshot();
+            if (!panel || !status) {
+                stream.markdown('No live capture panel is active.\n\n');
+                return { metadata: { command: 'capture-control' } };
+            }
+
+            const fileLabel = status.captureFile ? `\`${path.basename(status.captureFile)}\`` : '(not written yet)';
+            stream.markdown(
+                `Live capture status: **${status.sessionStatus || 'idle'}**\n` +
+                `- packets: **${status.packetCount.toLocaleString()}**\n` +
+                `- elapsed: **${status.elapsedSeconds}s**\n` +
+                `- file: ${fileLabel}\n\n`
+            );
+            return { metadata: { command: 'capture-control' } };
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Extract optional capture binding metadata from prompt text.
+     * Marker format: [[nettrace:captureFile=<url-encoded-absolute-path>]]
+     */
+    private extractCaptureOverride(prompt: string): { prompt: string; captureFileOverride?: string } {
+        const markerRe = /\[\[nettrace:captureFile=([^\]]+)\]\]/;
+        const m = prompt.match(markerRe);
+        if (!m) {
+            return { prompt };
+        }
+
+        let decoded: string | undefined;
+        try {
+            decoded = decodeURIComponent(m[1]);
+        } catch {
+            decoded = m[1];
+        }
+
+        const cleanPrompt = prompt.replace(markerRe, '').replace(/\s{2,}/g, ' ').trim();
+        return { prompt: cleanPrompt || 'Analyze this capture.', captureFileOverride: decoded };
     }
 
     // ─── Capture Selection ────────────────────────────────────────────────
@@ -1010,8 +1389,32 @@ export class NetTraceParticipant {
     *    - 3+ open panels        -> QuickPick (with safe fallback)
     * 4. Empty -> no-capture mode (handled by handleNoCaptureRequest)
      */
-    private async getCapturesToAnalyze(): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
+    private async getCapturesToAnalyze(captureFileOverride?: string): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
         const allCaptures = this.capturesTree.getCaptures();
+
+        // Explicit capture binding from panel-originated action always wins.
+        if (captureFileOverride) {
+            const bound = allCaptures.find(c => c.filePath === captureFileOverride);
+            if (bound) {
+                this.outputChannel.appendLine(`[ChatParticipant] Using bound capture from prompt: ${bound.filePath}`);
+                return { captures: [bound], mode: 'single' };
+            }
+
+            this.outputChannel.appendLine(
+                `[ChatParticipant] Bound capture not present in tree; synthesizing capture: ${captureFileOverride}`
+            );
+            return {
+                captures: [{
+                    filePath: captureFileOverride,
+                    name: path.basename(captureFileOverride),
+                    sizeBytes: 0,
+                    parsed: false,
+                    openInPanel: 'viewer',
+                }],
+                mode: 'single',
+            };
+        }
+
         const clientCapture = allCaptures.find(c => c.role === 'client');
         const serverCapture = allCaptures.find(c => c.role === 'server');
 
@@ -1027,7 +1430,29 @@ export class NetTraceParticipant {
             return { captures: [active], mode: 'single' };
         }
 
-        const openCaptures = this.capturesTree.getOpenCaptures();
+        let openCaptures = this.capturesTree.getOpenCaptures();
+
+        // Safety-net rehydration: if tree says nothing is open but panel registries
+        // clearly have open captures (e.g., after extension reload edge cases),
+        // repopulate panel state into the tree before deciding.
+        if (openCaptures.length === 0) {
+            const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
+            if (livePath) {
+                this.capturesTree.markOpenInPanel(livePath, 'live');
+            }
+
+            const viewerPanels = CaptureWebviewPanel.getOpenCapturePanels();
+            for (const p of viewerPanels) {
+                this.capturesTree.markOpenInPanel(p.filePath, 'viewer');
+            }
+
+            openCaptures = this.capturesTree.getOpenCaptures();
+            if (openCaptures.length > 0) {
+                this.outputChannel.appendLine(
+                    `[ChatParticipant] Rehydrated ${openCaptures.length} open capture(s) from panel registries`
+                );
+            }
+        }
 
         // Deterministic open-panel fallback: avoid dropping to no-capture when
         // captures are clearly open but no single panel is marked "active".

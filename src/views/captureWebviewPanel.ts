@@ -84,19 +84,29 @@ export class CaptureWebviewPanel {
                         await this.loadCaptureData();
                         break;
                     case 'analyzeWithAI':
-                        await vscode.commands.executeCommand('workbench.action.chat.open', {
-                            query: `@nettrace ${message.prompt}`,
-                        });
+                        {
+                            const marker = `[[nettrace:captureFile=${encodeURIComponent(this.currentCapture.filePath)}]]`;
+                            const prompt = message.prompt || 'Analyze this capture.';
+                            await vscode.commands.executeCommand('workbench.action.chat.open', {
+                                query: `@nettrace ${marker} ${prompt}`,
+                            });
+                        }
                         break;
                     case 'analyzePacket':
-                        await vscode.commands.executeCommand('workbench.action.chat.open', {
-                            query: `@nettrace Look at packet #${message.packetNumber} in detail. What's happening and is there an issue?`,
-                        });
+                        {
+                            const marker = `[[nettrace:captureFile=${encodeURIComponent(this.currentCapture.filePath)}]]`;
+                            await vscode.commands.executeCommand('workbench.action.chat.open', {
+                                query: `@nettrace ${marker} Look at packet #${message.packetNumber} in detail. What's happening and is there an issue?`,
+                            });
+                        }
                         break;
                     case 'analyzeStream':
-                        await vscode.commands.executeCommand('workbench.action.chat.open', {
-                            query: `@nettrace /stream ${message.streamIndex} Analyze this stream in detail.`,
-                        });
+                        {
+                            const marker = `[[nettrace:captureFile=${encodeURIComponent(this.currentCapture.filePath)}]]`;
+                            await vscode.commands.executeCommand('workbench.action.chat.open', {
+                                query: `@nettrace ${marker} /stream ${message.streamIndex} Analyze this stream in detail.`,
+                            });
+                        }
                         break;
                     case 'getStreamData':
                         await this.loadStreamPackets(message.streamIndex);
