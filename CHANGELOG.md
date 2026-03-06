@@ -2,6 +2,18 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
+## [0.1.9] - 2026-03-05
+
+### Fixed
+- **Dual-analysis active capture detection** — When two capture panels were open, active capture selection could resolve incorrectly during analysis and follow-up tool usage
+- **Live capture start/stop stability** — Follow-up fixes hardened the live capture panel's start and stop handling after the initial 0.1.8 release
+- **Open-in-Wireshark from captures** — Launching Wireshark from capture items could target the wrong path or fail to open reliably
+
+### Improved
+- **Live capture packet actions** — Live packet rows now preserve source, destination, protocol, and `tcp.stream` metadata so right-click actions can target the selected conversation or stream correctly
+- **Live display filter synchronization** — External filter updates pushed by tools now update the live capture filter bar and surface filter errors in the panel UI
+- **Post-stop live parse enrichment** — Final live-capture parsing now also collects protocol hierarchy data alongside packets, conversations, and expert information for downstream viewer parity work
+
 ## [0.1.8] - 2026-03-05
 
 ### Fixed

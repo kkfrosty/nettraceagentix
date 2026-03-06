@@ -2,7 +2,7 @@
   "name": "nettrace-agentix",
   "displayName": "NetTrace Agentix",
   "description": "AI-powered network trace and packet capture analysis for VS Code. Uses tshark (Wireshark CLI) to parse pcap and pcapng files, then drives GitHub Copilot to deliver expert network diagnosis, protocol-level troubleshooting, and anomaly detection — like having a network engineer in your editor.",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "publisher": "CognitiveAgentics-KrisFrost",
   "license": "MIT",
   "icon": "media/nettrace-icon.png",

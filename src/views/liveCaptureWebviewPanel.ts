@@ -583,10 +583,11 @@ export class LiveCaptureWebviewPanel {
 
         // Do a final full parse so the packet table is fully populated.
         try {
-            const [packetData, conversations, expertInfo] = await Promise.all([
+            const [packetData, conversations, expertInfo, protocolHierarchy] = await Promise.all([
                 this.tsharkRunner.getPacketsForDisplay(outputFile, this.lastDisplayFilter),
                 this.tsharkRunner.getConversations(outputFile).catch(() => []),
                 this.tsharkRunner.getExpertInfo(outputFile).catch(() => ''),
+                this.tsharkRunner.getProtocolHierarchy(outputFile).catch(() => ''),
             ]);
             const packets = this.parsePacketOutput(packetData);
             const packetCount = packets.length > 0
@@ -600,7 +601,7 @@ export class LiveCaptureWebviewPanel {
 
             // Tell the webview capture is complete so it enables the Analyze button.
             this.postMessage({ command: 'captureComplete', packetCount, elapsed, outputFile });
-            this.postMessage({ command: 'updatePackets', packets, conversations, expertInfo, isFinal: true });
+            this.postMessage({ command: 'updatePackets', packets, conversations, expertInfo, protocolHierarchy, isFinal: true });
 
             if (this.activeAutoAnalyzeOnStop) {
                 this.activeAutoAnalyzeOnStop = false;
@@ -823,6 +824,7 @@ export class LiveCaptureWebviewPanel {
         if (!fs.existsSync(this.session.outputFilePath)) { return; }
 
         try {
+            this.postMessage({ command: 'applyFilterExt', filter: this.lastDisplayFilter });
             const packetData = await this.tsharkRunner.getPacketsForDisplay(
                 this.session.outputFilePath,
                 this.lastDisplayFilter,
@@ -833,6 +835,7 @@ export class LiveCaptureWebviewPanel {
             this.postMessage({ command: 'updatePackets', packets, elapsed, isFinal: this.session.status !== 'capturing' });
         } catch (e) {
             this.outputChannel.appendLine(`[LiveCapture] applyDisplayFilter error: ${e}`);
+            this.postMessage({ command: 'filterError', message: `Invalid filter: ${e}` });
         }
     }
 
@@ -878,17 +881,18 @@ export class LiveCaptureWebviewPanel {
         const packets: any[] = [];
         for (const line of raw.split('\n')) {
             const fields = line.split('|');
-            if (fields.length < 7) { continue; }
+            if (fields.length < 5) { continue; }
             const num = parseInt(fields[0], 10);
             if (isNaN(num)) { continue; }
             packets.push({
                 num,
-                time: fields[1],
-                src: fields[2],
-                dst: fields[3],
-                proto: fields[4],
-                len: fields[5],
-                info: fields[6],
+                time: (fields[1] || '0').trim(),
+                src: (fields[2] || '').trim(),
+                dst: (fields[3] || '').trim(),
+                proto: (fields[4] || '').trim(),
+                len: (fields[5] || '').trim(),
+                info: fields.slice(6, -1).join('|').trim(),
+                stream: fields[fields.length - 1]?.trim() || '',
             });
         }
         return packets;
@@ -1176,6 +1180,117 @@ body {
     cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
 }
 #btn-clear-df:hover { background: var(--row-hover); }
+
+/* ════════════════════════════════════════
+   TAB BAR + AUX PANELS
+   ════════════════════════════════════════ */
+.tab-bar {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    background: var(--toolbar-bg);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+.tab {
+    padding: 6px 16px;
+    cursor: pointer;
+    font-size: 12px;
+    border-bottom: 2px solid transparent;
+    color: var(--desc);
+    user-select: none;
+}
+.tab:hover { color: var(--fg); background: var(--row-hover); }
+.tab.active {
+    color: var(--fg);
+    border-bottom-color: var(--input-focus);
+}
+.tab-content {
+    display: none;
+    flex: 1;
+    overflow: hidden;
+    min-height: 0;
+}
+.tab-content.active {
+    display: flex;
+    flex-direction: column;
+}
+.side-panel {
+    padding: 12px;
+    overflow: auto;
+}
+
+/* ── Packet context menu ─────────────────────────────── */
+.ctx-menu {
+    position: fixed;
+    z-index: 1000;
+    background: var(--toolbar-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 0;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    min-width: 220px;
+    font-size: 12px;
+}
+.ctx-menu-item {
+    padding: 5px 16px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ctx-menu-item:hover { background: var(--row-hover); }
+.ctx-menu-sep {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 0;
+}
+
+/* ── Conversations / expert / protocols ─────────────── */
+.conv-table { table-layout: auto; }
+.conv-table td { padding: 4px 8px; }
+.btn-icon {
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--fg);
+    border-radius: 4px;
+    cursor: pointer;
+    width: 24px;
+    height: 24px;
+}
+.btn-icon:hover { background: var(--row-hover); }
+.proto-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 8px;
+    border-bottom: 1px solid var(--border);
+}
+.proto-name { font-weight: 500; }
+.proto-count { color: var(--desc); }
+.expert-entry {
+    padding: 4px 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    border-left: 3px solid transparent;
+    margin-bottom: 2px;
+}
+.expert-error { border-left-color: #f44; background: rgba(255,0,0,0.05); }
+.expert-warning { border-left-color: #fa0; background: rgba(255,165,0,0.05); }
+.expert-note { border-left-color: #0af; background: rgba(0,170,255,0.05); }
+.badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 11px;
+}
+.badge-warning { background: rgba(255,165,0,0.2); color: #fa0; }
+.badge-ok { color: #4c4; }
+.row-error > td { background: rgba(255, 0, 0, 0.08); }
+.row-warning > td { background: rgba(255, 165, 0, 0.08); }
+#protocol-raw {
+    margin-top: 16px;
+    font-size: 11px;
+    white-space: pre-wrap;
+    color: var(--desc);
+}
 
 /* ════════════════════════════════════════
    STATUS BAR  (bottom-style bar at top of table)
@@ -1794,6 +1909,7 @@ if (ifaceMenuSetDefault) {
 }
 
 document.addEventListener('click', (e) => {
+    closePacketContextMenu(e.target);
     if (!ifaceMenu || !btnIfaceMenu) { return; }
     if (!ifaceMenu.classList.contains('visible')) { return; }
     const target = e.target;
@@ -1807,6 +1923,7 @@ document.addEventListener('click', (e) => {
 let dfTimer = null;
 dispFilterInput.addEventListener('input', () => {
     displayFilter = dispFilterInput.value.trim();
+    hideBanner();
     vscode.postMessage({ command: 'updateDisplayFilter', filter: displayFilter });
     clearTimeout(dfTimer);
     dfTimer = setTimeout(() => dfTimer = null, 400);
@@ -1814,6 +1931,7 @@ dispFilterInput.addEventListener('input', () => {
 btnClearDf.addEventListener('click', () => {
     dispFilterInput.value = '';
     displayFilter = '';
+    hideBanner();
     vscode.postMessage({ command: 'updateDisplayFilter', filter: '' });
 });
 
@@ -1825,20 +1943,17 @@ tableWrap.addEventListener('scroll', () => {
 
 // ── Packet row click → detail pane ────────────────────────────────────
 pktBody.addEventListener('click', e => {
-    const tr = e.target.closest('tr');
+    const tr = e.target.closest('tr[data-packet]');
     if (!tr) { return; }
-    if (selectedTr) { selectedTr.classList.remove('selected'); }
-    tr.classList.add('selected');
-    selectedTr = tr;
-    const frame = parseInt(tr.dataset.f);
-    if (!isNaN(frame)) {
-        liveDetailTitle.textContent = 'Packet #' + frame + ' Detail';
-        liveDetailContent.innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail…</div>';
-        liveHexContent.textContent = 'Loading hex dump…';
-        wsBottom.style.display = 'flex';
-        vscode.postMessage({ command: 'getPacketDetail', frameNumber: frame });
-        vscode.postMessage({ command: 'getPacketHex', frameNumber: frame });
-    }
+    selectPacketRow(tr);
+});
+
+pktBody.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    const tr = e.target.closest('tr[data-packet]');
+    if (!tr) { return; }
+    selectPacketRow(tr);
+    showPacketContextMenu(e.clientX, e.clientY, tr);
 });
 
 // ── Detail / hex pane collapse toggles ──────────────────────────────
@@ -1885,13 +2000,107 @@ liveDetailContent.addEventListener('click', function(e) {
 });
 
 pktBody.addEventListener('dblclick', e => {
-    const tr = e.target.closest('tr');
+    const tr = e.target.closest('tr[data-packet]');
     if (!tr) { return; }
-    const frame = parseInt(tr.dataset.f);
+    const frame = parseInt(tr.dataset.packet || tr.dataset.f);
     if (!isNaN(frame)) { vscode.postMessage({ command: 'analyzePacket', packetNumber: frame }); }
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────
+function closePacketContextMenu(target) {
+    const menu = document.getElementById('ctxMenu');
+    if (menu && (!target || !menu.contains(target))) {
+        menu.remove();
+    }
+}
+
+function selectPacketRow(tr) {
+    if (selectedTr) { selectedTr.classList.remove('selected'); }
+    tr.classList.add('selected');
+    selectedTr = tr;
+    const frame = parseInt(tr.dataset.packet || tr.dataset.f, 10);
+    if (Number.isNaN(frame)) { return; }
+    liveDetailTitle.textContent = 'Packet #' + frame + ' Detail';
+    liveDetailContent.innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail...</div>';
+    liveHexContent.textContent = 'Loading hex dump...';
+    wsBottom.style.display = 'flex';
+    vscode.postMessage({ command: 'getPacketDetail', frameNumber: frame });
+    vscode.postMessage({ command: 'getPacketHex', frameNumber: frame });
+}
+
+function applyDisplayFilter(filter) {
+    dispFilterInput.value = filter;
+    displayFilter = filter.trim();
+    hideBanner();
+    vscode.postMessage({ command: 'updateDisplayFilter', filter: displayFilter });
+}
+
+function showPacketContextMenu(x, y, tr) {
+    closePacketContextMenu();
+
+    const src = tr.dataset.src || '';
+    const dst = tr.dataset.dst || '';
+    const proto = tr.dataset.proto || '';
+    const stream = tr.dataset.stream || '';
+    const packetNum = tr.dataset.packet || tr.dataset.f || '';
+
+    const items = [];
+    if (stream !== '') {
+        items.push({ label: 'Filter: TCP Conversation (stream ' + stream + ')', filter: 'tcp.stream == ' + stream });
+    }
+    if (src) {
+        items.push({ label: 'Filter: Source → ' + src, filter: 'ip.addr == ' + src });
+    }
+    if (dst) {
+        items.push({ label: 'Filter: Destination → ' + dst, filter: 'ip.addr == ' + dst });
+    }
+    if (src && dst) {
+        items.push({ label: 'Filter: Conversation ' + src + ' ↔ ' + dst, filter: 'ip.addr == ' + src + ' && ip.addr == ' + dst });
+    }
+    if (proto) {
+        items.push({ label: 'Filter: Protocol ' + proto, filter: proto.toLowerCase() });
+    }
+    items.push(null);
+    items.push({ label: 'Analyze Packet #' + packetNum + ' with AI', action: 'analyzePacket', packet: packetNum });
+    if (stream !== '') {
+        items.push({ label: 'Analyze TCP Stream ' + stream + ' with AI', action: 'analyzeStream', stream: stream });
+    }
+
+    const menu = document.createElement('div');
+    menu.id = 'ctxMenu';
+    menu.className = 'ctx-menu';
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+
+    for (const item of items) {
+        if (item === null) {
+            const sep = document.createElement('div');
+            sep.className = 'ctx-menu-sep';
+            menu.appendChild(sep);
+            continue;
+        }
+        const mi = document.createElement('div');
+        mi.className = 'ctx-menu-item';
+        mi.textContent = item.label;
+        mi.addEventListener('click', () => {
+            menu.remove();
+            if (item.filter) {
+                applyDisplayFilter(item.filter);
+            } else if (item.action === 'analyzePacket') {
+                vscode.postMessage({ command: 'analyzePacket', packetNumber: item.packet });
+            } else if (item.action === 'analyzeStream') {
+                vscode.postMessage({ command: 'analyzeStream', streamIndex: parseInt(item.stream, 10) });
+            }
+        });
+        menu.appendChild(mi);
+    }
+
+    document.body.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) { menu.style.left = (window.innerWidth - rect.width - 4) + 'px'; }
+    if (rect.bottom > window.innerHeight) { menu.style.top = (window.innerHeight - rect.height - 4) + 'px'; }
+}
+
 function startCapture(iface, dispName) {
     isCapturing   = true;
     ifaceName     = iface;
@@ -1911,7 +2120,7 @@ function startCapture(iface, dispName) {
     if (filterRow) { filterRow.style.display = 'flex'; }
     if (captureNameWrap) { captureNameWrap.style.display = 'flex'; }
     if (ifaceWrap) { ifaceWrap.style.display = 'flex'; }
-    filterBar.classList.remove('visible');
+    filterBar.classList.add('visible');
 
     setStatus('capturing', 'Capturing on ' + ifaceDispName, '⏺', 'var(--red)');
     vscode.postMessage({ command: 'startCapture', interfaceName: iface, interfaceDisplayName: dispName, captureFilter, displayFilter, captureName: captureNameInput ? captureNameInput.value.trim() : '' });
@@ -1986,6 +2195,13 @@ function protoClass(p) {
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+function formatBytes(bytes) {
+    const num = Number(bytes) || 0;
+    if (num < 1024) { return num + ' B'; }
+    if (num < 1024 * 1024) { return (num / 1024).toFixed(1) + ' KB'; }
+    return (num / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
 function pad2(n) { return String(n).padStart(2,'0'); }
 function fmtElapsed(s) {
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
@@ -2042,13 +2258,28 @@ function renderProtoNode(node, depth, startExpanded) {
 }
 
 function renderPackets(packets) {
-    if (!Array.isArray(packets) || packets.length === 0) { return; }
+    if (!Array.isArray(packets) || packets.length === 0) {
+        pktBody.innerHTML = '';
+        tableWrap.style.display = 'none';
+        if (!isCapturing) {
+            emptyState.style.display = 'flex';
+        }
+        return;
+    }
     const wasBottom = autoScroll;
     const frag = document.createDocumentFragment();
     for (const p of packets) {
         const tr = document.createElement('tr');
         tr.dataset.f = p.num;
+        tr.dataset.packet = p.num;
+        tr.dataset.src = p.src || '';
+        tr.dataset.dst = p.dst || '';
+        tr.dataset.proto = p.proto || '';
+        tr.dataset.stream = p.stream || '';
         const pc = protoClass(p.proto);
+        if (pc) {
+            tr.classList.add(pc);
+        }
         tr.innerHTML =
             '<td>' + p.num + '</td>' +
             '<td>' + esc(p.time || '') + '</td>' +
@@ -2163,6 +2394,7 @@ window.addEventListener('message', e => {
             isCapturing = true;
             outputFile = msg.outputFile || '';
             elapsedSec = 0;
+            filterBar.classList.add('visible');
             if (clockTimer) { clearInterval(clockTimer); }
             clockTimer = setInterval(() => {
                 elapsedSec++;
@@ -2243,6 +2475,16 @@ window.addEventListener('message', e => {
             if (captureNameWrap) { captureNameWrap.style.display = 'flex'; }
             if (ifaceWrap) { ifaceWrap.style.display = 'flex'; }
             filterBar.classList.add('visible');
+            break;
+
+        case 'applyFilterExt':
+            dispFilterInput.value = msg.filter || '';
+            displayFilter = msg.filter || '';
+            hideBanner();
+            break;
+
+        case 'filterError':
+            showBanner(msg.message || 'Invalid filter');
             break;
 
         case 'captureError':
