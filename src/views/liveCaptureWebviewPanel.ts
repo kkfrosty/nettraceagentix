@@ -577,24 +577,7 @@ export class LiveCaptureWebviewPanel {
         vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', false);
 
         const outputFile = this.session?.outputFilePath;
-        const packetCount = this.session?.packetCount ?? 0;
         const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
-
-        this.outputChannel.appendLine(`[LiveCapture] Capture stopped. File: ${outputFile}, packets: ${packetCount}`);
-
-        // Tell the webview capture is complete so it enables the Analyze button.
-        this.postMessage({ command: 'captureComplete', packetCount, elapsed, outputFile });
-
-        if (this.activeAutoAnalyzeOnStop) {
-            this.activeAutoAnalyzeOnStop = false;
-            await this.analyzeWithAI({
-                captureFilter: this.session?.captureFilter,
-                displayFilter: this.lastDisplayFilter,
-                interface: this.session?.interfaceDisplayName,
-                packetCount,
-                durationSec: elapsed,
-            });
-        }
 
         if (!outputFile) { return; }
 
@@ -606,7 +589,29 @@ export class LiveCaptureWebviewPanel {
                 this.tsharkRunner.getExpertInfo(outputFile).catch(() => ''),
             ]);
             const packets = this.parsePacketOutput(packetData);
+            const packetCount = packets.length > 0
+                ? Math.max(...packets.map((packet) => Number(packet.num) || 0))
+                : (this.session?.packetCount ?? 0);
+            if (this.session) {
+                this.session.packetCount = packetCount;
+            }
+
+            this.outputChannel.appendLine(`[LiveCapture] Capture stopped. File: ${outputFile}, packets: ${packetCount}`);
+
+            // Tell the webview capture is complete so it enables the Analyze button.
+            this.postMessage({ command: 'captureComplete', packetCount, elapsed, outputFile });
             this.postMessage({ command: 'updatePackets', packets, conversations, expertInfo, isFinal: true });
+
+            if (this.activeAutoAnalyzeOnStop) {
+                this.activeAutoAnalyzeOnStop = false;
+                await this.analyzeWithAI({
+                    captureFilter: this.session?.captureFilter,
+                    displayFilter: this.lastDisplayFilter,
+                    interface: this.session?.interfaceDisplayName,
+                    packetCount,
+                    durationSec: elapsed,
+                });
+            }
         } catch (e) {
             this.outputChannel.appendLine(`[LiveCapture] Final parse error: ${e}`);
         }
@@ -629,8 +634,12 @@ export class LiveCaptureWebviewPanel {
                 const packets = this.parsePacketOutput(packetData);
                 if (packets.length > 0) {
                     const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
+                    const packetCount = Math.max(...packets.map((packet) => Number(packet.num) || 0));
+                    if (this.session) {
+                        this.session.packetCount = packetCount;
+                    }
                     this.postMessage({ command: 'updatePackets', packets, elapsed, isFinal: false });
-                    this.postMessage({ command: 'packetCountUpdate', count: packets.length, elapsed });
+                    this.postMessage({ command: 'packetCountUpdate', count: packetCount, elapsed });
                 }
             } catch (e) {
                 this.outputChannel.appendLine(`[LiveCapture] refresh read error: ${e}`);
