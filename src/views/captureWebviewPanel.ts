@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { TsharkRunner } from '../parsing/tsharkRunner';
 import { CaptureFile } from '../types';
+import { ParsedPacketRow, ProtoTreeNode, loadPacketDetailIntoWebview, loadPacketHexIntoWebview, parsePacketOutput } from './sharedCaptureView';
 
 /**
  * Manages the Capture Viewer webview panel — a mini Wireshark inside VS Code.
@@ -223,248 +224,29 @@ export class CaptureWebviewPanel {
      * This is more reliable than PDML XML parsing.
      */
     private async loadPacketDetail(frameNumber: number): Promise<void> {
-        this.outputChannel.appendLine(`[WebviewPanel] Loading detail for packet #${frameNumber}`);
-        try {
-            // Use -V verbose text output — reliable and easy to parse by indentation
-            const verbose = await this.tsharkRunner.getPacketDetail(
-                this.currentCapture.filePath,
-                frameNumber
-            );
-
-            this.outputChannel.appendLine(`[WebviewPanel] Verbose output length: ${verbose.length} chars, lines: ${verbose.split('\n').length}`);
-
-            const tree = this.parseVerboseToTree(verbose);
-
-            this.outputChannel.appendLine(`[WebviewPanel] Parsed ${tree.length} protocol layers: ${tree.map(n => n.showname.substring(0, 40)).join(' | ')}`);
-
-            if (tree.length === 0) {
-                // Fallback: show raw text if parsing produced nothing
-                this.outputChannel.appendLine(`[WebviewPanel] Tree empty, showing raw text`);
-                this.panel.webview.postMessage({
-                    command: 'packetDetailRaw',
-                    frameNumber,
-                    text: verbose || 'No detail available for this packet.',
-                });
-                return;
-            }
-
-            this.panel.webview.postMessage({
-                command: 'packetDetail',
-                frameNumber,
-                tree,
-            });
-        } catch (e) {
-            this.outputChannel.appendLine(`[WebviewPanel] Packet detail error: ${e}`);
-            this.panel.webview.postMessage({
-                command: 'packetDetailRaw',
-                frameNumber,
-                text: `Error loading packet detail: ${e}`,
-            });
-        }
+        await loadPacketDetailIntoWebview({
+            tsharkRunner: this.tsharkRunner,
+            captureFile: this.currentCapture.filePath,
+            frameNumber,
+            postMessage: (message) => this.panel.webview.postMessage(message),
+            outputChannel: this.outputChannel,
+            logPrefix: 'WebviewPanel',
+            preferredFormat: 'verbose',
+        });
     }
 
     /**
      * Load hex dump for a single packet.
      */
     private async loadPacketHex(frameNumber: number): Promise<void> {
-        try {
-            const hex = await this.tsharkRunner.getPacketHexDump(
-                this.currentCapture.filePath,
-                frameNumber
-            );
-            this.panel.webview.postMessage({
-                command: 'packetHex',
-                frameNumber,
-                hex,
-            });
-        } catch (e) {
-            this.panel.webview.postMessage({
-                command: 'packetHex',
-                frameNumber,
-                hex: `Error: ${e}`,
-            });
-        }
-    }
-
-    /**
-     * Parse tshark -V (verbose) text output into a tree structure.
-     * Lines with no leading space = protocol headers (Frame, Ethernet, IP, TCP...)
-     * Lines with leading spaces = fields under the protocol, nesting by indent level.
-     * 
-     * This is the same format Wireshark shows in the middle pane.
-     */
-    private parseVerboseToTree(verbose: string): ProtoTreeNode[] {
-        const nodes: ProtoTreeNode[] = [];
-        if (!verbose || verbose.trim().length === 0) { return nodes; }
-
-        const rawLines = verbose.split('\n');
-
-        // tshark -V can wrap long lines. We join continuation lines that have
-        // unusual indentation back to the previous line.
-        const lines: string[] = [];
-        for (const raw of rawLines) {
-            if (raw.length === 0) { continue; }
-            const indent = raw.search(/\S/);
-            if (indent === -1) { continue; }
-
-            if (lines.length > 0 && indent > 0) {
-                const prevIndent = lines[lines.length - 1].search(/\S/);
-                // Continuation: odd indent, or way deeper than expected
-                if (indent % 4 !== 0 || indent > prevIndent + 8) {
-                    lines[lines.length - 1] = lines[lines.length - 1] + ' ' + raw.trim();
-                    continue;
-                }
-            }
-            lines.push(raw);
-        }
-
-        // Parse lines into a tree by indentation level.
-        // indent=0 → protocol header (top-level expandable node)
-        // indent=4 → field under protocol
-        // indent=8 → sub-field, etc.
-        const stack: Array<{ node: ProtoTreeNode; indent: number }> = [];
-
-        for (const line of lines) {
-            const indent = line.search(/\S/);
-            if (indent === -1) { continue; }
-            const text = line.trim();
-            if (text.length === 0) { continue; }
-
-            const node: ProtoTreeNode = {
-                name: '',
-                showname: text,
-                children: [],
-            };
-
-            if (indent === 0) {
-                // Protocol header — top-level node
-                nodes.push(node);
-                stack.length = 0;
-                stack.push({ node, indent: 0 });
-            } else {
-                // Field — pop stack to find parent with lower indent
-                while (stack.length > 0 && stack[stack.length - 1].indent >= indent) {
-                    stack.pop();
-                }
-                if (stack.length > 0) {
-                    stack[stack.length - 1].node.children.push(node);
-                } else {
-                    nodes.push(node);
-                }
-                stack.push({ node, indent });
-            }
-        }
-
-        return nodes;
-    }
-
-    /**
-     * Parse PDML XML into a tree structure for the webview.
-     * Properly handles nested fields, multi-line tags, and filters out hidden entries.
-     *
-     * PDML structure:
-     *   <packet>
-     *     <proto name="frame" showname="Frame 1: ...">
-     *       <field name="frame.time" showname="Arrival Time: ..."/>
-     *       <field name="frame.len" showname="Frame Length: ...">
-     *         <field name="..." showname="..."/>   ← nested children
-     *       </field>
-     *     </proto>
-     *   </packet>
-     */
-    private parsePdmlToTree(pdml: string): ProtoTreeNode[] {
-        const nodes: ProtoTreeNode[] = [];
-
-        // Normalize: collapse multi-line tags into single lines.
-        // tshark wraps long attribute values across lines.
-        const normalized = pdml.replace(/\n\s*/g, ' ');
-
-        // Extract all tags using a regex that matches opening, self-closing, and closing tags
-        // Regex to match XML tags. Use lazy capture for attrs so trailing / isn't consumed.
-        const tagRegex = /<(\/?)(\w+)(\s[^>]*?)?\s*(\/?)>/g;
-        const stack: ProtoTreeNode[] = [];
-        let skipDepth = 0; // Track depth inside hidden or geninfo elements
-
-        let match;
-        while ((match = tagRegex.exec(normalized)) !== null) {
-            const isClosing = match[1] === '/';
-            const tagName = match[2];
-            const attrStr = match[3] || '';
-            const isSelfClosing = match[4] === '/';
-
-            // Skip non-proto/field tags (pdml, packet, etc.)
-            if (tagName !== 'proto' && tagName !== 'field') { continue; }
-
-            if (isClosing) {
-                // Closing tag: </proto> or </field>
-                if (skipDepth > 0) {
-                    skipDepth--;
-                    continue;
-                }
-                stack.pop();
-                continue;
-            }
-
-            // Opening or self-closing tag
-            const attrs = this.parseXmlAttrs(attrStr);
-
-            // Skip geninfo proto (tshark metadata)
-            if (tagName === 'proto' && attrs.name === 'geninfo') {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            // Skip hidden fields
-            if (attrs.hide === 'yes') {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            // If we're inside a skipped element, skip everything
-            if (skipDepth > 0) {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            // Skip fields with no display text
-            if (tagName === 'field' && !attrs.showname) {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            const node: ProtoTreeNode = {
-                name: attrs.name || '',
-                showname: attrs.showname || attrs.name || 'Unknown',
-                children: [],
-            };
-
-            if (stack.length === 0) {
-                // Top-level proto
-                nodes.push(node);
-            } else {
-                // Child of current parent
-                stack[stack.length - 1].children.push(node);
-            }
-
-            if (!isSelfClosing) {
-                stack.push(node);
-            }
-        }
-
-        return nodes;
-    }
-
-    /**
-     * Parse XML attributes from a string like: name="foo" showname="bar" hide="yes"
-     */
-    private parseXmlAttrs(attrString: string): Record<string, string> {
-        const attrs: Record<string, string> = {};
-        const regex = /(\w+)="([^"]*)"/g;
-        let match;
-        while ((match = regex.exec(attrString)) !== null) {
-            attrs[match[1]] = match[2];
-        }
-        return attrs;
+        await loadPacketHexIntoWebview({
+            tsharkRunner: this.tsharkRunner,
+            captureFile: this.currentCapture.filePath,
+            frameNumber,
+            postMessage: (message) => this.panel.webview.postMessage(message),
+            outputChannel: this.outputChannel,
+            logPrefix: 'WebviewPanel',
+        });
     }
 
     /**
@@ -554,28 +336,16 @@ export class CaptureWebviewPanel {
      * Format: frame.number|time_relative|source|destination|protocol|frame.len|info|tcp.stream
      */
     private parsePacketOutput(rawOutput: string): PacketRow[] {
-        const lines = rawOutput.split('\n').filter(l => l.trim().length > 0);
-        const packets: PacketRow[] = [];
-
-        for (const line of lines) {
-            const parts = line.split('|');
-            if (parts.length < 5) { continue; }
-
-            const frameNum = parseInt(parts[0]);
-            if (isNaN(frameNum) || frameNum <= 0) { continue; } // Skip header or junk lines
-
-            packets.push({
-                number: frameNum,
-                time: (parts[1] || '0').trim(),
-                source: (parts[2] || '').trim(),
-                destination: (parts[3] || '').trim(),
-                protocol: (parts[4] || '').trim(),
-                length: parseInt(parts[5]) || 0,
-                info: parts.slice(6, -1).join('|').trim(), // Info may contain pipes; last field is tcp.stream
-                stream: parts[parts.length - 1]?.trim() || '',
-            });
-        }
-        return packets;
+        return parsePacketOutput(rawOutput).map((packet) => ({
+            number: packet.number,
+            time: packet.time,
+            source: packet.source,
+            destination: packet.destination,
+            protocol: packet.protocol,
+            length: packet.length,
+            info: packet.info,
+            stream: packet.stream,
+        }));
     }
 
     private getErrorHtml(message: string): string {
@@ -1478,22 +1248,7 @@ export class CaptureWebviewPanel {
 
 // ─── Helper types and functions ───────────────────────────────────────────
 
-interface PacketRow {
-    number: number;
-    time: string;
-    source: string;
-    destination: string;
-    protocol: string;
-    length: number;
-    info: string;
-    stream: string;
-}
-
-interface ProtoTreeNode {
-    name: string;
-    showname: string;
-    children: ProtoTreeNode[];
-}
+type PacketRow = ParsedPacketRow;
 
 function getNonce(): string {
     let text = '';

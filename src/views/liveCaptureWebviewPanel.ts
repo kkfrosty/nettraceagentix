@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { TsharkRunner } from '../parsing/tsharkRunner';
 import { NetworkInterface, LiveCaptureSession } from '../types';
+import { ProtoTreeNode, loadPacketDetailIntoWebview, loadPacketHexIntoWebview, parsePacketOutput } from './sharedCaptureView';
 
 /** Options to pre-fill the panel when opened via AI or command. */
 export interface LiveCapturePrefill {
@@ -385,28 +386,27 @@ export class LiveCaptureWebviewPanel {
                 break;
             case 'getPacketDetail':
                 if (this.session?.outputFilePath) {
-                    try {
-                        const detail = await this.tsharkRunner.getPacketDetail(this.session.outputFilePath, msg.frameNumber);
-                        const pdml = await this.tsharkRunner.getPacketDetailPdml(this.session.outputFilePath, msg.frameNumber).catch(() => '');
-                        if (pdml) {
-                            const tree = this.parsePdmlToTree(pdml);
-                            if (tree.length > 0) {
-                                this.postMessage({ command: 'packetDetail', frameNumber: msg.frameNumber, tree });
-                            } else {
-                                this.postMessage({ command: 'packetDetailRaw', frameNumber: msg.frameNumber, text: detail });
-                            }
-                        } else {
-                            this.postMessage({ command: 'packetDetailRaw', frameNumber: msg.frameNumber, text: detail });
-                        }
-                    } catch (e) { /* ignore */ }
+                    await loadPacketDetailIntoWebview({
+                        tsharkRunner: this.tsharkRunner,
+                        captureFile: this.session.outputFilePath,
+                        frameNumber: msg.frameNumber,
+                        postMessage: (message) => this.postMessage(message),
+                        outputChannel: this.outputChannel,
+                        logPrefix: 'LiveCapture',
+                        preferredFormat: 'pdml',
+                    });
                 }
                 break;
             case 'getPacketHex':
                 if (this.session?.outputFilePath) {
-                    try {
-                        const hex = await this.tsharkRunner.getPacketHexDump(this.session.outputFilePath, msg.frameNumber);
-                        this.postMessage({ command: 'packetHex', frameNumber: msg.frameNumber, hex });
-                    } catch (e) { /* ignore */ }
+                    await loadPacketHexIntoWebview({
+                        tsharkRunner: this.tsharkRunner,
+                        captureFile: this.session.outputFilePath,
+                        frameNumber: msg.frameNumber,
+                        postMessage: (message) => this.postMessage(message),
+                        outputChannel: this.outputChannel,
+                        logPrefix: 'LiveCapture',
+                    });
                 }
                 break;
         }
@@ -878,24 +878,16 @@ export class LiveCaptureWebviewPanel {
     }
 
     private parsePacketOutput(raw: string): any[] {
-        const packets: any[] = [];
-        for (const line of raw.split('\n')) {
-            const fields = line.split('|');
-            if (fields.length < 5) { continue; }
-            const num = parseInt(fields[0], 10);
-            if (isNaN(num)) { continue; }
-            packets.push({
-                num,
-                time: (fields[1] || '0').trim(),
-                src: (fields[2] || '').trim(),
-                dst: (fields[3] || '').trim(),
-                proto: (fields[4] || '').trim(),
-                len: (fields[5] || '').trim(),
-                info: fields.slice(6, -1).join('|').trim(),
-                stream: fields[fields.length - 1]?.trim() || '',
-            });
-        }
-        return packets;
+        return parsePacketOutput(raw).map((packet) => ({
+            num: packet.number,
+            time: packet.time,
+            src: packet.source,
+            dst: packet.destination,
+            proto: packet.protocol,
+            len: String(packet.length),
+            info: packet.info,
+            stream: packet.stream,
+        }));
     }
 
     private postMessage(msg: object): void {
@@ -2548,68 +2540,4 @@ window.addEventListener('message', e => {
 </html>`;
     }
 
-    // ─── PDML parsing (mirrors CaptureWebviewPanel) ───────────────────────
-
-    private parsePdmlToTree(pdml: string): ProtoTreeNode[] {
-        const nodes: ProtoTreeNode[] = [];
-        const normalized = pdml.replace(/\n\s*/g, ' ');
-        const tagRegex = /<(\/?)([\w:.-]+)(\s[^>]*?)?\s*(\/?)>/g;
-        const stack: ProtoTreeNode[] = [];
-        let skipDepth = 0;
-        let match;
-        while ((match = tagRegex.exec(normalized)) !== null) {
-            const isClosing    = match[1] === '/';
-            const tagName      = match[2];
-            const attrStr      = match[3] || '';
-            const isSelfClosing = match[4] === '/';
-            if (tagName !== 'proto' && tagName !== 'field') { continue; }
-            if (isClosing) {
-                if (skipDepth > 0) { skipDepth--; continue; }
-                stack.pop();
-                continue;
-            }
-            const attrs = this.parseXmlAttrs(attrStr);
-            if (tagName === 'proto' && attrs.name === 'geninfo') {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-            if (attrs.hide === 'yes') {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-            if (skipDepth > 0) {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-            if (tagName === 'field' && !attrs.showname) {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-            const node: ProtoTreeNode = {
-                name: attrs.name || '',
-                showname: attrs.showname || attrs.name || 'Unknown',
-                children: [],
-            };
-            if (stack.length === 0) { nodes.push(node); }
-            else { stack[stack.length - 1].children.push(node); }
-            if (!isSelfClosing) { stack.push(node); }
-        }
-        return nodes;
-    }
-
-    private parseXmlAttrs(attrString: string): Record<string, string> {
-        const attrs: Record<string, string> = {};
-        const regex = /(\w+)="([^"]*)"/g;
-        let match;
-        while ((match = regex.exec(attrString)) !== null) {
-            attrs[match[1]] = match[2];
-        }
-        return attrs;
-    }
-}
-
-interface ProtoTreeNode {
-    name: string;
-    showname: string;
-    children: ProtoTreeNode[];
 }
