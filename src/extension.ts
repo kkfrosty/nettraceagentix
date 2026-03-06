@@ -908,29 +908,59 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const configuredRaw = vscode.workspace.getConfiguration('nettrace').get<string>('wiresharkPath', '').trim();
-            const configured = configuredRaw.replace(/^"|"$/g, '');
-            const candidates = configured
-                ? [configured]
-                : process.platform === 'win32'
-                    ? [
-                        'wireshark',
-                        'Wireshark.exe',
-                        'C:\\Program Files\\Wireshark\\Wireshark.exe',
-                        'C:\\Program Files (x86)\\Wireshark\\Wireshark.exe',
-                    ]
-                    : process.platform === 'darwin'
-                        ? [
-                            'wireshark',
-                            '/Applications/Wireshark.app/Contents/MacOS/Wireshark',
-                        ]
-                        : [
-                            'wireshark',
-                            '/usr/bin/wireshark',
-                            '/usr/local/bin/wireshark',
-                        ];
+            const expandEnvVars = (value: string): string => {
+                if (process.platform !== 'win32') { return value; }
+                return value.replace(/%([^%]+)%/g, (_, name: string) => process.env[name] ?? `%${name}%`);
+            };
 
-            const tryLaunchWireshark = async (candidate: string, capturePath: string): Promise<{ ok: boolean; error?: string }> => {
+            const normalizeCandidate = (candidate: string): string => {
+                return expandEnvVars(candidate.trim().replace(/^"|"$/g, ''));
+            };
+
+            const resolveExecutablePaths = async (name: string): Promise<string[]> => {
+                const locator = process.platform === 'win32' ? 'where.exe' : 'which';
+                const locatorArgs = process.platform === 'win32' ? [name] : ['-a', name];
+                return new Promise((resolve) => {
+                    cp.execFile(locator, locatorArgs, { timeout: 5000, windowsHide: true }, (error, stdout) => {
+                        if (error || !stdout) {
+                            resolve([]);
+                            return;
+                        }
+                        const found = stdout
+                            .split(/\r?\n/)
+                            .map(l => l.trim())
+                            .filter(Boolean);
+                        resolve(found);
+                    });
+                });
+            };
+
+            const nettraceConfig = vscode.workspace.getConfiguration('nettrace');
+            const configuredRaw = nettraceConfig.get<string>('wiresharkPath', '').trim();
+            const configured = normalizeCandidate(configuredRaw);
+
+            // If tshark was detected by absolute path, Wireshark is usually in the same folder.
+            const tsharkPath = tsharkRunner.getTsharkPath();
+            const siblingWireshark = ((): string | undefined => {
+                if (!tsharkPath || !path.isAbsolute(tsharkPath)) { return undefined; }
+                const tsharkDir = path.dirname(tsharkPath);
+                return process.platform === 'win32'
+                    ? path.join(tsharkDir, 'Wireshark.exe')
+                    : path.join(tsharkDir, 'wireshark');
+            })();
+
+            // Fast path: launch immediately using configured/sibling/common command names.
+            // Only do expensive discovery if these fail.
+            const initialCandidates = Array.from(new Set([
+                configured,
+                siblingWireshark,
+                process.platform === 'win32' ? 'Wireshark.exe' : undefined,
+                'wireshark',
+            ].map(c => c ? normalizeCandidate(c) : '').filter(Boolean)));
+
+            const buildWiresharkArgs = (capturePath: string): string[] => ['-r', capturePath];
+
+            const tryLaunchDirect = async (candidate: string, capturePath: string): Promise<{ ok: boolean; error?: string }> => {
                 return new Promise((resolve) => {
                     let settled = false;
                     const finish = (ok: boolean, error?: string) => {
@@ -941,10 +971,10 @@ async function activateInternal(context: vscode.ExtensionContext) {
                     };
 
                     try {
-                        const child = cp.spawn(candidate, [capturePath], {
+                        const child = cp.spawn(candidate, buildWiresharkArgs(capturePath), {
                             detached: true,
                             stdio: 'ignore',
-                            windowsHide: true,
+                            windowsHide: false,
                         });
 
                         child.once('error', (err) => {
@@ -953,7 +983,17 @@ async function activateInternal(context: vscode.ExtensionContext) {
 
                         child.once('spawn', () => {
                             child.unref();
-                            finish(true);
+
+                            // Avoid reporting success if the process immediately exits with an error.
+                            const successTimer = setTimeout(() => finish(true), 1200);
+                            child.once('exit', (code, signal) => {
+                                clearTimeout(successTimer);
+                                if (code === 0 && !signal) {
+                                    finish(true);
+                                } else {
+                                    finish(false, `process exited quickly (code=${String(code)}, signal=${String(signal)})`);
+                                }
+                            });
                         });
                     } catch (e) {
                         finish(false, e instanceof Error ? e.message : String(e));
@@ -961,22 +1001,74 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 });
             };
 
-            let launched = false;
-            let lastErr: string | undefined;
-            for (const candidate of candidates) {
-                const result = await tryLaunchWireshark(candidate, filePath);
-                if (result.ok) {
-                    launched = true;
-                    outputChannel.appendLine(`[Wireshark] Opened ${filePath} using ${candidate}`);
-                    break;
+            const attemptLaunch = async (
+                rawCandidates: string[],
+                phaseLabel: 'initial' | 'discovery'
+            ): Promise<{ launched: boolean; usedCandidate?: string; lastErr?: string }> => {
+                let lastErr: string | undefined;
+                for (const rawCandidate of rawCandidates) {
+                    const candidate = normalizeCandidate(rawCandidate);
+
+                    if (path.isAbsolute(candidate) && !fs.existsSync(candidate)) {
+                        outputChannel.appendLine(`[Wireshark] Skipping missing path (${phaseLabel}): ${candidate}`);
+                        continue;
+                    }
+
+                    const directResult = await tryLaunchDirect(candidate, filePath);
+                    if (directResult.ok) {
+                        outputChannel.appendLine(`[Wireshark] Opened ${filePath} using ${candidate} (direct, ${phaseLabel})`);
+                        return { launched: true, usedCandidate: candidate };
+                    }
+
+                    lastErr = directResult.error;
+                    outputChannel.appendLine(`[Wireshark] Direct launch failed using ${candidate} (${phaseLabel}): ${directResult.error ?? 'unknown error'}`);
+                }
+                return { launched: false, lastErr };
+            };
+
+            let result = await attemptLaunch(initialCandidates, 'initial');
+
+            if (!result.launched) {
+                outputChannel.appendLine('[Wireshark] Initial launch failed; running executable discovery...');
+
+                const discoveredCandidates: string[] = [];
+                if (process.platform === 'win32') {
+                    const programFiles = process.env.ProgramFiles;
+                    const programFilesX86 = process.env['ProgramFiles(x86)'];
+                    const localAppData = process.env.LocalAppData;
+                    discoveredCandidates.push('C:\\Program Files\\Wireshark\\Wireshark.exe');
+                    discoveredCandidates.push('C:\\Program Files (x86)\\Wireshark\\Wireshark.exe');
+                    if (programFiles) { discoveredCandidates.push(path.join(programFiles, 'Wireshark', 'Wireshark.exe')); }
+                    if (programFilesX86) { discoveredCandidates.push(path.join(programFilesX86, 'Wireshark', 'Wireshark.exe')); }
+                    if (localAppData) { discoveredCandidates.push(path.join(localAppData, 'Programs', 'Wireshark', 'Wireshark.exe')); }
+                } else if (process.platform === 'darwin') {
+                    discoveredCandidates.push('/Applications/Wireshark.app/Contents/MacOS/Wireshark');
                 } else {
-                    lastErr = result.error;
-                    outputChannel.appendLine(`[Wireshark] Failed using ${candidate}: ${lastErr ?? 'unknown error'}`);
+                    discoveredCandidates.push('/usr/bin/wireshark');
+                    discoveredCandidates.push('/usr/local/bin/wireshark');
+                }
+
+                const discoveredFromPath = await resolveExecutablePaths(process.platform === 'win32' ? 'wireshark.exe' : 'wireshark');
+                discoveredCandidates.push(...discoveredFromPath);
+
+                const dedupedDiscoveryCandidates = Array.from(
+                    new Set(discoveredCandidates.map(normalizeCandidate).filter(Boolean))
+                );
+
+                result = await attemptLaunch(dedupedDiscoveryCandidates, 'discovery');
+
+                if (result.launched && result.usedCandidate && path.isAbsolute(result.usedCandidate)) {
+                    try {
+                        await nettraceConfig.update('wiresharkPath', result.usedCandidate, vscode.ConfigurationTarget.Global);
+                        outputChannel.appendLine(`[Wireshark] Saved detected Wireshark path to settings: ${result.usedCandidate}`);
+                    } catch (e) {
+                        outputChannel.appendLine(`[Wireshark] Warning: failed to persist detected path: ${e instanceof Error ? e.message : String(e)}`);
+                    }
                 }
             }
 
-            if (!launched) {
-                vscode.window.showErrorMessage(`Could not launch Wireshark. Set nettrace.wiresharkPath in settings. ${lastErr ? `(${lastErr})` : ''}`);
+            if (!result.launched) {
+                vscode.window.showErrorMessage(`Could not launch Wireshark. Set nettrace.wiresharkPath in settings. ${result.lastErr ? `(${result.lastErr})` : ''}`);
             }
         })
     );
