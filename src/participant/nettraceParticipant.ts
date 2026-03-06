@@ -8,6 +8,7 @@ import { AgentsTreeProvider } from '../views/agentsTreeProvider';
 import { StreamsTreeProvider } from '../views/streamsTreeProvider';
 import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
 import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
+import { resolveOpenCaptures } from '../captureRouting';
 import { AgentDefinition, AssembledContext, CaptureFile } from '../types';
 
 /**
@@ -1507,36 +1508,12 @@ export class NetTraceParticipant {
             return { captures: [clientCapture, serverCapture], mode: 'dual' };
         }
 
-        // Ask the tree — it knows which captures are open and in which panel
-        const active = this.capturesTree.getActiveCapture();
-        if (active) {
-            this.outputChannel.appendLine(`[ChatParticipant] Active capture (${active.openInPanel ?? 'tree'}): ${active.filePath}`);
-            return { captures: [active], mode: 'single' };
+        const routing = resolveOpenCaptures(this.capturesTree, this.outputChannel, 'ChatParticipant');
+        if (routing.activeCapture) {
+            return { captures: [routing.activeCapture], mode: 'single' };
         }
 
-        let openCaptures = this.capturesTree.getOpenCaptures();
-
-        // Safety-net rehydration: if tree says nothing is open but panel registries
-        // clearly have open captures (e.g., after extension reload edge cases),
-        // repopulate panel state into the tree before deciding.
-        if (openCaptures.length === 0) {
-            const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
-            if (livePath) {
-                this.capturesTree.markOpenInPanel(livePath, 'live');
-            }
-
-            const viewerPanels = CaptureWebviewPanel.getOpenCapturePanels();
-            for (const p of viewerPanels) {
-                this.capturesTree.markOpenInPanel(p.filePath, 'viewer');
-            }
-
-            openCaptures = this.capturesTree.getOpenCaptures();
-            if (openCaptures.length > 0) {
-                this.outputChannel.appendLine(
-                    `[ChatParticipant] Rehydrated ${openCaptures.length} open capture(s) from panel registries`
-                );
-            }
-        }
+        const openCaptures = routing.openCaptures;
 
         // Deterministic open-panel fallback: avoid dropping to no-capture when
         // captures are clearly open but no single panel is marked "active".
