@@ -1401,9 +1401,34 @@ col.c-info { width: auto; }
 .p-arp  { color: #ce9178; }
 
 /* ── Wireshark-style 3-pane detail / hex layout ─────────────── */
+.ws-splitter {
+    display: none;
+    flex: 0 0 6px;
+    cursor: row-resize;
+    background: var(--panel-bg, var(--vscode-sideBar-background));
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+}
+.ws-splitter::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 36px;
+    height: 2px;
+    transform: translate(-50%, -50%);
+    background: var(--vscode-descriptionForeground, #888);
+    box-shadow: 0 -4px 0 var(--vscode-descriptionForeground, #888), 0 4px 0 var(--vscode-descriptionForeground, #888);
+    opacity: 0.65;
+}
+.ws-splitter:hover,
+.ws-splitter.dragging {
+    background: var(--hover-bg, rgba(255,255,255,0.07));
+}
 .ws-bottom {
     display: none;                    /* hidden until first packet selected */
-    flex: 0 0 220px;
+    flex: 0 0 var(--ws-bottom-height, 220px);
     min-height: 80px;
     border-top: 2px solid var(--border);
     flex-direction: row;
@@ -1452,6 +1477,8 @@ col.c-info { width: auto; }
 .ws-bottom.all-collapsed .ws-detail .ws-pane-body,
 .ws-bottom.all-collapsed #liveDetailContent,
 .ws-bottom.all-collapsed .ws-hex { display: none; }
+.ws-bottom.all-collapsed + .ws-splitter,
+.live-bottom-collapsed .ws-splitter { display: none !important; }
 /* Proto tree */
 .ws-empty { color: var(--vscode-descriptionForeground); padding: 8px; font-size: 12px; }
 .proto-tree { font-family: var(--mono); font-size: 12px; padding: 4px 0; }
@@ -1564,6 +1591,8 @@ col.c-info { width: auto; }
         </table>
     </div>
 
+    <div class="ws-splitter" id="wsBottomSplitter" role="separator" aria-orientation="horizontal" title="Drag to resize detail pane"></div>
+
     <!-- Wireshark-style 3-pane detail/hex (appears when a row is clicked) -->
     <div class="ws-bottom" id="wsBottom">
         <div class="ws-detail" id="liveDetailPane">
@@ -1654,9 +1683,13 @@ const emptyState      = document.getElementById('empty-state');
 const tableWrap       = document.getElementById('table-wrap');
 const pktBody         = document.getElementById('pkt-body');
 const wsBottom          = document.getElementById('wsBottom');
+const wsBottomSplitter  = document.getElementById('wsBottomSplitter');
 const liveDetailTitle   = document.getElementById('liveDetailTitle');
 const liveDetailContent = document.getElementById('liveDetailContent');
 const liveHexContent    = document.getElementById('liveHexContent');
+const mainLayout        = document.getElementById('main');
+const MIN_BOTTOM_HEIGHT = 80;
+const DEFAULT_BOTTOM_HEIGHT = 220;
 
 // ── Logging helper ──────────────────────────────────────────────────
 function log(text) { vscode.postMessage({ command: 'log', text: String(text) }); }
@@ -1685,10 +1718,12 @@ function initializeUiState() {
     pktBody.innerHTML = '';
     tableWrap.style.display = 'none';
     emptyState.style.display = 'flex';
+    if (wsBottomSplitter) { wsBottomSplitter.style.display = 'none'; }
     wsBottom.style.display = 'none';
     liveDetailContent.innerHTML = '<div class="ws-empty">Click a packet row to inspect its fields.</div>';
     liveHexContent.textContent = 'Click a packet above to see hex dump';
     wsBottom.classList.remove('all-collapsed');
+    if (mainLayout) { mainLayout.classList.remove('live-bottom-collapsed'); }
     document.getElementById('liveHexPane').classList.remove('collapsed');
     document.getElementById('btnToggleDetail').textContent = '\u25bc';
     document.getElementById('btnToggleHex').textContent = '\u25c4';
@@ -1757,6 +1792,52 @@ function openInterfaceMenu() {
     ifaceMenu.style.top = (rect.bottom + 4) + 'px';
     ifaceMenu.classList.add('visible');
 }
+
+function setBottomHeight(heightPx) {
+    if (!mainLayout) { return; }
+    const layoutHeight = mainLayout.getBoundingClientRect().height || 0;
+    const maxHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.floor(layoutHeight * 0.75));
+    const nextHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.min(heightPx, maxHeight));
+    mainLayout.style.setProperty('--ws-bottom-height', nextHeight + 'px');
+    wsBottom.dataset.lastHeight = String(nextHeight);
+}
+
+function restoreBottomHeight() {
+    const lastHeight = parseInt(wsBottom.dataset.lastHeight || '', 10);
+    setBottomHeight(Number.isNaN(lastHeight) ? DEFAULT_BOTTOM_HEIGHT : lastHeight);
+}
+
+(function initializeBottomResizer() {
+    if (!wsBottomSplitter || !mainLayout) { return; }
+
+    let dragging = false;
+
+    function stopDragging() {
+        if (!dragging) { return; }
+        dragging = false;
+        wsBottomSplitter.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+    }
+
+    wsBottomSplitter.addEventListener('mousedown', function(e) {
+        if (wsBottom.style.display === 'none' || wsBottom.classList.contains('all-collapsed')) { return; }
+        dragging = true;
+        wsBottomSplitter.classList.add('dragging');
+        document.body.style.cursor = 'row-resize';
+        document.body.style.userSelect = 'none';
+        e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', function(e) {
+        if (!dragging || !mainLayout) { return; }
+        const layoutRect = mainLayout.getBoundingClientRect();
+        setBottomHeight(layoutRect.bottom - e.clientY);
+    });
+
+    window.addEventListener('mouseup', stopDragging);
+    window.addEventListener('mouseleave', stopDragging);
+})();
 // Signal the script has started executing (fires before any DOM work)
 log('Script started — DOM ready, acquireVsCodeApi OK');
 
@@ -1949,10 +2030,16 @@ pktBody.addEventListener('contextmenu', e => {
 document.getElementById('btnToggleDetail').addEventListener('click', function() {
     if (wsBottom.classList.contains('all-collapsed')) {
         wsBottom.classList.remove('all-collapsed');
+        if (mainLayout) { mainLayout.classList.remove('live-bottom-collapsed'); }
+        if (wsBottomSplitter) { wsBottomSplitter.style.display = 'block'; }
+        restoreBottomHeight();
         this.textContent = '\u25bc';
         this.title = 'Minimize';
     } else {
+        wsBottom.dataset.lastHeight = String(wsBottom.getBoundingClientRect().height || DEFAULT_BOTTOM_HEIGHT);
         wsBottom.classList.add('all-collapsed');
+        if (mainLayout) { mainLayout.classList.add('live-bottom-collapsed'); }
+        if (wsBottomSplitter) { wsBottomSplitter.style.display = 'none'; }
         this.textContent = '\u25b2';
         this.title = 'Maximize';
     }
@@ -2012,7 +2099,10 @@ function selectPacketRow(tr) {
     liveDetailTitle.textContent = 'Packet #' + frame + ' Detail';
     liveDetailContent.innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail...</div>';
     liveHexContent.textContent = 'Loading hex dump...';
+    if (wsBottomSplitter) { wsBottomSplitter.style.display = 'block'; }
     wsBottom.style.display = 'flex';
+    if (mainLayout) { mainLayout.classList.remove('live-bottom-collapsed'); }
+    restoreBottomHeight();
     vscode.postMessage({ command: 'getPacketDetail', frameNumber: frame });
     vscode.postMessage({ command: 'getPacketHex', frameNumber: frame });
 }
@@ -2122,10 +2212,12 @@ function resetToConfigureState() {
     pktBody.innerHTML = '';
     tableWrap.style.display    = 'none';
     emptyState.style.display   = 'flex';
+    if (wsBottomSplitter) { wsBottomSplitter.style.display = 'none'; }
     wsBottom.style.display = 'none';
     liveDetailContent.innerHTML = '<div class="ws-empty">Click a packet row to inspect its fields.</div>';
     liveHexContent.textContent = 'Click a packet above to see hex dump';
     wsBottom.classList.remove('all-collapsed');
+    if (mainLayout) { mainLayout.classList.remove('live-bottom-collapsed'); }
     document.getElementById('liveHexPane').classList.remove('collapsed');
     document.getElementById('btnToggleDetail').textContent = '\u25bc';
     document.getElementById('btnToggleHex').textContent = '\u25c4';

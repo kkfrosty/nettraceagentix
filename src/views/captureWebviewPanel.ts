@@ -614,9 +614,31 @@ export class CaptureWebviewPanel {
         .tab-content.active { display: flex; flex-direction: column; overflow: hidden; }
 
         /* ─── Wireshark-style 3-pane layout for Packets tab ── */
-        .ws-layout { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
-        .ws-top { flex: 1; min-height: 80px; overflow: auto; border-bottom: 2px solid var(--border-color); }
-        .ws-bottom { flex: 1; min-height: 80px; display: flex; flex-direction: row; overflow: hidden; }
+        .ws-layout { display: flex; flex-direction: column; flex: 1; overflow: hidden; --ws-bottom-height: 220px; }
+        .ws-top { flex: 1 1 auto; min-height: 80px; overflow: auto; }
+        .ws-splitter {
+            flex: 0 0 6px;
+            cursor: row-resize;
+            background: var(--header-bg);
+            border-top: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+            position: relative;
+        }
+        .ws-splitter::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 36px;
+            height: 2px;
+            transform: translate(-50%, -50%);
+            background: var(--vscode-descriptionForeground, #888);
+            box-shadow: 0 -4px 0 var(--vscode-descriptionForeground, #888), 0 4px 0 var(--vscode-descriptionForeground, #888);
+            opacity: 0.65;
+        }
+        .ws-splitter:hover,
+        .ws-splitter.dragging { background: var(--hover-bg); }
+        .ws-bottom { flex: 0 0 var(--ws-bottom-height); min-height: 80px; display: flex; flex-direction: row; overflow: hidden; }
         .ws-detail { flex: 1; overflow: auto; border-right: 2px solid var(--border-color); }
         .ws-hex { flex: 0 0 40%; max-width: 50%; overflow: auto; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
         .ws-pane-header {
@@ -643,6 +665,7 @@ export class CaptureWebviewPanel {
         .ws-bottom.collapsed { flex: 0 0 24px !important; min-height: 0 !important; overflow: hidden; }
         .ws-bottom.collapsed #packetDetailContent { display: none; }
         .ws-bottom.collapsed .ws-hex { display: none; }
+        .ws-layout.bottom-collapsed .ws-splitter { display: none; }
         .ws-empty {
             padding: 20px;
             text-align: center;
@@ -817,6 +840,7 @@ export class CaptureWebviewPanel {
                         </tbody>
                     </table>
                 </div>
+                <div class="ws-splitter" id="wsBottomSplitter" role="separator" aria-orientation="horizontal" title="Drag to resize detail pane"></div>
                 <!-- BOTTOM: Detail (left) + Hex (right), always visible -->
                 <div class="ws-bottom" id="wsBottom">
                     <!-- Left: Protocol detail tree -->
@@ -894,10 +918,63 @@ export class CaptureWebviewPanel {
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
         const filterInput = document.getElementById('filterInput');
+        const wsLayout = document.querySelector('.ws-layout');
+        const wsBottom = document.getElementById('wsBottom');
+        const wsBottomSplitter = document.getElementById('wsBottomSplitter');
+        const MIN_BOTTOM_HEIGHT = 80;
+        const DEFAULT_BOTTOM_HEIGHT = 220;
 
         // ══════════════════════════════════════════════════════
         // EVENT DELEGATION — no inline onclick needed (CSP safe)
         // ══════════════════════════════════════════════════════
+
+        function setBottomHeight(heightPx) {
+            if (!wsLayout) return;
+            var layoutHeight = wsLayout.getBoundingClientRect().height || 0;
+            var maxHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.floor(layoutHeight * 0.75));
+            var nextHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.min(heightPx, maxHeight));
+            wsLayout.style.setProperty('--ws-bottom-height', nextHeight + 'px');
+            wsBottom.dataset.lastHeight = String(nextHeight);
+        }
+
+        function restoreBottomHeight() {
+            var lastHeight = parseInt(wsBottom.dataset.lastHeight || '', 10);
+            setBottomHeight(Number.isNaN(lastHeight) ? DEFAULT_BOTTOM_HEIGHT : lastHeight);
+        }
+
+        (function initializeBottomResizer() {
+            if (!wsBottomSplitter || !wsLayout) return;
+
+            var dragging = false;
+
+            function stopDragging() {
+                if (!dragging) return;
+                dragging = false;
+                wsBottomSplitter.classList.remove('dragging');
+                document.body.style.cursor = '';
+                document.body.style.userSelect = '';
+            }
+
+            wsBottomSplitter.addEventListener('mousedown', function(e) {
+                if (wsBottom.classList.contains('collapsed')) return;
+                dragging = true;
+                wsBottomSplitter.classList.add('dragging');
+                document.body.style.cursor = 'row-resize';
+                document.body.style.userSelect = 'none';
+                e.preventDefault();
+            });
+
+            window.addEventListener('mousemove', function(e) {
+                if (!dragging || !wsLayout) return;
+                var layoutRect = wsLayout.getBoundingClientRect();
+                setBottomHeight(layoutRect.bottom - e.clientY);
+            });
+
+            window.addEventListener('mouseup', stopDragging);
+            window.addEventListener('mouseleave', stopDragging);
+
+            restoreBottomHeight();
+        })();
 
         // Toolbar buttons
         document.getElementById('btnAnalyze').addEventListener('click', function() {
@@ -974,14 +1051,17 @@ export class CaptureWebviewPanel {
 
         // Detail pane toggle — collapses entire bottom section to give packet list more space
         document.getElementById('btnToggleDetail').addEventListener('click', function() {
-            var wsBottom = document.getElementById('wsBottom');
             var btn = document.getElementById('btnToggleDetail');
             if (wsBottom.classList.contains('collapsed')) {
                 wsBottom.classList.remove('collapsed');
+                wsLayout.classList.remove('bottom-collapsed');
+                restoreBottomHeight();
                 btn.textContent = '\u25bc';
                 btn.title = 'Minimize';
             } else {
+                wsBottom.dataset.lastHeight = String(wsBottom.getBoundingClientRect().height || DEFAULT_BOTTOM_HEIGHT);
                 wsBottom.classList.add('collapsed');
+                wsLayout.classList.add('bottom-collapsed');
                 btn.textContent = '\u25b2';
                 btn.title = 'Maximize';
             }
