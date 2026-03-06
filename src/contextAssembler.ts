@@ -333,14 +333,6 @@ ${followed}
     }
 
     /**
-     * Build packet data section — smart-sized based on capture size.
-     */
-    private async buildPacketData(captures: CaptureFile[], tokenBudget: number, streams: TcpStream[] = []): Promise<string> {
-        const result = await this.buildPacketDataWithCoverage(captures, tokenBudget, streams);
-        return result.data;
-    }
-
-    /**
      * Try to include ALL packet list data if it fits within the token budget.
      * Returns the full packet section if it fits, or undefined if too large.
      *

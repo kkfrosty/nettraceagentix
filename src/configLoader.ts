@@ -241,6 +241,11 @@ If you need more data about a specific stream, use the available tools to retrie
                         const fileUri = vscode.Uri.joinPath(toolsUri, name);
                         const data = await vscode.workspace.fs.readFile(fileUri);
                         const tool: ToolDefinition = JSON.parse(Buffer.from(data).toString());
+                        const validationError = this.validateToolDefinition(tool);
+                        if (validationError) {
+                            this.outputChannel.appendLine(`[ConfigLoader] Skipping tool ${name}: ${validationError}`);
+                            continue;
+                        }
                         this.tools.set(tool.name, tool);
                         this.outputChannel.appendLine(`[ConfigLoader] Tool loaded: ${tool.displayName}`);
                     } catch (e) {
@@ -251,6 +256,41 @@ If you need more data about a specific stream, use the available tools to retrie
         } catch {
             // tools/ directory doesn't exist yet
         }
+    }
+
+    private validateToolDefinition(tool: ToolDefinition): string | undefined {
+        if (!tool.name || typeof tool.name !== 'string') {
+            return "missing or invalid 'name' field";
+        }
+
+        if (!tool.displayName || typeof tool.displayName !== 'string') {
+            return "missing or invalid 'displayName' field";
+        }
+
+        if (!tool.description || typeof tool.description !== 'string') {
+            return "missing or invalid 'description' field";
+        }
+
+        if (tool.type !== 'tshark-filter' && tool.type !== 'tshark-stats' && tool.type !== 'script') {
+            return `unsupported tool type '${String((tool as { type?: unknown }).type)}'`;
+        }
+
+        if (!tool.config || typeof tool.config !== 'object') {
+            return "missing or invalid 'config' field";
+        }
+
+        if (tool.type === 'script') {
+            const config = tool.config as ToolDefinition['config'] & { runtime?: unknown; script?: unknown };
+            const validRuntime = config.runtime === 'python' || config.runtime === 'node' || config.runtime === 'powershell';
+            if (!validRuntime) {
+                return "script tool requires runtime of 'python', 'node', or 'powershell'";
+            }
+            if (!config.script || typeof config.script !== 'string') {
+                return "script tool requires a string 'script' path";
+            }
+        }
+
+        return undefined;
     }
 
     private async loadFilters(nettraceUri: vscode.Uri): Promise<void> {
