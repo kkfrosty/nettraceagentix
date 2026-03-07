@@ -12,7 +12,7 @@ import { ParsedPacketRow, ProtoTreeNode, loadPacketDetailIntoWebview, loadPacket
 export class CaptureWebviewPanel {
     public static readonly viewType = 'nettrace.captureViewer';
     private static panels = new Map<string, CaptureWebviewPanel>();
-    private static readonly PACKET_CHUNK_SIZE = 500;
+    private static readonly PACKET_CHUNK_SIZE = 2000;
 
     /**
      * Callback fired when a viewer panel opens or closes.
@@ -184,7 +184,7 @@ export class CaptureWebviewPanel {
             // Render packets first so large captures open faster.
             this.panel.webview.html = this.getHtml(packets, {
                 isChunked: useChunkedPackets,
-                totalPacketCount: this.currentCapture.summary?.packetCount || packets.length,
+                totalPacketCount: this.currentCapture.summary?.packetCount,
                 loadedPacketCount: packets.length,
                 chunkSize: CaptureWebviewPanel.PACKET_CHUNK_SIZE,
                 filter: this.currentFilter,
@@ -213,7 +213,7 @@ export class CaptureWebviewPanel {
                 packets,
                 startFrame: safeStart,
                 endFrame: safeEnd,
-                totalPacketCount: this.currentCapture.summary?.packetCount || packets.length,
+                totalPacketCount: this.currentCapture.summary?.packetCount,
             });
         } catch (e) {
             this.outputChannel.appendLine(`[WebviewPanel] Packet chunk load failed (${safeStart}-${safeEnd}): ${e}`);
@@ -582,7 +582,7 @@ export class CaptureWebviewPanel {
         packets: PacketRow[],
         options: {
             isChunked: boolean;
-            totalPacketCount: number;
+            totalPacketCount?: number;
             loadedPacketCount: number;
             chunkSize: number;
             filter: string;
@@ -1081,13 +1081,16 @@ export class CaptureWebviewPanel {
         const wsBottomSplitter = document.getElementById('wsBottomSplitter');
         const MIN_BOTTOM_HEIGHT = 80;
         const DEFAULT_BOTTOM_HEIGHT = 220;
+        const PRELOAD_SCROLL_RATIO = 0.75;
+        const BACKGROUND_PREFETCH_DELAY_MS = 25;
         const requestedTabs = { conversations: false, protocols: false, expert: false };
         let isChunkedPacketView = ${JSON.stringify(options.isChunked)};
-        let totalPacketCount = ${JSON.stringify(options.totalPacketCount)};
+        let totalPacketCount = ${JSON.stringify(options.totalPacketCount ?? null)};
         let loadedPacketCount = ${JSON.stringify(options.loadedPacketCount)};
         const packetChunkSize = ${JSON.stringify(options.chunkSize)};
         let isLoadingMorePackets = false;
-        let exhaustedPacketChunks = !isChunkedPacketView || loadedPacketCount >= totalPacketCount;
+        let exhaustedPacketChunks = !isChunkedPacketView || (totalPacketCount !== null && loadedPacketCount >= totalPacketCount);
+        let backgroundPrefetchTimer = null;
 
         // ══════════════════════════════════════════════════════
         // EVENT DELEGATION — no inline onclick needed (CSP safe)
@@ -1100,6 +1103,10 @@ export class CaptureWebviewPanel {
                 return;
             }
             if (isChunkedPacketView) {
+                if (totalPacketCount === null) {
+                    status.textContent = 'Showing ' + loadedPacketCount + '+ packets';
+                    return;
+                }
                 status.textContent = 'Showing ' + loadedPacketCount + ' of ' + totalPacketCount + ' packets';
                 return;
             }
@@ -1111,10 +1118,21 @@ export class CaptureWebviewPanel {
             var scroller = document.querySelector('.ws-top');
             if (!scroller) return;
             var remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-            if (remaining > 800) return;
+            var scrollRatio = scroller.scrollHeight > 0
+                ? (scroller.scrollTop + scroller.clientHeight) / scroller.scrollHeight
+                : 0;
+            if (remaining > 1200 && scrollRatio < PRELOAD_SCROLL_RATIO) return;
+
+            queueNextPacketChunk();
+        }
+
+        function queueNextPacketChunk() {
+            if (!isChunkedPacketView || isLoadingMorePackets || exhaustedPacketChunks) return;
 
             var startFrame = loadedPacketCount + 1;
-            var endFrame = Math.min(startFrame + packetChunkSize - 1, totalPacketCount);
+            var endFrame = totalPacketCount === null
+                ? startFrame + packetChunkSize - 1
+                : Math.min(startFrame + packetChunkSize - 1, totalPacketCount);
             if (startFrame > endFrame) {
                 exhaustedPacketChunks = true;
                 return;
@@ -1122,6 +1140,17 @@ export class CaptureWebviewPanel {
 
             isLoadingMorePackets = true;
             vscode.postMessage({ command: 'loadMorePackets', startFrame: startFrame, endFrame: endFrame });
+        }
+
+        function scheduleBackgroundPrefetch() {
+            if (!isChunkedPacketView || isLoadingMorePackets || exhaustedPacketChunks) return;
+            if (backgroundPrefetchTimer) {
+                clearTimeout(backgroundPrefetchTimer);
+            }
+            backgroundPrefetchTimer = setTimeout(function() {
+                backgroundPrefetchTimer = null;
+                queueNextPacketChunk();
+            }, BACKGROUND_PREFETCH_DELAY_MS);
         }
 
         function setBottomHeight(heightPx) {
@@ -1399,6 +1428,10 @@ export class CaptureWebviewPanel {
             filterInput.value = '';
             document.getElementById('filterStatus').textContent = '';
             filterInput.classList.remove('filter-error');
+            if (backgroundPrefetchTimer) {
+                clearTimeout(backgroundPrefetchTimer);
+                backgroundPrefetchTimer = null;
+            }
             vscode.postMessage({ command: 'clearFilter' });
         }
 
@@ -1493,13 +1526,15 @@ export class CaptureWebviewPanel {
                     }).join('');
                     isChunkedPacketView = !!msg.isChunked;
                     loadedPacketCount = msg.packets.length;
-                    totalPacketCount = msg.totalCount || msg.packets.length;
-                    exhaustedPacketChunks = !isChunkedPacketView || loadedPacketCount >= totalPacketCount;
+                    totalPacketCount = typeof msg.totalCount === 'number' ? msg.totalCount : null;
+                    exhaustedPacketChunks = !isChunkedPacketView || (totalPacketCount !== null && loadedPacketCount >= totalPacketCount);
                     isLoadingMorePackets = false;
                     updatePacketStatusText(msg.filter);
                     document.getElementById('statusFilter').textContent = msg.filter ? 'Filter: ' + msg.filter : 'No filter applied';
                     document.getElementById('filterStatus').textContent = msg.packets.length + ' packets match';
                     document.getElementById('filterStatus').className = 'filter-hint';
+                    setTimeout(maybeLoadMorePackets, 0);
+                    scheduleBackgroundPrefetch();
                     break;
                 }
                 case 'appendPackets': {
@@ -1517,14 +1552,24 @@ export class CaptureWebviewPanel {
                             + '</tr>';
                     }).join(''));
                     loadedPacketCount += msg.packets.length;
-                    totalPacketCount = msg.totalPacketCount || totalPacketCount;
-                    exhaustedPacketChunks = msg.packets.length === 0 || loadedPacketCount >= totalPacketCount;
+                    if (typeof msg.totalPacketCount === 'number') {
+                        totalPacketCount = msg.totalPacketCount;
+                    }
+                    exhaustedPacketChunks = msg.packets.length === 0
+                        || msg.packets.length < packetChunkSize
+                        || (totalPacketCount !== null && loadedPacketCount >= totalPacketCount);
                     isLoadingMorePackets = false;
                     updatePacketStatusText(filterInput.value.trim());
+                    setTimeout(maybeLoadMorePackets, 0);
+                    scheduleBackgroundPrefetch();
                     break;
                 }
                 case 'packetChunkError': {
                     isLoadingMorePackets = false;
+                    if (backgroundPrefetchTimer) {
+                        clearTimeout(backgroundPrefetchTimer);
+                        backgroundPrefetchTimer = null;
+                    }
                     document.getElementById('statusSelected').textContent = msg.message;
                     break;
                 }
@@ -1542,6 +1587,10 @@ export class CaptureWebviewPanel {
                 }
                 case 'filterError': {
                     isLoadingMorePackets = false;
+                    if (backgroundPrefetchTimer) {
+                        clearTimeout(backgroundPrefetchTimer);
+                        backgroundPrefetchTimer = null;
+                    }
                     document.getElementById('filterStatus').textContent = msg.message;
                     document.getElementById('filterStatus').className = 'filter-error-msg';
                     document.getElementById('filterInput').classList.add('filter-error');
@@ -1574,6 +1623,8 @@ export class CaptureWebviewPanel {
         });
 
         updatePacketStatusText(${JSON.stringify(options.filter)});
+        setTimeout(maybeLoadMorePackets, 0);
+        scheduleBackgroundPrefetch();
     </script>
 </body>
 </html>`;
