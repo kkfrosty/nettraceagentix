@@ -24,6 +24,7 @@ export class CaptureWebviewPanel {
     private disposables: vscode.Disposable[] = [];
     private currentFilter: string = '';
     private currentCapture: CaptureFile;
+    private loadSequence: number = 0;
 
     /**
      * Open or focus the viewer for a specific capture file.
@@ -146,30 +147,71 @@ export class CaptureWebviewPanel {
 
     private async loadCaptureData(): Promise<void> {
         const filePath = this.currentCapture.filePath;
+        const loadSequence = ++this.loadSequence;
         this.outputChannel.appendLine(`[WebviewPanel] Loading data for ${this.currentCapture.name} at ${filePath}`);
 
         try {
-            // Run multiple tshark queries in parallel
-            const [packetData, conversations, expertInfo, protocolHierarchy] = await Promise.all([
-                this.tsharkRunner.getPacketsForDisplay(filePath, this.currentFilter),
-                this.tsharkRunner.getConversations(filePath).catch((e) => { this.outputChannel.appendLine(`[WebviewPanel] Conversations error: ${e}`); return []; }),
-                this.tsharkRunner.getExpertInfo(filePath).catch((e) => { this.outputChannel.appendLine(`[WebviewPanel] Expert info error: ${e}`); return ''; }),
-                this.tsharkRunner.getProtocolHierarchy(filePath).catch((e) => { this.outputChannel.appendLine(`[WebviewPanel] Protocol hierarchy error: ${e}`); return ''; }),
-            ]);
+            const packetData = await this.tsharkRunner.getPacketsForDisplay(filePath, this.currentFilter);
 
             this.outputChannel.appendLine(`[WebviewPanel] Raw packet output length: ${packetData.length} chars, first 500 chars: ${packetData.substring(0, 500)}`);
-            this.outputChannel.appendLine(`[WebviewPanel] Conversations count: ${conversations.length}`);
 
             // Parse pipe-separated packet data into structured rows
             const packets = this.parsePacketOutput(packetData);
             this.outputChannel.appendLine(`[WebviewPanel] Parsed ${packets.length} packets from ${packetData.split('\\n').length} lines`);
 
-            // Update the webview with the full HTML + data
-            this.panel.webview.html = this.getHtml(packets, conversations, expertInfo, protocolHierarchy);
+            if (loadSequence !== this.loadSequence) {
+                return;
+            }
+
+            // Render packets first so large captures open faster.
+            this.panel.webview.html = this.getHtml(packets);
+
+            // Hydrate non-packet tabs in the background.
+            void this.loadSupplementalTabData(filePath, loadSequence);
 
         } catch (e) {
             this.outputChannel.appendLine(`[WebviewPanel] Error loading data: ${e}`);
             this.panel.webview.html = this.getErrorHtml(`Failed to load capture data: ${e}`);
+        }
+    }
+
+    private async loadSupplementalTabData(filePath: string, loadSequence: number): Promise<void> {
+        try {
+            const [conversations, expertInfo, protocolHierarchy] = await Promise.all([
+                this.tsharkRunner.getConversations(filePath).catch((e) => {
+                    this.outputChannel.appendLine(`[WebviewPanel] Conversations error: ${e}`);
+                    return [];
+                }),
+                this.tsharkRunner.getExpertInfo(filePath).catch((e) => {
+                    this.outputChannel.appendLine(`[WebviewPanel] Expert info error: ${e}`);
+                    return '';
+                }),
+                this.tsharkRunner.getProtocolHierarchy(filePath).catch((e) => {
+                    this.outputChannel.appendLine(`[WebviewPanel] Protocol hierarchy error: ${e}`);
+                    return '';
+                }),
+            ]);
+
+            if (loadSequence !== this.loadSequence) {
+                return;
+            }
+
+            this.outputChannel.appendLine(`[WebviewPanel] Background tab hydration ready: ${conversations.length} conversations`);
+
+            this.panel.webview.postMessage({
+                command: 'updateConversations',
+                html: this.buildConversationsHtml(conversations),
+            });
+            this.panel.webview.postMessage({
+                command: 'updateProtocols',
+                html: this.buildProtocolsHtml(protocolHierarchy),
+            });
+            this.panel.webview.postMessage({
+                command: 'updateExpertInfo',
+                html: this.buildExpertInfoHtml(expertInfo),
+            });
+        } catch (e) {
+            this.outputChannel.appendLine(`[WebviewPanel] Supplemental tab hydration failed: ${e}`);
         }
     }
 
@@ -352,6 +394,63 @@ export class CaptureWebviewPanel {
         }));
     }
 
+    private buildConversationsHtml(conversations: any[]): string {
+        if (conversations.length === 0) {
+            return '<tr><td colspan="8" class="loading-cell">No conversations available</td></tr>';
+        }
+
+        return conversations.slice(0, 50).map((c) => {
+            const anomalyClass = c.anomalyScore >= 10 ? 'row-error' : c.anomalyScore > 0 ? 'row-warning' : '';
+            const anomalyBadge = c.anomalies.length > 0
+                ? `<span class="badge badge-warning" title="${c.anomalies.map((a: any) => a.description).join(', ')}">${c.anomalies.length} issue${c.anomalies.length > 1 ? 's' : ''}</span>`
+                : '<span class="badge badge-ok">✓</span>';
+            return `<tr class="${anomalyClass}" data-stream="${c.index}">
+                <td>${c.index}</td>
+                <td>${c.source}</td>
+                <td>${c.destination}</td>
+                <td>${c.packetCount}</td>
+                <td>${formatBytes(c.totalBytes)}</td>
+                <td>${c.durationSeconds.toFixed(2)}s</td>
+                <td>${anomalyBadge}</td>
+                <td>
+                    <button class="btn-icon" data-action="analyzeStream" data-stream="${c.index}" title="Analyze with AI">🔍</button>
+                    <button class="btn-icon" data-action="filterStream" data-stream="${c.index}" title="Filter to this stream">🎯</button>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    private buildExpertInfoHtml(expertInfo: string): string {
+        const expertLines = expertInfo.split('\n').filter(l => l.trim());
+        if (expertLines.length === 0) {
+            return '<p style="color:var(--vscode-descriptionForeground)">No expert information available</p>';
+        }
+
+        return expertLines.slice(0, 50).map(line => {
+            const severity = line.toLowerCase().includes('error') ? 'error'
+                : line.toLowerCase().includes('warn') ? 'warning'
+                : line.toLowerCase().includes('note') ? 'note' : 'info';
+            return `<div class="expert-entry expert-${severity}">${escapeHtml(line)}</div>`;
+        }).join('');
+    }
+
+    private buildProtocolsHtml(protocolHierarchy: string): string {
+        const protocolBreakdown = this.currentCapture.summary?.protocolBreakdown || {};
+        const topProtocols = Object.entries(protocolBreakdown)
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 15);
+
+        const protocolsHtml = topProtocols.map(([name, count]) =>
+            `<div class="proto-item"><span class="proto-name">${name}</span><span class="proto-count">${count}</span></div>`
+        ).join('');
+
+        const hierarchyHtml = protocolHierarchy
+            ? `<pre style="margin-top: 16px; font-size: 11px; white-space: pre-wrap; color: var(--vscode-descriptionForeground);">${escapeHtml(protocolHierarchy)}</pre>`
+            : '';
+
+        return `${protocolsHtml || '<p style="color:var(--vscode-descriptionForeground)">No protocol data available</p>'}${hierarchyHtml}`;
+    }
+
     private getErrorHtml(message: string): string {
         return `<!DOCTYPE html>
 <html>
@@ -393,48 +492,12 @@ export class CaptureWebviewPanel {
 </html>`;
     }
 
-    private getHtml(packets: PacketRow[], conversations: any[], expertInfo: string, protocolHierarchy: string): string {
+    private getHtml(packets: PacketRow[]): string {
         const nonce = getNonce();
         const captureName = this.currentCapture.name;
         const packetCount = this.currentCapture.summary?.packetCount || packets.length;
         const duration = this.currentCapture.summary?.durationSeconds?.toFixed(2) || '?';
         const streamCount = this.currentCapture.summary?.tcpStreamCount || 0;
-
-        // Build protocol breakdown from summary
-        const protocolBreakdown = this.currentCapture.summary?.protocolBreakdown || {};
-        const topProtocols = Object.entries(protocolBreakdown)
-            .sort(([, a], [, b]) => b - a)
-            .slice(0, 15);
-
-        // Build conversations HTML
-        const convsHtml = conversations.slice(0, 50).map((c, i) => {
-            const anomalyClass = c.anomalyScore >= 10 ? 'row-error' : c.anomalyScore > 0 ? 'row-warning' : '';
-            const anomalyBadge = c.anomalies.length > 0
-                ? `<span class="badge badge-warning" title="${c.anomalies.map((a: any) => a.description).join(', ')}">${c.anomalies.length} issue${c.anomalies.length > 1 ? 's' : ''}</span>`
-                : '<span class="badge badge-ok">✓</span>';
-            return `<tr class="${anomalyClass}" data-stream="${c.index}">
-                <td>${c.index}</td>
-                <td>${c.source}</td>
-                <td>${c.destination}</td>
-                <td>${c.packetCount}</td>
-                <td>${formatBytes(c.totalBytes)}</td>
-                <td>${c.durationSeconds.toFixed(2)}s</td>
-                <td>${anomalyBadge}</td>
-                <td>
-                    <button class="btn-icon" data-action="analyzeStream" data-stream="${c.index}" title="Analyze with AI">🔍</button>
-                    <button class="btn-icon" data-action="filterStream" data-stream="${c.index}" title="Filter to this stream">🎯</button>
-                </td>
-            </tr>`;
-        }).join('');
-
-        // Build expert info HTML
-        const expertLines = expertInfo.split('\n').filter(l => l.trim());
-        const expertHtml = expertLines.slice(0, 50).map(line => {
-            const severity = line.toLowerCase().includes('error') ? 'error'
-                : line.toLowerCase().includes('warn') ? 'warning'
-                : line.toLowerCase().includes('note') ? 'note' : 'info';
-            return `<div class="expert-entry expert-${severity}">${escapeHtml(line)}</div>`;
-        }).join('');
 
         // Build packets table rows
         const packetsHtml = packets.map(p => {
@@ -449,11 +512,6 @@ export class CaptureWebviewPanel {
                 <td class="col-info">${escapeHtml(p.info)}</td>
             </tr>`;
         }).join('');
-
-        // Top protocols HTML
-        const protocolsHtml = topProtocols.map(([name, count]) =>
-            `<div class="proto-item"><span class="proto-name">${name}</span><span class="proto-count">${count}</span></div>`
-        ).join('');
 
         return `<!DOCTYPE html>
 <html>
@@ -688,6 +746,12 @@ export class CaptureWebviewPanel {
         }
         .ctx-menu-item:hover { background: var(--hover-bg); }
         .ctx-menu-sep { height: 1px; background: var(--border-color); margin: 4px 0; }
+        .loading-cell {
+            padding: 16px 8px;
+            color: var(--vscode-descriptionForeground, #888);
+            text-align: center;
+            font-style: italic;
+        }
 
         /* ─── Packet Table ──────────────────────────────────── */
         .packet-table-container { overflow: auto; }
@@ -884,7 +948,7 @@ export class CaptureWebviewPanel {
                         </tr>
                     </thead>
                     <tbody>
-                        ${convsHtml}
+                        <tr><td colspan="8" class="loading-cell">Loading conversations...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -892,18 +956,17 @@ export class CaptureWebviewPanel {
 
         <!-- Protocols Tab -->
         <div class="tab-content" id="tab-protocols">
-            <div class="side-panel">
+            <div class="side-panel" id="protocolsContent">
                 <h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3>
-                ${protocolsHtml || '<p style="color:var(--vscode-descriptionForeground)">No protocol data available</p>'}
-                ${protocolHierarchy ? `<pre style="margin-top: 16px; font-size: 11px; white-space: pre-wrap; color: var(--vscode-descriptionForeground);">${escapeHtml(protocolHierarchy)}</pre>` : ''}
+                <p style="color:var(--vscode-descriptionForeground)" id="protocolsLoading">Loading protocol hierarchy...</p>
             </div>
         </div>
 
         <!-- Expert Info Tab -->
         <div class="tab-content" id="tab-expert">
-            <div class="side-panel">
+            <div class="side-panel" id="expertContent">
                 <h3 style="margin-bottom: 8px;">Expert Information</h3>
-                ${expertHtml || '<p style="color:var(--vscode-descriptionForeground)">No expert information available</p>'}
+                <p style="color:var(--vscode-descriptionForeground)" id="expertLoading">Loading expert information...</p>
             </div>
         </div>
     </div>
@@ -1285,6 +1348,18 @@ export class CaptureWebviewPanel {
                     document.getElementById('statusFilter').textContent = msg.filter ? 'Filter: ' + msg.filter : 'No filter applied';
                     document.getElementById('filterStatus').textContent = msg.packets.length + ' packets match';
                     document.getElementById('filterStatus').className = 'filter-hint';
+                    break;
+                }
+                case 'updateConversations': {
+                    document.querySelector('#tab-conversations tbody').innerHTML = msg.html;
+                    break;
+                }
+                case 'updateProtocols': {
+                    document.getElementById('protocolsContent').innerHTML = '<h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3>' + msg.html;
+                    break;
+                }
+                case 'updateExpertInfo': {
+                    document.getElementById('expertContent').innerHTML = '<h3 style="margin-bottom: 8px;">Expert Information</h3>' + msg.html;
                     break;
                 }
                 case 'filterError': {
