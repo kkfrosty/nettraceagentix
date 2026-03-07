@@ -25,6 +25,8 @@ export class CaptureWebviewPanel {
     private currentFilter: string = '';
     private currentCapture: CaptureFile;
     private loadSequence: number = 0;
+    private supplementalTabHtml: Partial<Record<'conversations' | 'protocols' | 'expert', string>> = {};
+    private supplementalTabLoads = new Map<'conversations' | 'protocols' | 'expert', Promise<void>>();
 
     /**
      * Open or focus the viewer for a specific capture file.
@@ -84,6 +86,11 @@ export class CaptureWebviewPanel {
                         break;
                     case 'refreshData':
                         await this.loadCaptureData();
+                        break;
+                    case 'loadTabData':
+                        if (message.tab === 'conversations' || message.tab === 'protocols' || message.tab === 'expert') {
+                            await this.ensureSupplementalTabLoaded(message.tab, this.currentCapture.filePath, this.loadSequence);
+                        }
                         break;
                     case 'analyzeWithAI':
                         {
@@ -148,6 +155,8 @@ export class CaptureWebviewPanel {
     private async loadCaptureData(): Promise<void> {
         const filePath = this.currentCapture.filePath;
         const loadSequence = ++this.loadSequence;
+        this.supplementalTabHtml = {};
+        this.supplementalTabLoads.clear();
         this.outputChannel.appendLine(`[WebviewPanel] Loading data for ${this.currentCapture.name} at ${filePath}`);
 
         try {
@@ -166,53 +175,81 @@ export class CaptureWebviewPanel {
             // Render packets first so large captures open faster.
             this.panel.webview.html = this.getHtml(packets);
 
-            // Hydrate non-packet tabs in the background.
-            void this.loadSupplementalTabData(filePath, loadSequence);
-
         } catch (e) {
             this.outputChannel.appendLine(`[WebviewPanel] Error loading data: ${e}`);
             this.panel.webview.html = this.getErrorHtml(`Failed to load capture data: ${e}`);
         }
     }
 
-    private async loadSupplementalTabData(filePath: string, loadSequence: number): Promise<void> {
+    private async ensureSupplementalTabLoaded(
+        tab: 'conversations' | 'protocols' | 'expert',
+        filePath: string,
+        loadSequence: number
+    ): Promise<void> {
+        if (this.supplementalTabHtml[tab]) {
+            this.postSupplementalTabHtml(tab, this.supplementalTabHtml[tab]!);
+            return;
+        }
+
+        const existingLoad = this.supplementalTabLoads.get(tab);
+        if (existingLoad) {
+            await existingLoad;
+            return;
+        }
+
+        const loadPromise = this.loadSupplementalTab(tab, filePath, loadSequence)
+            .finally(() => this.supplementalTabLoads.delete(tab));
+        this.supplementalTabLoads.set(tab, loadPromise);
+        await loadPromise;
+    }
+
+    private async loadSupplementalTab(
+        tab: 'conversations' | 'protocols' | 'expert',
+        filePath: string,
+        loadSequence: number
+    ): Promise<void> {
         try {
-            const [conversations, expertInfo, protocolHierarchy] = await Promise.all([
-                this.tsharkRunner.getConversations(filePath).catch((e) => {
+            let html = '';
+
+            if (tab === 'conversations') {
+                const conversations = await this.tsharkRunner.getConversations(filePath).catch((e) => {
                     this.outputChannel.appendLine(`[WebviewPanel] Conversations error: ${e}`);
                     return [];
-                }),
-                this.tsharkRunner.getExpertInfo(filePath).catch((e) => {
-                    this.outputChannel.appendLine(`[WebviewPanel] Expert info error: ${e}`);
-                    return '';
-                }),
-                this.tsharkRunner.getProtocolHierarchy(filePath).catch((e) => {
+                });
+                html = this.buildConversationsHtml(conversations);
+                this.outputChannel.appendLine(`[WebviewPanel] Conversations tab ready: ${conversations.length} conversations`);
+            } else if (tab === 'protocols') {
+                const protocolHierarchy = await this.tsharkRunner.getProtocolHierarchy(filePath).catch((e) => {
                     this.outputChannel.appendLine(`[WebviewPanel] Protocol hierarchy error: ${e}`);
                     return '';
-                }),
-            ]);
+                });
+                html = this.buildProtocolsHtml(protocolHierarchy);
+            } else {
+                const expertInfo = await this.tsharkRunner.getExpertInfo(filePath).catch((e) => {
+                    this.outputChannel.appendLine(`[WebviewPanel] Expert info error: ${e}`);
+                    return '';
+                });
+                html = this.buildExpertInfoHtml(expertInfo);
+            }
 
             if (loadSequence !== this.loadSequence) {
                 return;
             }
 
-            this.outputChannel.appendLine(`[WebviewPanel] Background tab hydration ready: ${conversations.length} conversations`);
-
-            this.panel.webview.postMessage({
-                command: 'updateConversations',
-                html: this.buildConversationsHtml(conversations),
-            });
-            this.panel.webview.postMessage({
-                command: 'updateProtocols',
-                html: this.buildProtocolsHtml(protocolHierarchy),
-            });
-            this.panel.webview.postMessage({
-                command: 'updateExpertInfo',
-                html: this.buildExpertInfoHtml(expertInfo),
-            });
+            this.supplementalTabHtml[tab] = html;
+            this.postSupplementalTabHtml(tab, html);
         } catch (e) {
-            this.outputChannel.appendLine(`[WebviewPanel] Supplemental tab hydration failed: ${e}`);
+            this.outputChannel.appendLine(`[WebviewPanel] ${tab} tab load failed: ${e}`);
         }
+    }
+
+    private postSupplementalTabHtml(tab: 'conversations' | 'protocols' | 'expert', html: string): void {
+        const command = tab === 'conversations'
+            ? 'updateConversations'
+            : tab === 'protocols'
+                ? 'updateProtocols'
+                : 'updateExpertInfo';
+        this.panel.webview.postMessage({ command, html });
     }
 
     private async applyFilter(filter: string): Promise<void> {
@@ -948,7 +985,7 @@ export class CaptureWebviewPanel {
                         </tr>
                     </thead>
                     <tbody>
-                        <tr><td colspan="8" class="loading-cell">Loading conversations...</td></tr>
+                        <tr><td colspan="8" class="loading-cell">Open this tab to load conversations</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -958,7 +995,7 @@ export class CaptureWebviewPanel {
         <div class="tab-content" id="tab-protocols">
             <div class="side-panel" id="protocolsContent">
                 <h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3>
-                <p style="color:var(--vscode-descriptionForeground)" id="protocolsLoading">Loading protocol hierarchy...</p>
+                <p style="color:var(--vscode-descriptionForeground)" id="protocolsLoading">Open this tab to load protocol hierarchy</p>
             </div>
         </div>
 
@@ -966,7 +1003,7 @@ export class CaptureWebviewPanel {
         <div class="tab-content" id="tab-expert">
             <div class="side-panel" id="expertContent">
                 <h3 style="margin-bottom: 8px;">Expert Information</h3>
-                <p style="color:var(--vscode-descriptionForeground)" id="expertLoading">Loading expert information...</p>
+                <p style="color:var(--vscode-descriptionForeground)" id="expertLoading">Open this tab to load expert information</p>
             </div>
         </div>
     </div>
@@ -986,6 +1023,7 @@ export class CaptureWebviewPanel {
         const wsBottomSplitter = document.getElementById('wsBottomSplitter');
         const MIN_BOTTOM_HEIGHT = 80;
         const DEFAULT_BOTTOM_HEIGHT = 220;
+        const requestedTabs = { conversations: false, protocols: false, expert: false };
 
         // ══════════════════════════════════════════════════════
         // EVENT DELEGATION — no inline onclick needed (CSP safe)
@@ -1071,6 +1109,18 @@ export class CaptureWebviewPanel {
             document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
             tab.classList.add('active');
             document.getElementById('tab-' + tabName).classList.add('active');
+
+            if (tabName !== 'packets' && !requestedTabs[tabName]) {
+                requestedTabs[tabName] = true;
+                if (tabName === 'conversations') {
+                    document.querySelector('#tab-conversations tbody').innerHTML = '<tr><td colspan="8" class="loading-cell">Loading conversations...</td></tr>';
+                } else if (tabName === 'protocols') {
+                    document.getElementById('protocolsContent').innerHTML = '<h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3><p style="color:var(--vscode-descriptionForeground)">Loading protocol hierarchy...</p>';
+                } else if (tabName === 'expert') {
+                    document.getElementById('expertContent').innerHTML = '<h3 style="margin-bottom: 8px;">Expert Information</h3><p style="color:var(--vscode-descriptionForeground)">Loading expert information...</p>';
+                }
+                vscode.postMessage({ command: 'loadTabData', tab: tabName });
+            }
         });
 
         // Packet table — click on any row to select it
