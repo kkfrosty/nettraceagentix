@@ -12,6 +12,7 @@ import { ParsedPacketRow, ProtoTreeNode, loadPacketDetailIntoWebview, loadPacket
 export class CaptureWebviewPanel {
     public static readonly viewType = 'nettrace.captureViewer';
     private static panels = new Map<string, CaptureWebviewPanel>();
+    private static readonly PACKET_CHUNK_SIZE = 500;
 
     /**
      * Callback fired when a viewer panel opens or closes.
@@ -92,6 +93,11 @@ export class CaptureWebviewPanel {
                             await this.ensureSupplementalTabLoaded(message.tab, this.currentCapture.filePath, this.loadSequence);
                         }
                         break;
+                    case 'loadMorePackets':
+                        if (!this.currentFilter) {
+                            await this.loadPacketChunk(message.startFrame, message.endFrame, this.loadSequence);
+                        }
+                        break;
                     case 'analyzeWithAI':
                         {
                             const prompt = message.prompt || 'Analyze the current open capture context and diagnose any issues.';
@@ -160,7 +166,10 @@ export class CaptureWebviewPanel {
         this.outputChannel.appendLine(`[WebviewPanel] Loading data for ${this.currentCapture.name} at ${filePath}`);
 
         try {
-            const packetData = await this.tsharkRunner.getPacketsForDisplay(filePath, this.currentFilter);
+            const useChunkedPackets = !this.currentFilter;
+            const packetData = useChunkedPackets
+                ? await this.tsharkRunner.getPacketRange(filePath, 1, CaptureWebviewPanel.PACKET_CHUNK_SIZE)
+                : await this.tsharkRunner.getPacketsForDisplay(filePath, this.currentFilter);
 
             this.outputChannel.appendLine(`[WebviewPanel] Raw packet output length: ${packetData.length} chars, first 500 chars: ${packetData.substring(0, 500)}`);
 
@@ -173,11 +182,45 @@ export class CaptureWebviewPanel {
             }
 
             // Render packets first so large captures open faster.
-            this.panel.webview.html = this.getHtml(packets);
+            this.panel.webview.html = this.getHtml(packets, {
+                isChunked: useChunkedPackets,
+                totalPacketCount: this.currentCapture.summary?.packetCount || packets.length,
+                loadedPacketCount: packets.length,
+                chunkSize: CaptureWebviewPanel.PACKET_CHUNK_SIZE,
+                filter: this.currentFilter,
+            });
 
         } catch (e) {
             this.outputChannel.appendLine(`[WebviewPanel] Error loading data: ${e}`);
             this.panel.webview.html = this.getErrorHtml(`Failed to load capture data: ${e}`);
+        }
+    }
+
+    private async loadPacketChunk(startFrame: number, endFrame: number, loadSequence: number): Promise<void> {
+        const safeStart = Math.max(1, Number(startFrame) || 1);
+        const safeEnd = Math.max(safeStart, Number(endFrame) || safeStart);
+
+        try {
+            const raw = await this.tsharkRunner.getPacketRange(this.currentCapture.filePath, safeStart, safeEnd);
+            const packets = this.parsePacketOutput(raw);
+
+            if (loadSequence !== this.loadSequence) {
+                return;
+            }
+
+            this.panel.webview.postMessage({
+                command: 'appendPackets',
+                packets,
+                startFrame: safeStart,
+                endFrame: safeEnd,
+                totalPacketCount: this.currentCapture.summary?.packetCount || packets.length,
+            });
+        } catch (e) {
+            this.outputChannel.appendLine(`[WebviewPanel] Packet chunk load failed (${safeStart}-${safeEnd}): ${e}`);
+            this.panel.webview.postMessage({
+                command: 'packetChunkError',
+                message: `Failed to load packets ${safeStart}-${safeEnd}: ${e}`,
+            });
         }
     }
 
@@ -256,6 +299,11 @@ export class CaptureWebviewPanel {
         this.currentFilter = filter;
         this.outputChannel.appendLine(`[WebviewPanel] Applying filter: "${filter || '(none)'}"`);
 
+        if (!filter) {
+            await this.loadCaptureData();
+            return;
+        }
+
         try {
             const packetData = await this.tsharkRunner.getPacketsForDisplay(
                 this.currentCapture.filePath,
@@ -268,6 +316,7 @@ export class CaptureWebviewPanel {
                 packets,
                 filter,
                 totalCount: packets.length,
+                isChunked: false,
             });
         } catch (e) {
             this.panel.webview.postMessage({
@@ -529,7 +578,16 @@ export class CaptureWebviewPanel {
 </html>`;
     }
 
-    private getHtml(packets: PacketRow[]): string {
+    private getHtml(
+        packets: PacketRow[],
+        options: {
+            isChunked: boolean;
+            totalPacketCount: number;
+            loadedPacketCount: number;
+            chunkSize: number;
+            filter: string;
+        }
+    ): string {
         const nonce = getNonce();
         const captureName = this.currentCapture.name;
         const packetCount = this.currentCapture.summary?.packetCount || packets.length;
@@ -1024,10 +1082,47 @@ export class CaptureWebviewPanel {
         const MIN_BOTTOM_HEIGHT = 80;
         const DEFAULT_BOTTOM_HEIGHT = 220;
         const requestedTabs = { conversations: false, protocols: false, expert: false };
+        let isChunkedPacketView = ${JSON.stringify(options.isChunked)};
+        let totalPacketCount = ${JSON.stringify(options.totalPacketCount)};
+        let loadedPacketCount = ${JSON.stringify(options.loadedPacketCount)};
+        const packetChunkSize = ${JSON.stringify(options.chunkSize)};
+        let isLoadingMorePackets = false;
+        let exhaustedPacketChunks = !isChunkedPacketView || loadedPacketCount >= totalPacketCount;
 
         // ══════════════════════════════════════════════════════
         // EVENT DELEGATION — no inline onclick needed (CSP safe)
         // ══════════════════════════════════════════════════════
+
+        function updatePacketStatusText(filterValue) {
+            var status = document.getElementById('statusPacketCount');
+            if (filterValue) {
+                status.textContent = 'Showing ' + loadedPacketCount + ' filtered packets';
+                return;
+            }
+            if (isChunkedPacketView) {
+                status.textContent = 'Showing ' + loadedPacketCount + ' of ' + totalPacketCount + ' packets';
+                return;
+            }
+            status.textContent = 'Showing ' + loadedPacketCount + ' packets';
+        }
+
+        function maybeLoadMorePackets() {
+            if (!isChunkedPacketView || isLoadingMorePackets || exhaustedPacketChunks) return;
+            var scroller = document.querySelector('.ws-top');
+            if (!scroller) return;
+            var remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+            if (remaining > 800) return;
+
+            var startFrame = loadedPacketCount + 1;
+            var endFrame = Math.min(startFrame + packetChunkSize - 1, totalPacketCount);
+            if (startFrame > endFrame) {
+                exhaustedPacketChunks = true;
+                return;
+            }
+
+            isLoadingMorePackets = true;
+            vscode.postMessage({ command: 'loadMorePackets', startFrame: startFrame, endFrame: endFrame });
+        }
 
         function setBottomHeight(heightPx) {
             if (!wsLayout) return;
@@ -1142,6 +1237,8 @@ export class CaptureWebviewPanel {
             if (!isNaN(num)) selectPacket(num);
             showContextMenu(e.clientX, e.clientY, row);
         });
+
+        document.querySelector('.ws-top').addEventListener('scroll', maybeLoadMorePackets);
 
         // Close context menu on click elsewhere
         document.addEventListener('click', function(e) {
@@ -1394,10 +1491,41 @@ export class CaptureWebviewPanel {
                             + '<td class="col-info">' + escapeHtml(p.info) + '</td>'
                             + '</tr>';
                     }).join('');
-                    document.getElementById('statusPacketCount').textContent = 'Showing ' + msg.packets.length + ' packets';
+                    isChunkedPacketView = !!msg.isChunked;
+                    loadedPacketCount = msg.packets.length;
+                    totalPacketCount = msg.totalCount || msg.packets.length;
+                    exhaustedPacketChunks = !isChunkedPacketView || loadedPacketCount >= totalPacketCount;
+                    isLoadingMorePackets = false;
+                    updatePacketStatusText(msg.filter);
                     document.getElementById('statusFilter').textContent = msg.filter ? 'Filter: ' + msg.filter : 'No filter applied';
                     document.getElementById('filterStatus').textContent = msg.packets.length + ' packets match';
                     document.getElementById('filterStatus').className = 'filter-hint';
+                    break;
+                }
+                case 'appendPackets': {
+                    var tbody = document.getElementById('packetTableBody');
+                    tbody.insertAdjacentHTML('beforeend', msg.packets.map(function(p) {
+                        var protoClass = getProtocolClass(p.protocol);
+                        return '<tr class="' + protoClass + '" data-packet="' + p.number + '" data-src="' + escapeHtml(p.source) + '" data-dst="' + escapeHtml(p.destination) + '" data-proto="' + escapeHtml(p.protocol) + '" data-stream="' + (p.stream || '') + '">'
+                            + '<td class="col-no">' + p.number + '</td>'
+                            + '<td class="col-time">' + p.time + '</td>'
+                            + '<td class="col-src">' + p.source + '</td>'
+                            + '<td class="col-dst">' + p.destination + '</td>'
+                            + '<td class="col-proto">' + p.protocol + '</td>'
+                            + '<td class="col-len">' + p.length + '</td>'
+                            + '<td class="col-info">' + escapeHtml(p.info) + '</td>'
+                            + '</tr>';
+                    }).join(''));
+                    loadedPacketCount += msg.packets.length;
+                    totalPacketCount = msg.totalPacketCount || totalPacketCount;
+                    exhaustedPacketChunks = msg.packets.length === 0 || loadedPacketCount >= totalPacketCount;
+                    isLoadingMorePackets = false;
+                    updatePacketStatusText(filterInput.value.trim());
+                    break;
+                }
+                case 'packetChunkError': {
+                    isLoadingMorePackets = false;
+                    document.getElementById('statusSelected').textContent = msg.message;
                     break;
                 }
                 case 'updateConversations': {
@@ -1413,6 +1541,7 @@ export class CaptureWebviewPanel {
                     break;
                 }
                 case 'filterError': {
+                    isLoadingMorePackets = false;
                     document.getElementById('filterStatus').textContent = msg.message;
                     document.getElementById('filterStatus').className = 'filter-error-msg';
                     document.getElementById('filterInput').classList.add('filter-error');
@@ -1443,6 +1572,8 @@ export class CaptureWebviewPanel {
                 }
             }
         });
+
+        updatePacketStatusText(${JSON.stringify(options.filter)});
     </script>
 </body>
 </html>`;
