@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { TsharkRunner } from '../parsing/tsharkRunner';
 import { CaptureFile } from '../types';
+import { ParsedPacketRow, ProtoTreeNode, loadPacketDetailIntoWebview, loadPacketHexIntoWebview, parsePacketOutput } from './sharedCaptureView';
 
 /**
  * Manages the Capture Viewer webview panel — a mini Wireshark inside VS Code.
@@ -11,6 +12,7 @@ import { CaptureFile } from '../types';
 export class CaptureWebviewPanel {
     public static readonly viewType = 'nettrace.captureViewer';
     private static panels = new Map<string, CaptureWebviewPanel>();
+    private static readonly DEFAULT_VIRTUALIZATION_THRESHOLD = 20000;
 
     /**
      * Callback fired when a viewer panel opens or closes.
@@ -23,6 +25,10 @@ export class CaptureWebviewPanel {
     private disposables: vscode.Disposable[] = [];
     private currentFilter: string = '';
     private currentCapture: CaptureFile;
+    private loadSequence: number = 0;
+    private packetWindowCache = new Map<string, PacketRow[]>();
+    private supplementalTabHtml: Partial<Record<'conversations' | 'protocols' | 'expert', string>> = {};
+    private supplementalTabLoads = new Map<'conversations' | 'protocols' | 'expert', Promise<void>>();
 
     /**
      * Open or focus the viewer for a specific capture file.
@@ -83,12 +89,19 @@ export class CaptureWebviewPanel {
                     case 'refreshData':
                         await this.loadCaptureData();
                         break;
+                    case 'loadTabData':
+                        if (message.tab === 'conversations' || message.tab === 'protocols' || message.tab === 'expert') {
+                            await this.ensureSupplementalTabLoaded(message.tab, this.currentCapture.filePath, this.loadSequence);
+                        }
+                        break;
+                    case 'requestPacketWindow':
+                        await this.loadPacketWindow(message.startFrame, message.endFrame);
+                        break;
                     case 'analyzeWithAI':
                         {
-                            const marker = `[[nettrace:captureFile=${encodeURIComponent(this.currentCapture.filePath)}]]`;
-                            const prompt = message.prompt || 'Analyze this capture.';
+                            const prompt = message.prompt || 'Analyze the current open capture context and diagnose any issues.';
                             await vscode.commands.executeCommand('workbench.action.chat.open', {
-                                query: `@nettrace ${marker} ${prompt}`,
+                                query: `@nettrace ${prompt}`,
                             });
                         }
                         break;
@@ -146,26 +159,44 @@ export class CaptureWebviewPanel {
 
     private async loadCaptureData(): Promise<void> {
         const filePath = this.currentCapture.filePath;
+        const loadSequence = ++this.loadSequence;
+        const virtualizationThreshold = this.getVirtualizationThreshold();
+        const summaryPacketCount = this.currentCapture.summary?.packetCount ?? 0;
+        const usePagedPacketLoading = !this.currentFilter && summaryPacketCount >= virtualizationThreshold;
+        this.packetWindowCache.clear();
+        this.supplementalTabHtml = {};
+        this.supplementalTabLoads.clear();
         this.outputChannel.appendLine(`[WebviewPanel] Loading data for ${this.currentCapture.name} at ${filePath}`);
 
         try {
-            // Run multiple tshark queries in parallel
-            const [packetData, conversations, expertInfo, protocolHierarchy] = await Promise.all([
-                this.tsharkRunner.getPacketsForDisplay(filePath, this.currentFilter),
-                this.tsharkRunner.getConversations(filePath).catch((e) => { this.outputChannel.appendLine(`[WebviewPanel] Conversations error: ${e}`); return []; }),
-                this.tsharkRunner.getExpertInfo(filePath).catch((e) => { this.outputChannel.appendLine(`[WebviewPanel] Expert info error: ${e}`); return ''; }),
-                this.tsharkRunner.getProtocolHierarchy(filePath).catch((e) => { this.outputChannel.appendLine(`[WebviewPanel] Protocol hierarchy error: ${e}`); return ''; }),
-            ]);
+            this.panel.webview.html = this.getHtml([], {
+                isChunked: true,
+                totalPacketCount: summaryPacketCount || undefined,
+                loadedPacketCount: 0,
+                chunkSize: 0,
+                filter: this.currentFilter,
+                virtualizationThreshold,
+                isPagedPacketView: usePagedPacketLoading,
+            });
 
-            this.outputChannel.appendLine(`[WebviewPanel] Raw packet output length: ${packetData.length} chars, first 500 chars: ${packetData.substring(0, 500)}`);
-            this.outputChannel.appendLine(`[WebviewPanel] Conversations count: ${conversations.length}`);
+            if (usePagedPacketLoading) {
+                return;
+            }
 
-            // Parse pipe-separated packet data into structured rows
+            const packetData = await this.tsharkRunner.getPacketsForDisplay(filePath, this.currentFilter);
             const packets = this.parsePacketOutput(packetData);
-            this.outputChannel.appendLine(`[WebviewPanel] Parsed ${packets.length} packets from ${packetData.split('\\n').length} lines`);
 
-            // Update the webview with the full HTML + data
-            this.panel.webview.html = this.getHtml(packets, conversations, expertInfo, protocolHierarchy);
+            if (loadSequence !== this.loadSequence) {
+                return;
+            }
+
+            this.panel.webview.postMessage({
+                command: 'replacePackets',
+                packets,
+                filter: this.currentFilter,
+                totalCount: this.currentFilter ? packets.length : (this.currentCapture.summary?.packetCount ?? packets.length),
+                isChunked: false,
+            });
 
         } catch (e) {
             this.outputChannel.appendLine(`[WebviewPanel] Error loading data: ${e}`);
@@ -173,9 +204,86 @@ export class CaptureWebviewPanel {
         }
     }
 
+    private async ensureSupplementalTabLoaded(
+        tab: 'conversations' | 'protocols' | 'expert',
+        filePath: string,
+        loadSequence: number
+    ): Promise<void> {
+        if (this.supplementalTabHtml[tab]) {
+            this.postSupplementalTabHtml(tab, this.supplementalTabHtml[tab]!);
+            return;
+        }
+
+        const existingLoad = this.supplementalTabLoads.get(tab);
+        if (existingLoad) {
+            await existingLoad;
+            return;
+        }
+
+        const loadPromise = this.loadSupplementalTab(tab, filePath, loadSequence)
+            .finally(() => this.supplementalTabLoads.delete(tab));
+        this.supplementalTabLoads.set(tab, loadPromise);
+        await loadPromise;
+    }
+
+    private async loadSupplementalTab(
+        tab: 'conversations' | 'protocols' | 'expert',
+        filePath: string,
+        loadSequence: number
+    ): Promise<void> {
+        try {
+            let html = '';
+
+            if (tab === 'conversations') {
+                const conversations = await this.tsharkRunner.getConversations(filePath).catch((e) => {
+                    this.outputChannel.appendLine(`[WebviewPanel] Conversations error: ${e}`);
+                    return [];
+                });
+                html = this.buildConversationsHtml(conversations);
+                this.outputChannel.appendLine(`[WebviewPanel] Conversations tab ready: ${conversations.length} conversations`);
+            } else if (tab === 'protocols') {
+                const protocolHierarchy = await this.tsharkRunner.getProtocolHierarchy(filePath).catch((e) => {
+                    this.outputChannel.appendLine(`[WebviewPanel] Protocol hierarchy error: ${e}`);
+                    return '';
+                });
+                html = this.buildProtocolsHtml(protocolHierarchy);
+            } else {
+                const expertInfo = await this.tsharkRunner.getExpertInfo(filePath).catch((e) => {
+                    this.outputChannel.appendLine(`[WebviewPanel] Expert info error: ${e}`);
+                    return '';
+                });
+                html = this.buildExpertInfoHtml(expertInfo);
+            }
+
+            if (loadSequence !== this.loadSequence) {
+                return;
+            }
+
+            this.supplementalTabHtml[tab] = html;
+            this.postSupplementalTabHtml(tab, html);
+        } catch (e) {
+            this.outputChannel.appendLine(`[WebviewPanel] ${tab} tab load failed: ${e}`);
+        }
+    }
+
+    private postSupplementalTabHtml(tab: 'conversations' | 'protocols' | 'expert', html: string): void {
+        const command = tab === 'conversations'
+            ? 'updateConversations'
+            : tab === 'protocols'
+                ? 'updateProtocols'
+                : 'updateExpertInfo';
+        this.panel.webview.postMessage({ command, html });
+    }
+
     private async applyFilter(filter: string): Promise<void> {
         this.currentFilter = filter;
+        this.packetWindowCache.clear();
         this.outputChannel.appendLine(`[WebviewPanel] Applying filter: "${filter || '(none)'}"`);
+
+        if (!filter) {
+            await this.loadCaptureData();
+            return;
+        }
 
         try {
             const packetData = await this.tsharkRunner.getPacketsForDisplay(
@@ -185,10 +293,11 @@ export class CaptureWebviewPanel {
             const packets = this.parsePacketOutput(packetData);
 
             this.panel.webview.postMessage({
-                command: 'updatePackets',
+                command: 'replacePackets',
                 packets,
                 filter,
                 totalCount: packets.length,
+                isChunked: false,
             });
         } catch (e) {
             this.panel.webview.postMessage({
@@ -196,6 +305,65 @@ export class CaptureWebviewPanel {
                 message: `Invalid filter: ${e}`,
             });
         }
+    }
+
+    private async loadPacketWindow(startFrame: number, endFrame: number): Promise<void> {
+        const loadSequence = this.loadSequence;
+        const clampedStart = Math.max(1, Math.floor(startFrame));
+        const clampedEnd = Math.max(clampedStart, Math.floor(endFrame));
+        const cacheKey = `${this.currentFilter}::${clampedStart}-${clampedEnd}`;
+
+        try {
+            const cached = this.packetWindowCache.get(cacheKey);
+            if (cached) {
+                this.panel.webview.postMessage({
+                    command: 'packetWindow',
+                    packets: cached,
+                    startFrame: clampedStart,
+                    endFrame: clampedEnd,
+                    totalCount: this.currentFilter
+                        ? cached.length
+                        : (this.currentCapture.summary?.packetCount ?? cached.length),
+                    filter: this.currentFilter,
+                });
+                return;
+            }
+
+            const packetData = await this.tsharkRunner.getPacketRange(
+                this.currentCapture.filePath,
+                clampedStart,
+                clampedEnd,
+                this.currentFilter || undefined
+            );
+            const packets = this.parsePacketOutput(packetData);
+
+            if (loadSequence !== this.loadSequence) {
+                return;
+            }
+
+            this.packetWindowCache.set(cacheKey, packets);
+
+            this.panel.webview.postMessage({
+                command: 'packetWindow',
+                packets,
+                startFrame: clampedStart,
+                endFrame: clampedEnd,
+                totalCount: this.currentFilter
+                    ? packets.length
+                    : (this.currentCapture.summary?.packetCount ?? packets.length),
+                filter: this.currentFilter,
+            });
+        } catch (e) {
+            this.panel.webview.postMessage({
+                command: 'error',
+                message: `Failed to load packet window ${clampedStart}-${clampedEnd}: ${e}`,
+            });
+        }
+    }
+
+    private async applyDisplayFilterToPanel(filter: string): Promise<void> {
+        this.panel.webview.postMessage({ command: 'applyFilterExt', filter });
+        await this.applyFilter(filter);
     }
 
     private async loadStreamPackets(streamIndex: number): Promise<void> {
@@ -223,248 +391,29 @@ export class CaptureWebviewPanel {
      * This is more reliable than PDML XML parsing.
      */
     private async loadPacketDetail(frameNumber: number): Promise<void> {
-        this.outputChannel.appendLine(`[WebviewPanel] Loading detail for packet #${frameNumber}`);
-        try {
-            // Use -V verbose text output — reliable and easy to parse by indentation
-            const verbose = await this.tsharkRunner.getPacketDetail(
-                this.currentCapture.filePath,
-                frameNumber
-            );
-
-            this.outputChannel.appendLine(`[WebviewPanel] Verbose output length: ${verbose.length} chars, lines: ${verbose.split('\n').length}`);
-
-            const tree = this.parseVerboseToTree(verbose);
-
-            this.outputChannel.appendLine(`[WebviewPanel] Parsed ${tree.length} protocol layers: ${tree.map(n => n.showname.substring(0, 40)).join(' | ')}`);
-
-            if (tree.length === 0) {
-                // Fallback: show raw text if parsing produced nothing
-                this.outputChannel.appendLine(`[WebviewPanel] Tree empty, showing raw text`);
-                this.panel.webview.postMessage({
-                    command: 'packetDetailRaw',
-                    frameNumber,
-                    text: verbose || 'No detail available for this packet.',
-                });
-                return;
-            }
-
-            this.panel.webview.postMessage({
-                command: 'packetDetail',
-                frameNumber,
-                tree,
-            });
-        } catch (e) {
-            this.outputChannel.appendLine(`[WebviewPanel] Packet detail error: ${e}`);
-            this.panel.webview.postMessage({
-                command: 'packetDetailRaw',
-                frameNumber,
-                text: `Error loading packet detail: ${e}`,
-            });
-        }
+        await loadPacketDetailIntoWebview({
+            tsharkRunner: this.tsharkRunner,
+            captureFile: this.currentCapture.filePath,
+            frameNumber,
+            postMessage: (message) => this.panel.webview.postMessage(message),
+            outputChannel: this.outputChannel,
+            logPrefix: 'WebviewPanel',
+            preferredFormat: 'verbose',
+        });
     }
 
     /**
      * Load hex dump for a single packet.
      */
     private async loadPacketHex(frameNumber: number): Promise<void> {
-        try {
-            const hex = await this.tsharkRunner.getPacketHexDump(
-                this.currentCapture.filePath,
-                frameNumber
-            );
-            this.panel.webview.postMessage({
-                command: 'packetHex',
-                frameNumber,
-                hex,
-            });
-        } catch (e) {
-            this.panel.webview.postMessage({
-                command: 'packetHex',
-                frameNumber,
-                hex: `Error: ${e}`,
-            });
-        }
-    }
-
-    /**
-     * Parse tshark -V (verbose) text output into a tree structure.
-     * Lines with no leading space = protocol headers (Frame, Ethernet, IP, TCP...)
-     * Lines with leading spaces = fields under the protocol, nesting by indent level.
-     * 
-     * This is the same format Wireshark shows in the middle pane.
-     */
-    private parseVerboseToTree(verbose: string): ProtoTreeNode[] {
-        const nodes: ProtoTreeNode[] = [];
-        if (!verbose || verbose.trim().length === 0) { return nodes; }
-
-        const rawLines = verbose.split('\n');
-
-        // tshark -V can wrap long lines. We join continuation lines that have
-        // unusual indentation back to the previous line.
-        const lines: string[] = [];
-        for (const raw of rawLines) {
-            if (raw.length === 0) { continue; }
-            const indent = raw.search(/\S/);
-            if (indent === -1) { continue; }
-
-            if (lines.length > 0 && indent > 0) {
-                const prevIndent = lines[lines.length - 1].search(/\S/);
-                // Continuation: odd indent, or way deeper than expected
-                if (indent % 4 !== 0 || indent > prevIndent + 8) {
-                    lines[lines.length - 1] = lines[lines.length - 1] + ' ' + raw.trim();
-                    continue;
-                }
-            }
-            lines.push(raw);
-        }
-
-        // Parse lines into a tree by indentation level.
-        // indent=0 → protocol header (top-level expandable node)
-        // indent=4 → field under protocol
-        // indent=8 → sub-field, etc.
-        const stack: Array<{ node: ProtoTreeNode; indent: number }> = [];
-
-        for (const line of lines) {
-            const indent = line.search(/\S/);
-            if (indent === -1) { continue; }
-            const text = line.trim();
-            if (text.length === 0) { continue; }
-
-            const node: ProtoTreeNode = {
-                name: '',
-                showname: text,
-                children: [],
-            };
-
-            if (indent === 0) {
-                // Protocol header — top-level node
-                nodes.push(node);
-                stack.length = 0;
-                stack.push({ node, indent: 0 });
-            } else {
-                // Field — pop stack to find parent with lower indent
-                while (stack.length > 0 && stack[stack.length - 1].indent >= indent) {
-                    stack.pop();
-                }
-                if (stack.length > 0) {
-                    stack[stack.length - 1].node.children.push(node);
-                } else {
-                    nodes.push(node);
-                }
-                stack.push({ node, indent });
-            }
-        }
-
-        return nodes;
-    }
-
-    /**
-     * Parse PDML XML into a tree structure for the webview.
-     * Properly handles nested fields, multi-line tags, and filters out hidden entries.
-     *
-     * PDML structure:
-     *   <packet>
-     *     <proto name="frame" showname="Frame 1: ...">
-     *       <field name="frame.time" showname="Arrival Time: ..."/>
-     *       <field name="frame.len" showname="Frame Length: ...">
-     *         <field name="..." showname="..."/>   ← nested children
-     *       </field>
-     *     </proto>
-     *   </packet>
-     */
-    private parsePdmlToTree(pdml: string): ProtoTreeNode[] {
-        const nodes: ProtoTreeNode[] = [];
-
-        // Normalize: collapse multi-line tags into single lines.
-        // tshark wraps long attribute values across lines.
-        const normalized = pdml.replace(/\n\s*/g, ' ');
-
-        // Extract all tags using a regex that matches opening, self-closing, and closing tags
-        // Regex to match XML tags. Use lazy capture for attrs so trailing / isn't consumed.
-        const tagRegex = /<(\/?)(\w+)(\s[^>]*?)?\s*(\/?)>/g;
-        const stack: ProtoTreeNode[] = [];
-        let skipDepth = 0; // Track depth inside hidden or geninfo elements
-
-        let match;
-        while ((match = tagRegex.exec(normalized)) !== null) {
-            const isClosing = match[1] === '/';
-            const tagName = match[2];
-            const attrStr = match[3] || '';
-            const isSelfClosing = match[4] === '/';
-
-            // Skip non-proto/field tags (pdml, packet, etc.)
-            if (tagName !== 'proto' && tagName !== 'field') { continue; }
-
-            if (isClosing) {
-                // Closing tag: </proto> or </field>
-                if (skipDepth > 0) {
-                    skipDepth--;
-                    continue;
-                }
-                stack.pop();
-                continue;
-            }
-
-            // Opening or self-closing tag
-            const attrs = this.parseXmlAttrs(attrStr);
-
-            // Skip geninfo proto (tshark metadata)
-            if (tagName === 'proto' && attrs.name === 'geninfo') {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            // Skip hidden fields
-            if (attrs.hide === 'yes') {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            // If we're inside a skipped element, skip everything
-            if (skipDepth > 0) {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            // Skip fields with no display text
-            if (tagName === 'field' && !attrs.showname) {
-                if (!isSelfClosing) { skipDepth++; }
-                continue;
-            }
-
-            const node: ProtoTreeNode = {
-                name: attrs.name || '',
-                showname: attrs.showname || attrs.name || 'Unknown',
-                children: [],
-            };
-
-            if (stack.length === 0) {
-                // Top-level proto
-                nodes.push(node);
-            } else {
-                // Child of current parent
-                stack[stack.length - 1].children.push(node);
-            }
-
-            if (!isSelfClosing) {
-                stack.push(node);
-            }
-        }
-
-        return nodes;
-    }
-
-    /**
-     * Parse XML attributes from a string like: name="foo" showname="bar" hide="yes"
-     */
-    private parseXmlAttrs(attrString: string): Record<string, string> {
-        const attrs: Record<string, string> = {};
-        const regex = /(\w+)="([^"]*)"/g;
-        let match;
-        while ((match = regex.exec(attrString)) !== null) {
-            attrs[match[1]] = match[2];
-        }
-        return attrs;
+        await loadPacketHexIntoWebview({
+            tsharkRunner: this.tsharkRunner,
+            captureFile: this.currentCapture.filePath,
+            frameNumber,
+            postMessage: (message) => this.panel.webview.postMessage(message),
+            outputChannel: this.outputChannel,
+            logPrefix: 'WebviewPanel',
+        });
     }
 
     /**
@@ -538,14 +487,14 @@ export class CaptureWebviewPanel {
     public static applyFilterToActive(filter: string): void {
         for (const [, viewer] of CaptureWebviewPanel.panels) {
             if (viewer.panel.visible) {
-                viewer.panel.webview.postMessage({ command: 'applyFilterExt', filter });
+                void viewer.applyDisplayFilterToPanel(filter);
                 return;
             }
         }
         // Fallback: apply to first panel
         const first = CaptureWebviewPanel.panels.values().next();
         if (!first.done) {
-            first.value.panel.webview.postMessage({ command: 'applyFilterExt', filter });
+            void first.value.applyDisplayFilterToPanel(filter);
         }
     }
 
@@ -554,28 +503,85 @@ export class CaptureWebviewPanel {
      * Format: frame.number|time_relative|source|destination|protocol|frame.len|info|tcp.stream
      */
     private parsePacketOutput(rawOutput: string): PacketRow[] {
-        const lines = rawOutput.split('\n').filter(l => l.trim().length > 0);
-        const packets: PacketRow[] = [];
+        return parsePacketOutput(rawOutput).map((packet) => ({
+            number: packet.number,
+            time: packet.time,
+            source: packet.source,
+            destination: packet.destination,
+            protocol: packet.protocol,
+            length: packet.length,
+            info: packet.info,
+            stream: packet.stream,
+        }));
+    }
 
-        for (const line of lines) {
-            const parts = line.split('|');
-            if (parts.length < 5) { continue; }
+    private getVirtualizationThreshold(): number {
+        const configured = vscode.workspace
+            .getConfiguration('nettrace')
+            .get<number>('captureViewerVirtualizationThreshold', CaptureWebviewPanel.DEFAULT_VIRTUALIZATION_THRESHOLD);
 
-            const frameNum = parseInt(parts[0]);
-            if (isNaN(frameNum) || frameNum <= 0) { continue; } // Skip header or junk lines
-
-            packets.push({
-                number: frameNum,
-                time: (parts[1] || '0').trim(),
-                source: (parts[2] || '').trim(),
-                destination: (parts[3] || '').trim(),
-                protocol: (parts[4] || '').trim(),
-                length: parseInt(parts[5]) || 0,
-                info: parts.slice(6, -1).join('|').trim(), // Info may contain pipes; last field is tcp.stream
-                stream: parts[parts.length - 1]?.trim() || '',
-            });
+        if (!Number.isFinite(configured) || configured <= 0) {
+            return CaptureWebviewPanel.DEFAULT_VIRTUALIZATION_THRESHOLD;
         }
-        return packets;
+
+        return Math.floor(configured);
+    }
+
+    private buildConversationsHtml(conversations: any[]): string {
+        if (conversations.length === 0) {
+            return '<tr><td colspan="8" class="loading-cell">No conversations available</td></tr>';
+        }
+
+        return conversations.slice(0, 50).map((c) => {
+            const anomalyClass = c.anomalyScore >= 10 ? 'row-error' : c.anomalyScore > 0 ? 'row-warning' : '';
+            const anomalyBadge = c.anomalies.length > 0
+                ? `<span class="badge badge-warning" title="${c.anomalies.map((a: any) => a.description).join(', ')}">${c.anomalies.length} issue${c.anomalies.length > 1 ? 's' : ''}</span>`
+                : '<span class="badge badge-ok">✓</span>';
+            return `<tr class="${anomalyClass}" data-stream="${c.index}">
+                <td>${c.index}</td>
+                <td>${c.source}</td>
+                <td>${c.destination}</td>
+                <td>${c.packetCount}</td>
+                <td>${formatBytes(c.totalBytes)}</td>
+                <td>${c.durationSeconds.toFixed(2)}s</td>
+                <td>${anomalyBadge}</td>
+                <td>
+                    <button class="btn-icon" data-action="analyzeStream" data-stream="${c.index}" title="Analyze with AI">🔍</button>
+                    <button class="btn-icon" data-action="filterStream" data-stream="${c.index}" title="Filter to this stream">🎯</button>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    private buildExpertInfoHtml(expertInfo: string): string {
+        const expertLines = expertInfo.split('\n').filter(l => l.trim());
+        if (expertLines.length === 0) {
+            return '<p style="color:var(--vscode-descriptionForeground)">No expert information available</p>';
+        }
+
+        return expertLines.slice(0, 50).map(line => {
+            const severity = line.toLowerCase().includes('error') ? 'error'
+                : line.toLowerCase().includes('warn') ? 'warning'
+                : line.toLowerCase().includes('note') ? 'note' : 'info';
+            return `<div class="expert-entry expert-${severity}">${escapeHtml(line)}</div>`;
+        }).join('');
+    }
+
+    private buildProtocolsHtml(protocolHierarchy: string): string {
+        const protocolBreakdown = this.currentCapture.summary?.protocolBreakdown || {};
+        const topProtocols = Object.entries(protocolBreakdown)
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 15);
+
+        const protocolsHtml = topProtocols.map(([name, count]) =>
+            `<div class="proto-item"><span class="proto-name">${name}</span><span class="proto-count">${count}</span></div>`
+        ).join('');
+
+        const hierarchyHtml = protocolHierarchy
+            ? `<pre style="margin-top: 16px; font-size: 11px; white-space: pre-wrap; color: var(--vscode-descriptionForeground);">${escapeHtml(protocolHierarchy)}</pre>`
+            : '';
+
+        return `${protocolsHtml || '<p style="color:var(--vscode-descriptionForeground)">No protocol data available</p>'}${hierarchyHtml}`;
     }
 
     private getErrorHtml(message: string): string {
@@ -619,67 +625,42 @@ export class CaptureWebviewPanel {
 </html>`;
     }
 
-    private getHtml(packets: PacketRow[], conversations: any[], expertInfo: string, protocolHierarchy: string): string {
+    private getHtml(
+        packets: PacketRow[],
+        options: {
+            isChunked: boolean;
+            totalPacketCount?: number;
+            loadedPacketCount: number;
+            chunkSize: number;
+            filter: string;
+            virtualizationThreshold: number;
+            isPagedPacketView?: boolean;
+        }
+    ): string {
         const nonce = getNonce();
         const captureName = this.currentCapture.name;
-        const packetCount = this.currentCapture.summary?.packetCount || packets.length;
-        const duration = this.currentCapture.summary?.durationSeconds?.toFixed(2) || '?';
-        const streamCount = this.currentCapture.summary?.tcpStreamCount || 0;
+        const packetCount = this.currentCapture.summary?.packetCount ?? packets.length;
+        const initialHeaderStats = options.isChunked
+            ? (options.totalPacketCount !== undefined
+                ? `Loading 0 of ${options.totalPacketCount} packets...`
+                : 'Loading packets...')
+            : `${packetCount} packets`;
 
-        // Build protocol breakdown from summary
-        const protocolBreakdown = this.currentCapture.summary?.protocolBreakdown || {};
-        const topProtocols = Object.entries(protocolBreakdown)
-            .sort(([, a], [, b]) => b - a)
-            .slice(0, 15);
-
-        // Build conversations HTML
-        const convsHtml = conversations.slice(0, 50).map((c, i) => {
-            const anomalyClass = c.anomalyScore >= 10 ? 'row-error' : c.anomalyScore > 0 ? 'row-warning' : '';
-            const anomalyBadge = c.anomalies.length > 0
-                ? `<span class="badge badge-warning" title="${c.anomalies.map((a: any) => a.description).join(', ')}">${c.anomalies.length} issue${c.anomalies.length > 1 ? 's' : ''}</span>`
-                : '<span class="badge badge-ok">✓</span>';
-            return `<tr class="${anomalyClass}" data-stream="${c.index}">
-                <td>${c.index}</td>
-                <td>${c.source}</td>
-                <td>${c.destination}</td>
-                <td>${c.packetCount}</td>
-                <td>${formatBytes(c.totalBytes)}</td>
-                <td>${c.durationSeconds.toFixed(2)}s</td>
-                <td>${anomalyBadge}</td>
-                <td>
-                    <button class="btn-icon" data-action="analyzeStream" data-stream="${c.index}" title="Analyze with AI">🔍</button>
-                    <button class="btn-icon" data-action="filterStream" data-stream="${c.index}" title="Filter to this stream">🎯</button>
-                </td>
-            </tr>`;
-        }).join('');
-
-        // Build expert info HTML
-        const expertLines = expertInfo.split('\n').filter(l => l.trim());
-        const expertHtml = expertLines.slice(0, 50).map(line => {
-            const severity = line.toLowerCase().includes('error') ? 'error'
-                : line.toLowerCase().includes('warn') ? 'warning'
-                : line.toLowerCase().includes('note') ? 'note' : 'info';
-            return `<div class="expert-entry expert-${severity}">${escapeHtml(line)}</div>`;
-        }).join('');
-
-        // Build packets table rows
-        const packetsHtml = packets.map(p => {
+        // Build packet rows (div-based grid, matches renderPacketRow in webview JS)
+        const packetsHtml = packets.length > 0 ? packets.map(p => {
             const protoClass = getProtocolClass(p.protocol);
-            return `<tr class="${protoClass}" data-packet="${p.number}" data-src="${escapeHtml(p.source)}" data-dst="${escapeHtml(p.destination)}" data-proto="${escapeHtml(p.protocol)}" data-stream="${p.stream}">
-                <td class="col-no">${p.number}</td>
-                <td class="col-time">${p.time}</td>
-                <td class="col-src">${p.source}</td>
-                <td class="col-dst">${p.destination}</td>
-                <td class="col-proto">${p.protocol}</td>
-                <td class="col-len">${p.length}</td>
-                <td class="col-info">${escapeHtml(p.info)}</td>
-            </tr>`;
-        }).join('');
-
-        // Top protocols HTML
-        const protocolsHtml = topProtocols.map(([name, count]) =>
-            `<div class="proto-item"><span class="proto-name">${name}</span><span class="proto-count">${count}</span></div>`
-        ).join('');
+            return `<div class="packet-row ${protoClass}" data-packet="${p.number}" data-src="${escapeHtml(p.source)}" data-dst="${escapeHtml(p.destination)}" data-proto="${escapeHtml(p.protocol)}" data-stream="${p.stream}">
+                <div class="packet-cell col-no">${p.number}</div>
+                <div class="packet-cell col-time">${p.time}</div>
+                <div class="packet-cell col-src">${p.source}</div>
+                <div class="packet-cell col-dst">${p.destination}</div>
+                <div class="packet-cell col-proto">${p.protocol}</div>
+                <div class="packet-cell col-len">${p.length}</div>
+                <div class="packet-cell col-info">${escapeHtml(p.info)}</div>
+            </div>`;
+        }).join('') : options.isChunked
+            ? '<div class="packet-loading">Loading packets...</div>'
+            : '<div class="packet-loading">No packets available</div>';
 
         return `<!DOCTYPE html>
 <html>
@@ -840,9 +821,31 @@ export class CaptureWebviewPanel {
         .tab-content.active { display: flex; flex-direction: column; overflow: hidden; }
 
         /* ─── Wireshark-style 3-pane layout for Packets tab ── */
-        .ws-layout { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
-        .ws-top { flex: 1; min-height: 80px; overflow: auto; border-bottom: 2px solid var(--border-color); }
-        .ws-bottom { flex: 1; min-height: 80px; display: flex; flex-direction: row; overflow: hidden; }
+        .ws-layout { display: flex; flex-direction: column; flex: 1; overflow: hidden; --ws-bottom-height: 220px; }
+        .ws-top { flex: 1 1 auto; min-height: 80px; overflow: hidden; display: flex; flex-direction: column; }
+        .ws-splitter {
+            flex: 0 0 6px;
+            cursor: row-resize;
+            background: var(--header-bg);
+            border-top: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+            position: relative;
+        }
+        .ws-splitter::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 36px;
+            height: 2px;
+            transform: translate(-50%, -50%);
+            background: var(--vscode-descriptionForeground, #888);
+            box-shadow: 0 -4px 0 var(--vscode-descriptionForeground, #888), 0 4px 0 var(--vscode-descriptionForeground, #888);
+            opacity: 0.65;
+        }
+        .ws-splitter:hover,
+        .ws-splitter.dragging { background: var(--hover-bg); }
+        .ws-bottom { flex: 0 0 var(--ws-bottom-height); min-height: 80px; display: flex; flex-direction: row; overflow: hidden; }
         .ws-detail { flex: 1; overflow: auto; border-right: 2px solid var(--border-color); }
         .ws-hex { flex: 0 0 40%; max-width: 50%; overflow: auto; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
         .ws-pane-header {
@@ -869,6 +872,7 @@ export class CaptureWebviewPanel {
         .ws-bottom.collapsed { flex: 0 0 24px !important; min-height: 0 !important; overflow: hidden; }
         .ws-bottom.collapsed #packetDetailContent { display: none; }
         .ws-bottom.collapsed .ws-hex { display: none; }
+        .ws-layout.bottom-collapsed .ws-splitter { display: none; }
         .ws-empty {
             padding: 20px;
             text-align: center;
@@ -891,9 +895,86 @@ export class CaptureWebviewPanel {
         }
         .ctx-menu-item:hover { background: var(--hover-bg); }
         .ctx-menu-sep { height: 1px; background: var(--border-color); margin: 4px 0; }
+        .loading-cell {
+            padding: 16px 8px;
+            color: var(--vscode-descriptionForeground, #888);
+            text-align: center;
+            font-style: italic;
+        }
 
         /* ─── Packet Table ──────────────────────────────────── */
         .packet-table-container { overflow: auto; }
+        .packet-grid {
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 0;
+            min-height: 0;
+            overflow: hidden;
+            position: relative;
+        }
+        .packet-header {
+            display: grid;
+            grid-template-columns: 60px 90px 140px 140px 70px 55px minmax(220px, 1fr);
+            flex: 0 0 auto;
+            background: var(--header-bg);
+            border-bottom: 1px solid var(--border-color);
+            font-family: var(--vscode-editor-font-family, 'Consolas', monospace);
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .packet-header-cell {
+            padding: 4px 8px;
+            white-space: nowrap;
+        }
+        .packet-viewport {
+            flex: 1 1 0;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+            font-family: var(--vscode-editor-font-family, 'Consolas', monospace);
+            font-size: 12px;
+        }
+        .packet-row {
+            display: grid;
+            grid-template-columns: 60px 90px 140px 140px 70px 55px minmax(220px, 1fr);
+            height: 24px;
+            cursor: pointer;
+            border-bottom: 1px solid var(--border-color);
+            align-items: center;
+        }
+        .packet-row:hover { background: var(--hover-bg); }
+        .packet-row.selected { background: var(--selected-bg); color: var(--selected-fg); }
+        .packet-cell {
+            padding: 2px 8px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .packet-cell.col-no { text-align: right; color: var(--vscode-descriptionForeground, #888); }
+        .packet-cell.col-len { text-align: right; }
+        .packet-loading {
+            padding: 16px 8px;
+            color: var(--vscode-descriptionForeground, #888);
+            text-align: center;
+            font-style: italic;
+        }
+        .packet-window-busy {
+            position: absolute;
+            top: 36px;
+            right: 12px;
+            z-index: 3;
+            padding: 4px 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 3px;
+            background: color-mix(in srgb, var(--header-bg) 92%, transparent);
+            color: var(--vscode-descriptionForeground, #bbb);
+            font-size: 11px;
+            pointer-events: none;
+            display: none;
+        }
+        .packet-window-busy.visible {
+            display: block;
+        }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -994,7 +1075,7 @@ export class CaptureWebviewPanel {
     <!-- Toolbar -->
     <div class="toolbar">
         <span class="title">📡 ${escapeHtml(captureName)}</span>
-        <span class="stats">${packetCount} packets · ${duration}s · ${streamCount} streams</span>
+        <span class="stats" id="headerPacketStats">${initialHeaderStats}</span>
         <span class="spacer"></span>
         <button class="btn btn-secondary" id="btnToggleSidebar" title="Toggle sidebar (Ctrl+B)">☰</button>
         <button class="btn btn-ai" id="btnAnalyze">Analyze with Copilot</button>
@@ -1026,23 +1107,25 @@ export class CaptureWebviewPanel {
             <div class="ws-layout">
                 <!-- TOP: Packet list -->
                 <div class="ws-top">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th class="col-no">No.</th>
-                                <th class="col-time">Time</th>
-                                <th class="col-src">Source</th>
-                                <th class="col-dst">Destination</th>
-                                <th class="col-proto">Protocol</th>
-                                <th class="col-len">Length</th>
-                                <th class="col-info">Info</th>
-                            </tr>
-                        </thead>
-                        <tbody id="packetTableBody">
-                            ${packetsHtml}
-                        </tbody>
-                    </table>
+                    <div class="packet-grid">
+                        <div class="packet-header">
+                            <div class="packet-header-cell col-no">No.</div>
+                            <div class="packet-header-cell col-time">Time</div>
+                            <div class="packet-header-cell col-src">Source</div>
+                            <div class="packet-header-cell col-dst">Destination</div>
+                            <div class="packet-header-cell col-proto">Protocol</div>
+                            <div class="packet-header-cell col-len">Length</div>
+                            <div class="packet-header-cell col-info">Info</div>
+                        </div>
+                        <div class="packet-window-busy" id="packetWindowBusy">Loading visible packets...</div>
+                        <div class="packet-viewport" id="packetViewport">
+                            <div class="packet-canvas" id="packetTableBody">
+                                ${packetsHtml}
+                            </div>
+                        </div>
+                    </div>
                 </div>
+                <div class="ws-splitter" id="wsBottomSplitter" role="separator" aria-orientation="horizontal" title="Drag to resize detail pane"></div>
                 <!-- BOTTOM: Detail (left) + Hex (right), always visible -->
                 <div class="ws-bottom" id="wsBottom">
                     <!-- Left: Protocol detail tree -->
@@ -1086,7 +1169,7 @@ export class CaptureWebviewPanel {
                         </tr>
                     </thead>
                     <tbody>
-                        ${convsHtml}
+                        <tr><td colspan="8" class="loading-cell">Open this tab to load conversations</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1094,18 +1177,17 @@ export class CaptureWebviewPanel {
 
         <!-- Protocols Tab -->
         <div class="tab-content" id="tab-protocols">
-            <div class="side-panel">
+            <div class="side-panel" id="protocolsContent">
                 <h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3>
-                ${protocolsHtml || '<p style="color:var(--vscode-descriptionForeground)">No protocol data available</p>'}
-                ${protocolHierarchy ? `<pre style="margin-top: 16px; font-size: 11px; white-space: pre-wrap; color: var(--vscode-descriptionForeground);">${escapeHtml(protocolHierarchy)}</pre>` : ''}
+                <p style="color:var(--vscode-descriptionForeground)" id="protocolsLoading">Open this tab to load protocol hierarchy</p>
             </div>
         </div>
 
         <!-- Expert Info Tab -->
         <div class="tab-content" id="tab-expert">
-            <div class="side-panel">
+            <div class="side-panel" id="expertContent">
                 <h3 style="margin-bottom: 8px;">Expert Information</h3>
-                ${expertHtml || '<p style="color:var(--vscode-descriptionForeground)">No expert information available</p>'}
+                <p style="color:var(--vscode-descriptionForeground)" id="expertLoading">Open this tab to load expert information</p>
             </div>
         </div>
     </div>
@@ -1120,10 +1202,236 @@ export class CaptureWebviewPanel {
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
         const filterInput = document.getElementById('filterInput');
+        const packetTableBody = document.getElementById('packetTableBody');
+        const packetScroller = document.getElementById('packetViewport');
+        const packetWindowBusy = document.getElementById('packetWindowBusy');
+        const wsLayout = document.querySelector('.ws-layout');
+        const wsBottom = document.getElementById('wsBottom');
+        const wsBottomSplitter = document.getElementById('wsBottomSplitter');
+        const MIN_BOTTOM_HEIGHT = 80;
+        const DEFAULT_BOTTOM_HEIGHT = 220;
+        const VIRTUALIZATION_THRESHOLD = ${JSON.stringify(options.virtualizationThreshold)};
+        const VIRTUAL_ROW_HEIGHT = 24;
+        const VIRTUAL_OVERSCAN = 30;
+        const requestedTabs = { conversations: false, protocols: false, expert: false };
+        const pendingTabs = { conversations: false, protocols: false, expert: false };
+        const PAGED_PACKET_WINDOW_SIZE = 1000;
+        const PAGED_PACKET_BUFFER = 250;
+        let isChunkedPacketView = ${JSON.stringify(options.isChunked)};
+        let isPagedPacketView = ${JSON.stringify(!!options.isPagedPacketView)};
+        let totalPacketCount = ${JSON.stringify(options.totalPacketCount ?? null)};
+        let loadedPacketCount = ${JSON.stringify(options.loadedPacketCount)};
+        let packetListLoaded = !isChunkedPacketView;
+        let packetRows = [];
+        let usingVirtualPacketList = false;
+        let virtualRenderQueued = false;
+        let packetWindowStart = 1;
+        let packetWindowEnd = 0;
+        let packetWindowRequestKey = '';
+        let packetWindowLoading = false;
 
         // ══════════════════════════════════════════════════════
         // EVENT DELEGATION — no inline onclick needed (CSP safe)
         // ══════════════════════════════════════════════════════
+
+        function updatePacketStatusText(filterValue) {
+            var status = document.getElementById('statusPacketCount');
+            if (filterValue) {
+                status.textContent = isChunkedPacketView
+                    ? 'Loading filtered packets...'
+                    : 'Showing ' + loadedPacketCount + ' filtered packets';
+                return;
+            }
+            if (isPagedPacketView && totalPacketCount !== null) {
+                status.textContent = 'Showing ' + totalPacketCount + ' packets';
+                return;
+            }
+            if (isChunkedPacketView) {
+                status.textContent = 'Loading packet list...';
+                return;
+            }
+            status.textContent = 'Showing ' + loadedPacketCount + ' packets';
+        }
+
+        function updateHeaderStatsText(filterValue) {
+            var header = document.getElementById('headerPacketStats');
+            if (!header) return;
+
+            if (filterValue) {
+                header.textContent = isChunkedPacketView
+                    ? 'Loading filtered packets...'
+                    : loadedPacketCount + ' filtered packets';
+                return;
+            }
+
+            if (isChunkedPacketView) {
+                header.textContent = 'Loading packet list...';
+                return;
+            }
+
+            if (isPagedPacketView && totalPacketCount !== null) {
+                header.textContent = totalPacketCount + ' packets';
+                return;
+            }
+
+            header.textContent = loadedPacketCount + ' packets';
+        }
+
+        function renderPacketRow(p) {
+            var protoClass = getProtocolClass(p.protocol);
+            var selectedClass = selectedPacket === p.number ? ' selected' : '';
+            return '<div class="packet-row ' + protoClass + selectedClass + '" data-packet="' + p.number + '" data-src="' + escapeHtml(p.source) + '" data-dst="' + escapeHtml(p.destination) + '" data-proto="' + escapeHtml(p.protocol) + '" data-stream="' + (p.stream || '') + '">' 
+                + '<div class="packet-cell col-no">' + p.number + '</div>'
+                + '<div class="packet-cell col-time">' + p.time + '</div>'
+                + '<div class="packet-cell col-src">' + p.source + '</div>'
+                + '<div class="packet-cell col-dst">' + p.destination + '</div>'
+                + '<div class="packet-cell col-proto">' + p.protocol + '</div>'
+                + '<div class="packet-cell col-len">' + p.length + '</div>'
+                + '<div class="packet-cell col-info">' + escapeHtml(p.info) + '</div>'
+                + '</div>';
+        }
+
+        function setPacketWindowBusy(isBusy) {
+            if (!packetWindowBusy) return;
+            packetWindowBusy.classList.toggle('visible', !!isBusy);
+            if (isPagedPacketView) {
+                document.getElementById('filterStatus').textContent = isBusy ? 'Loading visible packets...' : 'Packet list loaded';
+                document.getElementById('filterStatus').className = 'filter-hint';
+            }
+        }
+
+        function sizeViewport() {
+            if (!packetScroller || !packetScroller.parentElement) return;
+            var gridRect = packetScroller.parentElement.getBoundingClientRect();
+            var headerEl = packetScroller.parentElement.querySelector('.packet-header');
+            var headerH = headerEl ? headerEl.getBoundingClientRect().height : 0;
+            var h = Math.floor(gridRect.height - headerH);
+            if (h > 0) packetScroller.style.height = h + 'px';
+        }
+
+        function renderPacketRows() {
+            if (!usingVirtualPacketList) {
+                packetTableBody.innerHTML = packetRows.length > 0
+                    ? packetRows.map(renderPacketRow).join('')
+                    : '<div class="packet-loading">No packets available</div>';
+                return;
+            }
+
+            sizeViewport();
+            var totalRows = isPagedPacketView && totalPacketCount !== null ? totalPacketCount : packetRows.length;
+            var startIndex = isPagedPacketView ? Math.max(0, packetWindowStart - 1) : 0;
+            var endIndex = isPagedPacketView ? Math.min(totalRows, packetWindowEnd) : packetRows.length;
+            var topSpacerHeight = startIndex * VIRTUAL_ROW_HEIGHT;
+            var bottomSpacerHeight = Math.max(0, (totalRows - endIndex) * VIRTUAL_ROW_HEIGHT);
+            var rowsHtml = '<div style="height:' + topSpacerHeight + 'px"></div>';
+            for (var i = 0; i < packetRows.length; i++) {
+                rowsHtml += renderPacketRow(packetRows[i]);
+            }
+            rowsHtml += '<div style="height:' + bottomSpacerHeight + 'px"></div>';
+            packetTableBody.innerHTML = rowsHtml;
+        }
+
+        function requestPacketWindowForScroll(force) {
+            if (!isPagedPacketView || !packetScroller || totalPacketCount === null || totalPacketCount <= 0) {
+                return;
+            }
+
+            sizeViewport();
+            var viewportHeight = packetScroller.clientHeight || 600;
+            var scrollTop = packetScroller.scrollTop || 0;
+            var visibleStart = Math.max(1, Math.floor(scrollTop / VIRTUAL_ROW_HEIGHT) + 1);
+            var visibleEnd = Math.min(totalPacketCount, Math.ceil((scrollTop + viewportHeight) / VIRTUAL_ROW_HEIGHT));
+            var nearTopEdge = visibleStart < (packetWindowStart + PAGED_PACKET_BUFFER);
+            var nearBottomEdge = visibleEnd > (packetWindowEnd - PAGED_PACKET_BUFFER);
+            var needWindow = force || packetWindowEnd < packetWindowStart || nearTopEdge || nearBottomEdge;
+
+            if (!needWindow) {
+                return;
+            }
+
+            var desiredStart = Math.max(1, visibleStart - Math.floor(PAGED_PACKET_WINDOW_SIZE / 2));
+            var desiredEnd = Math.min(totalPacketCount, desiredStart + PAGED_PACKET_WINDOW_SIZE - 1);
+            desiredStart = Math.max(1, desiredEnd - PAGED_PACKET_WINDOW_SIZE + 1);
+
+            var requestKey = desiredStart + ':' + desiredEnd;
+            if ((packetWindowLoading && !force) || requestKey === packetWindowRequestKey) {
+                return;
+            }
+
+            packetWindowLoading = true;
+            packetWindowRequestKey = requestKey;
+            setPacketWindowBusy(true);
+            vscode.postMessage({ command: 'requestPacketWindow', startFrame: desiredStart, endFrame: desiredEnd });
+        }
+
+        function queueVirtualRender() {
+            if (!usingVirtualPacketList || virtualRenderQueued) {
+                return;
+            }
+            virtualRenderQueued = true;
+            requestAnimationFrame(function() {
+                virtualRenderQueued = false;
+                renderPacketRows();
+            });
+        }
+
+        function setPacketRows(nextPackets) {
+            packetRows = Array.isArray(nextPackets) ? nextPackets : [];
+            usingVirtualPacketList = isPagedPacketView;
+            if (packetScroller) {
+                packetScroller.scrollTop = 0;
+            }
+            sizeViewport();
+            renderPacketRows();
+        }
+
+        function setBottomHeight(heightPx) {
+            if (!wsLayout) return;
+            var layoutHeight = wsLayout.getBoundingClientRect().height || 0;
+            var maxHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.floor(layoutHeight * 0.75));
+            var nextHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.min(heightPx, maxHeight));
+            wsLayout.style.setProperty('--ws-bottom-height', nextHeight + 'px');
+            wsBottom.dataset.lastHeight = String(nextHeight);
+        }
+
+        function restoreBottomHeight() {
+            var lastHeight = parseInt(wsBottom.dataset.lastHeight || '', 10);
+            setBottomHeight(Number.isNaN(lastHeight) ? DEFAULT_BOTTOM_HEIGHT : lastHeight);
+        }
+
+        (function initializeBottomResizer() {
+            if (!wsBottomSplitter || !wsLayout) return;
+
+            var dragging = false;
+
+            function stopDragging() {
+                if (!dragging) return;
+                dragging = false;
+                wsBottomSplitter.classList.remove('dragging');
+                document.body.style.cursor = '';
+                document.body.style.userSelect = '';
+            }
+
+            wsBottomSplitter.addEventListener('mousedown', function(e) {
+                if (wsBottom.classList.contains('collapsed')) return;
+                dragging = true;
+                wsBottomSplitter.classList.add('dragging');
+                document.body.style.cursor = 'row-resize';
+                document.body.style.userSelect = 'none';
+                e.preventDefault();
+            });
+
+            window.addEventListener('mousemove', function(e) {
+                if (!dragging || !wsLayout) return;
+                var layoutRect = wsLayout.getBoundingClientRect();
+                setBottomHeight(layoutRect.bottom - e.clientY);
+            });
+
+            window.addEventListener('mouseup', stopDragging);
+            window.addEventListener('mouseleave', stopDragging);
+
+            restoreBottomHeight();
+        })();
 
         // Toolbar buttons
         document.getElementById('btnAnalyze').addEventListener('click', function() {
@@ -1157,11 +1465,43 @@ export class CaptureWebviewPanel {
             document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
             tab.classList.add('active');
             document.getElementById('tab-' + tabName).classList.add('active');
+
+            if (tabName === 'packets') {
+                sizeViewport();
+                renderPacketRows();
+                if (isPagedPacketView) {
+                    setPacketWindowBusy(packetWindowLoading);
+                    requestPacketWindowForScroll(false);
+                }
+            }
+
+            if (tabName !== 'packets' && !requestedTabs[tabName]) {
+                if (!packetListLoaded) {
+                    pendingTabs[tabName] = true;
+                    if (tabName === 'conversations') {
+                        document.querySelector('#tab-conversations tbody').innerHTML = '<tr><td colspan="8" class="loading-cell">Packet list is still loading. Conversations will load next.</td></tr>';
+                    } else if (tabName === 'protocols') {
+                        document.getElementById('protocolsContent').innerHTML = '<h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3><p style="color:var(--vscode-descriptionForeground)">Packet list is still loading. Protocol hierarchy will load next.</p>';
+                    } else if (tabName === 'expert') {
+                        document.getElementById('expertContent').innerHTML = '<h3 style="margin-bottom: 8px;">Expert Information</h3><p style="color:var(--vscode-descriptionForeground)">Packet list is still loading. Expert info will load next.</p>';
+                    }
+                    return;
+                }
+                requestedTabs[tabName] = true;
+                if (tabName === 'conversations') {
+                    document.querySelector('#tab-conversations tbody').innerHTML = '<tr><td colspan="8" class="loading-cell">Loading conversations...</td></tr>';
+                } else if (tabName === 'protocols') {
+                    document.getElementById('protocolsContent').innerHTML = '<h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3><p style="color:var(--vscode-descriptionForeground)">Loading protocol hierarchy...</p>';
+                } else if (tabName === 'expert') {
+                    document.getElementById('expertContent').innerHTML = '<h3 style="margin-bottom: 8px;">Expert Information</h3><p style="color:var(--vscode-descriptionForeground)">Loading expert information...</p>';
+                }
+                vscode.postMessage({ command: 'loadTabData', tab: tabName });
+            }
         });
 
         // Packet table — click on any row to select it
         document.getElementById('packetTableBody').addEventListener('click', function(e) {
-            var row = e.target.closest('tr[data-packet]');
+            var row = e.target.closest('[data-packet]');
             if (!row) return;
             var num = parseInt(row.getAttribute('data-packet'));
             if (isNaN(num)) return;
@@ -1171,12 +1511,34 @@ export class CaptureWebviewPanel {
         // Packet table — right-click context menu
         document.getElementById('packetTableBody').addEventListener('contextmenu', function(e) {
             e.preventDefault();
-            var row = e.target.closest('tr[data-packet]');
+            var row = e.target.closest('[data-packet]');
             if (!row) return;
             // Select the row first
             var num = parseInt(row.getAttribute('data-packet'));
             if (!isNaN(num)) selectPacket(num);
             showContextMenu(e.clientX, e.clientY, row);
+        });
+
+        if (packetScroller) {
+            packetScroller.addEventListener('scroll', function() {
+                if (isPagedPacketView) {
+                    requestPacketWindowForScroll(false);
+                }
+                queueVirtualRender();
+            });
+        }
+
+        // Resize: recompute viewport height and re-render virtual rows
+        var resizeTimer = null;
+        window.addEventListener('resize', function() {
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(function() {
+                resizeTimer = null;
+                if (usingVirtualPacketList) {
+                    sizeViewport();
+                    renderPacketRows();
+                }
+            }, 100);
         });
 
         // Close context menu on click elsewhere
@@ -1200,14 +1562,17 @@ export class CaptureWebviewPanel {
 
         // Detail pane toggle — collapses entire bottom section to give packet list more space
         document.getElementById('btnToggleDetail').addEventListener('click', function() {
-            var wsBottom = document.getElementById('wsBottom');
             var btn = document.getElementById('btnToggleDetail');
             if (wsBottom.classList.contains('collapsed')) {
                 wsBottom.classList.remove('collapsed');
+                wsLayout.classList.remove('bottom-collapsed');
+                restoreBottomHeight();
                 btn.textContent = '\u25bc';
                 btn.title = 'Minimize';
             } else {
+                wsBottom.dataset.lastHeight = String(wsBottom.getBoundingClientRect().height || DEFAULT_BOTTOM_HEIGHT);
                 wsBottom.classList.add('collapsed');
+                wsLayout.classList.add('bottom-collapsed');
                 btn.textContent = '\u25b2';
                 btn.title = 'Maximize';
             }
@@ -1338,21 +1703,57 @@ export class CaptureWebviewPanel {
             vscode.postMessage({ command: 'clearFilter' });
         }
 
+        function loadPendingTabs() {
+            ['conversations', 'protocols', 'expert'].forEach(function(tabName) {
+                if (!pendingTabs[tabName] || requestedTabs[tabName]) {
+                    return;
+                }
+                pendingTabs[tabName] = false;
+                requestedTabs[tabName] = true;
+                if (tabName === 'conversations') {
+                    document.querySelector('#tab-conversations tbody').innerHTML = '<tr><td colspan="8" class="loading-cell">Loading conversations...</td></tr>';
+                } else if (tabName === 'protocols') {
+                    document.getElementById('protocolsContent').innerHTML = '<h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3><p style="color:var(--vscode-descriptionForeground)">Loading protocol hierarchy...</p>';
+                } else if (tabName === 'expert') {
+                    document.getElementById('expertContent').innerHTML = '<h3 style="margin-bottom: 8px;">Expert Information</h3><p style="color:var(--vscode-descriptionForeground)">Loading expert information...</p>';
+                }
+                vscode.postMessage({ command: 'loadTabData', tab: tabName });
+            });
+        }
+
         var selectedPacket = null;
 
         function selectPacket(num) {
-            document.querySelectorAll('#packetTableBody tr.selected').forEach(function(r) { r.classList.remove('selected'); });
-            var row = document.querySelector('#packetTableBody tr[data-packet="' + num + '"]');
-            if (row) {
-                row.classList.add('selected');
-                selectedPacket = num;
-                document.getElementById('statusSelected').textContent = 'Packet #' + num + ' selected';
-                document.getElementById('detailTitle').textContent = 'Packet #' + num + ' Detail';
-                document.getElementById('packetDetailContent').innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail...</div>';
-                document.getElementById('packetHexContent').textContent = 'Loading hex dump...';
-                vscode.postMessage({ command: 'getPacketDetail', frameNumber: num });
-                vscode.postMessage({ command: 'getPacketHex', frameNumber: num });
+            if (isChunkedPacketView && !packetListLoaded) {
+                document.getElementById('statusSelected').textContent = 'Packet list is still loading';
+                return;
             }
+            selectedPacket = num;
+            if (usingVirtualPacketList) {
+                var packetIndex = isPagedPacketView
+                    ? (num - 1)
+                    : packetRows.findIndex(function(packet) { return packet.number === num; });
+                if (packetIndex >= 0 && packetScroller) {
+                    var targetTop = Math.max(0, (packetIndex * VIRTUAL_ROW_HEIGHT) - Math.floor((packetScroller.clientHeight || 400) / 2));
+                    packetScroller.scrollTop = targetTop;
+                    if (isPagedPacketView) {
+                        requestPacketWindowForScroll(true);
+                    }
+                    renderPacketRows();
+                }
+            } else {
+                document.querySelectorAll('#packetTableBody .selected').forEach(function(r) { r.classList.remove('selected'); });
+                var row = document.querySelector('#packetTableBody [data-packet="' + num + '"]');
+                if (row) {
+                    row.classList.add('selected');
+                }
+            }
+            document.getElementById('statusSelected').textContent = 'Packet #' + num + ' selected';
+            document.getElementById('detailTitle').textContent = 'Packet #' + num + ' Detail';
+            document.getElementById('packetDetailContent').innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail...</div>';
+            document.getElementById('packetHexContent').textContent = 'Loading hex dump...';
+            vscode.postMessage({ command: 'getPacketDetail', frameNumber: num });
+            vscode.postMessage({ command: 'getPacketHex', frameNumber: num });
         }
 
         function getProtocolClass(proto) {
@@ -1413,27 +1814,69 @@ export class CaptureWebviewPanel {
         window.addEventListener('message', function(event) {
             var msg = event.data;
             switch (msg.command) {
-                case 'updatePackets': {
-                    var tbody = document.getElementById('packetTableBody');
-                    tbody.innerHTML = msg.packets.map(function(p) {
-                        var protoClass = getProtocolClass(p.protocol);
-                        return '<tr class="' + protoClass + '" data-packet="' + p.number + '" data-src="' + escapeHtml(p.source) + '" data-dst="' + escapeHtml(p.destination) + '" data-proto="' + escapeHtml(p.protocol) + '" data-stream="' + (p.stream || '') + '">'
-                            + '<td class="col-no">' + p.number + '</td>'
-                            + '<td class="col-time">' + p.time + '</td>'
-                            + '<td class="col-src">' + p.source + '</td>'
-                            + '<td class="col-dst">' + p.destination + '</td>'
-                            + '<td class="col-proto">' + p.protocol + '</td>'
-                            + '<td class="col-len">' + p.length + '</td>'
-                            + '<td class="col-info">' + escapeHtml(p.info) + '</td>'
-                            + '</tr>';
-                    }).join('');
-                    document.getElementById('statusPacketCount').textContent = 'Showing ' + msg.packets.length + ' packets';
+                case 'replacePackets': {
+                    var wasLoading = isChunkedPacketView;
+                    setPacketWindowBusy(false);
+                    isPagedPacketView = false;
+                    setPacketRows(msg.packets);
+                    isChunkedPacketView = !!msg.isChunked;
+                    loadedPacketCount = msg.packets.length;
+                    totalPacketCount = typeof msg.totalCount === 'number' ? msg.totalCount : null;
+                    packetListLoaded = !isChunkedPacketView;
+                    updatePacketStatusText(msg.filter);
+                    updateHeaderStatsText(msg.filter);
                     document.getElementById('statusFilter').textContent = msg.filter ? 'Filter: ' + msg.filter : 'No filter applied';
-                    document.getElementById('filterStatus').textContent = msg.packets.length + ' packets match';
+                    document.getElementById('filterStatus').textContent = msg.filter
+                        ? msg.packets.length + ' packets match'
+                        : 'Packet list loaded';
                     document.getElementById('filterStatus').className = 'filter-hint';
+                    if (wasLoading && !isChunkedPacketView) {
+                        loadPendingTabs();
+                    }
+                    break;
+                }
+                case 'packetWindow': {
+                    packetWindowLoading = false;
+                    setPacketWindowBusy(false);
+                    packetWindowStart = Math.max(1, msg.startFrame || 1);
+                    packetWindowEnd = Math.max(packetWindowStart, msg.endFrame || packetWindowStart);
+                    packetRows = Array.isArray(msg.packets) ? msg.packets : [];
+                    usingVirtualPacketList = true;
+                    isChunkedPacketView = false;
+                    packetListLoaded = true;
+                    loadedPacketCount = packetRows.length;
+                    totalPacketCount = typeof msg.totalCount === 'number' ? msg.totalCount : totalPacketCount;
+                    updatePacketStatusText(msg.filter);
+                    updateHeaderStatsText(msg.filter);
+                    document.getElementById('statusFilter').textContent = msg.filter ? 'Filter: ' + msg.filter : 'No filter applied';
+                    document.getElementById('filterStatus').textContent = 'Packet list loaded';
+                    document.getElementById('filterStatus').className = 'filter-hint';
+                    renderPacketRows();
+                    loadPendingTabs();
+                    break;
+                }
+                case 'packetChunkError': {
+                    packetListLoaded = true;
+                    isChunkedPacketView = false;
+                    packetWindowLoading = false;
+                    setPacketWindowBusy(false);
+                    document.getElementById('statusSelected').textContent = msg.message;
+                    break;
+                }
+                case 'updateConversations': {
+                    document.querySelector('#tab-conversations tbody').innerHTML = msg.html;
+                    break;
+                }
+                case 'updateProtocols': {
+                    document.getElementById('protocolsContent').innerHTML = '<h3 style="margin-bottom: 8px;">Protocol Hierarchy</h3>' + msg.html;
+                    break;
+                }
+                case 'updateExpertInfo': {
+                    document.getElementById('expertContent').innerHTML = '<h3 style="margin-bottom: 8px;">Expert Information</h3>' + msg.html;
                     break;
                 }
                 case 'filterError': {
+                    packetListLoaded = true;
                     document.getElementById('filterStatus').textContent = msg.message;
                     document.getElementById('filterStatus').className = 'filter-error-msg';
                     document.getElementById('filterInput').classList.add('filter-error');
@@ -1452,17 +1895,30 @@ export class CaptureWebviewPanel {
                     break;
                 }
                 case 'error': {
+                    packetWindowLoading = false;
+                    setPacketWindowBusy(false);
                     document.getElementById('statusSelected').textContent = msg.message;
                     break;
                 }
                 case 'applyFilterExt': {
-                    // Applied from chat or external command
+                    // Applied from chat or external command. Backend owns the re-query.
                     filterInput.value = msg.filter || '';
-                    if (msg.filter) { applyFilter(); } else { clearFilter(); }
+                    document.getElementById('filterStatus').textContent = '';
+                    document.getElementById('filterInput').classList.remove('filter-error');
                     break;
                 }
             }
         });
+
+        updatePacketStatusText(${JSON.stringify(options.filter)});
+        updateHeaderStatsText(${JSON.stringify(options.filter)});
+        if (isChunkedPacketView) {
+            document.getElementById('filterStatus').textContent = 'Loading packet list...';
+            document.getElementById('filterStatus').className = 'filter-hint';
+        }
+        if (isPagedPacketView) {
+            requestPacketWindowForScroll(true);
+        }
     </script>
 </body>
 </html>`;
@@ -1478,22 +1934,7 @@ export class CaptureWebviewPanel {
 
 // ─── Helper types and functions ───────────────────────────────────────────
 
-interface PacketRow {
-    number: number;
-    time: string;
-    source: string;
-    destination: string;
-    protocol: string;
-    length: number;
-    info: string;
-    stream: string;
-}
-
-interface ProtoTreeNode {
-    name: string;
-    showname: string;
-    children: ProtoTreeNode[];
-}
+type PacketRow = ParsedPacketRow;
 
 function getNonce(): string {
     let text = '';

@@ -4,6 +4,21 @@ import { CaptureFile, TcpStream, AgentDefinition, ScenarioDetails, AssembledCont
 import { TsharkRunner } from './parsing/tsharkRunner';
 import { ConfigLoader } from './configLoader';
 
+type SampledCaptureBuildState = {
+    packetData: string;
+    captureBudgetUsed: number;
+    coveredRanges: Array<[number, number]>;
+};
+
+type SampledCaptureContext = {
+    capture: CaptureFile;
+    totalPackets: number;
+    budgetPerCapture: number;
+    streams: TcpStream[];
+    scenarioFilter?: string;
+    agentDisplayFilter?: string;
+};
+
 /**
  * Assembles the context (prompt) to send to the LLM.
  * Manages the token budget, prioritizes anomalous streams,
@@ -222,25 +237,71 @@ ${followed}
 
     // ─── Public accessors for lightweight follow-up context ───────────────
 
-    /** Build the system prompt (public for follow-up turns). */
-    buildSystemPromptPublic(agent: AgentDefinition): string {
-        return this.buildSystemPrompt(agent);
+    async assembleFollowUpContext(
+        captures: CaptureFile[],
+        streams: TcpStream[],
+        agent: AgentDefinition
+    ): Promise<AssembledContext> {
+        const systemPrompt = this.buildSystemPrompt(agent);
+        const captureSummary = await this.buildCaptureSummary(captures);
+        const scenarioContext = this.buildScenarioContext();
+        const knowledgeResult = await this.buildKnowledgeContext(captures, streams, agent);
+        const knowledgeContext = knowledgeResult.content;
+
+        const estimatedTokens =
+            this.estimateTokens(systemPrompt) +
+            this.estimateTokens(captureSummary) +
+            this.estimateTokens(scenarioContext) +
+            this.estimateTokens(knowledgeContext);
+
+        const totalPackets = captures.reduce((sum, capture) => sum + (capture.summary?.packetCount || 0), 0);
+
+        return {
+            systemPrompt,
+            captureSummary,
+            streamDetails: '',
+            scenarioContext,
+            packetData: '',
+            knowledgeContext,
+            knowledgeManifest: knowledgeResult.manifest,
+            estimatedTokens,
+            coverage: {
+                mode: 'complete',
+                totalPackets,
+                packetsIncluded: totalPackets,
+            },
+        };
     }
 
-    /** Build the capture summary with expert info (public for follow-up turns). */
-    async buildCaptureSummaryPublic(captures: CaptureFile[]): Promise<string> {
-        return this.buildCaptureSummary(captures);
-    }
+    assembleToolOnlyContext(
+        agent: AgentDefinition,
+        captureSummary: string,
+        options?: {
+            scenarioContext?: string;
+            knowledgeContext?: string;
+            knowledgeManifest?: AssembledContext['knowledgeManifest'];
+        }
+    ): AssembledContext {
+        const systemPrompt = this.buildSystemPrompt(agent);
+        const scenarioContext = options?.scenarioContext ?? this.buildScenarioContext();
+        const knowledgeContext = options?.knowledgeContext ?? '';
+        const estimatedTokens =
+            this.estimateTokens(systemPrompt) +
+            this.estimateTokens(captureSummary) +
+            this.estimateTokens(scenarioContext) +
+            this.estimateTokens(knowledgeContext);
 
-    /** Build the scenario context (public for follow-up turns). */
-    buildScenarioContextPublic(): string {
-        return this.buildScenarioContext();
-    }
-
-    /** Build the knowledge context (public for follow-up turns). */
-    async buildKnowledgeContextPublic(captures: CaptureFile[], streams: TcpStream[], agent: AgentDefinition): Promise<string> {
-        const result = await this.buildKnowledgeContext(captures, streams, agent);
-        return result.content;
+        return {
+            systemPrompt,
+            captureSummary,
+            streamDetails: '',
+            scenarioContext,
+            packetData: '',
+            knowledgeContext,
+            knowledgeManifest: options?.knowledgeManifest,
+            estimatedTokens,
+            coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 },
+        };
     }
 
     // ─── Prompt Builders ──────────────────────────────────────────────────
@@ -284,14 +345,6 @@ ${followed}
                 uncoveredRanges: sampledResult.uncoveredRanges,
             },
         };
-    }
-
-    /**
-     * Build packet data section — smart-sized based on capture size.
-     */
-    private async buildPacketData(captures: CaptureFile[], tokenBudget: number, streams: TcpStream[] = []): Promise<string> {
-        const result = await this.buildPacketDataWithCoverage(captures, tokenBudget, streams);
-        return result.data;
     }
 
     /**
@@ -384,168 +437,38 @@ ${followed}
         for (const capture of captures) {
             const roleLabel = capture.role ? ` [${capture.role.toUpperCase()} SIDE]` : '';
             packetData += `### ${capture.name}${roleLabel}\n`;
-            let captureBudgetUsed = 0;
-            const coveredRanges: Array<[number, number]> = []; // Track which frame ranges we've included
+            const state: SampledCaptureBuildState = {
+                packetData: '',
+                captureBudgetUsed: 0,
+                coveredRanges: [],
+            };
+            const captureContext: SampledCaptureContext = {
+                capture,
+                totalPackets: capture.summary?.packetCount || 0,
+                budgetPerCapture,
+                streams,
+                scenarioFilter,
+                agentDisplayFilter,
+            };
 
             try {
-                const totalPackets = capture.summary?.packetCount || 0;
+                await this.appendInitialPacketSections(captureContext, state);
+                await this.appendScenarioFilteredSection(captureContext, state);
+                await this.appendAnomalousStreamSections(captureContext, state);
+                await this.appendMiddleFillSections(captureContext, state);
 
-                // --- Section A: First 200 packets (connection establishment, early traffic) ---
-                const firstN = Math.min(200, totalPackets);
-                const firstPackets = await this.tsharkRunner.getPacketRange(capture.filePath, 1, firstN, agentDisplayFilter);
-                if (firstPackets && firstPackets.trim()) {
-                    packetData += `\n#### First ${firstN} packets (of ${totalPackets} total)\n`;
-                    packetData += '```\n' + firstPackets + '\n```\n\n';
-                    captureBudgetUsed += this.estimateTokens(firstPackets);
-                    coveredRanges.push([1, firstN]);
-                }
-
-                // --- Section B: Last 100 packets (how it ends) ---
-                if (totalPackets > firstN + 100) {
-                    const lastStart = Math.max(totalPackets - 99, firstN + 1);
-                    const lastPackets = await this.tsharkRunner.getPacketRange(capture.filePath, lastStart, totalPackets, agentDisplayFilter);
-                    if (lastPackets && lastPackets.trim()) {
-                        packetData += `#### Last 100 packets\n`;
-                        packetData += '```\n' + lastPackets + '\n```\n\n';
-                        captureBudgetUsed += this.estimateTokens(lastPackets);
-                        coveredRanges.push([lastStart, totalPackets]);
-                    }
-                }
-
-                // --- Section C: Scenario-context-filtered sample ---
-                if (scenarioFilter && captureBudgetUsed < budgetPerCapture * 0.6) {
-                    try {
-                        const maxScenarioPackets = Math.min(500, Math.floor((budgetPerCapture * 0.2) / 30));
-                        const filteredSample = await this.tsharkRunner.applyFilter(
-                            capture.filePath, scenarioFilter, maxScenarioPackets
-                        );
-                        if (filteredSample && filteredSample.trim()) {
-                            const lineCount = filteredSample.trim().split('\n').filter(l => l.trim()).length;
-                            packetData += `#### Scenario-relevant packets (filter: \`${scenarioFilter}\`) — ${lineCount} shown\n`;
-                            packetData += '```\n' + filteredSample + '\n```\n\n';
-                            captureBudgetUsed += this.estimateTokens(filteredSample);
-                            // Scenario-filtered packets are scattered — don't add to covered ranges
-                        }
-                    } catch (e) {
-                        this.outputChannel.appendLine(`[ContextAssembler] Scenario filter error: ${e}`);
-                    }
-                }
-
-                // --- Section D: All anomalous streams — include as many as budget allows ---
-                const captureStreams = streams
-                    .filter(s => s.captureFile === capture.filePath && s.anomalyScore > 0)
-                    .sort((a, b) => b.anomalyScore - a.anomalyScore);
-
-                if (captureStreams.length > 0 && captureBudgetUsed < budgetPerCapture * 0.8) {
-                    packetData += `#### Packets from ${captureStreams.length} anomalous stream(s) (sorted by severity)\n\n`;
-
-                    for (const stream of captureStreams) {
-                        if (captureBudgetUsed >= budgetPerCapture * 0.9) { break; }
-
-                        try {
-                            const streamSample = await this.tsharkRunner.applyFilter(
-                                capture.filePath,
-                                `tcp.stream eq ${stream.index}`,
-                                100
-                            );
-                            if (streamSample && streamSample.trim()) {
-                                const sampleTokens = this.estimateTokens(streamSample);
-                                if (captureBudgetUsed + sampleTokens > budgetPerCapture * 0.95) { break; }
-
-                                const anomalyList = stream.anomalies.map(a => a.type).join(', ');
-                                packetData += `**Stream ${stream.index}** (score: ${stream.anomalyScore}, anomalies: ${anomalyList}) — ` +
-                                    `${stream.source} ↔ ${stream.destination} | ${stream.packetCount} pkts\n`;
-                                packetData += '```\n' + streamSample + '\n```\n\n';
-                                captureBudgetUsed += sampleTokens;
-                            }
-                        } catch (e) {
-                            this.outputChannel.appendLine(`[ContextAssembler] Error sampling stream ${stream.index}: ${e}`);
-                        }
-                    }
-                }
-
-                // --- Section E: Fill remaining budget with evenly-spaced middle samples ---
-                // After A/B/C/D, there is often significant token budget left unused (especially on
-                // small-context models where sections C/D may not fire). Rather than leaving the
-                // budget empty, sample the middle of the capture in evenly-spaced windows so the
-                // LLM has representative mid-session traffic for its initial analysis. Uncovered
-                // gaps are still listed below so the LLM can use tools to drill in further.
-                const TOKENS_PER_PACKET_EST = 30; // ~110 chars/packet ÷ 4 chars/token, conservatively rounded
-                const MAX_FILL_BATCHES = 6;        // Hard cap — each batch = 1 extra tshark call on the file
-                const FILL_BATCH_SIZE = 500;       // Packets per middle-fill batch
-                const lastStartForMiddle = Math.max(totalPackets - 99, firstN + 1);
-                const middleRegionStart = firstN + 1;
-                const middleRegionEnd = lastStartForMiddle - 1;
-                const remainingBudgetForFill = budgetPerCapture - captureBudgetUsed;
-
-                if (remainingBudgetForFill > 10000 && middleRegionEnd > middleRegionStart + FILL_BATCH_SIZE) {
-                    const packetsCanFit = Math.floor((remainingBudgetForFill * 0.85) / TOKENS_PER_PACKET_EST);
-                    const numFillBatches = Math.min(
-                        Math.max(1, Math.floor(packetsCanFit / FILL_BATCH_SIZE)),
-                        MAX_FILL_BATCHES
-                    );
-                    const middleSize = middleRegionEnd - middleRegionStart;
-                    const fillStep = Math.floor(middleSize / (numFillBatches + 1));
-
-                    this.outputChannel.appendLine(
-                        `[ContextAssembler] Section E: ${remainingBudgetForFill} tokens remaining, ` +
-                        `can fit ~${packetsCanFit} packets → ${numFillBatches} evenly-spaced batch(es) of ${FILL_BATCH_SIZE} through frames ${middleRegionStart}–${middleRegionEnd}`
-                    );
-
-                    packetData += `\n#### Representative mid-capture samples (${numFillBatches} batch${numFillBatches > 1 ? 'es' : ''} of up to ${FILL_BATCH_SIZE} packets, evenly spaced)\n\n`;
-
-                    for (let i = 1; i <= numFillBatches && captureBudgetUsed < budgetPerCapture * 0.92; i++) {
-                        const batchStart = middleRegionStart + (i * fillStep);
-                        const batchEnd = Math.min(batchStart + FILL_BATCH_SIZE - 1, middleRegionEnd);
-                        if (batchStart > middleRegionEnd) { break; }
-
-                        try {
-                            const batchPackets = await this.tsharkRunner.getPacketRange(
-                                capture.filePath, batchStart, batchEnd, agentDisplayFilter
-                            );
-                            if (batchPackets && batchPackets.trim()) {
-                                const batchTokens = this.estimateTokens(batchPackets);
-                                if (captureBudgetUsed + batchTokens > budgetPerCapture * 0.95) { break; }
-
-                                const pct = Math.round((batchStart / totalPackets) * 100);
-                                packetData += `##### Frames ${batchStart.toLocaleString()}\u2013${batchEnd.toLocaleString()} (~${pct}% through capture)\n`;
-                                packetData += '```\n' + batchPackets + '\n```\n\n';
-                                captureBudgetUsed += batchTokens;
-                                coveredRanges.push([batchStart, batchEnd]);
-                            }
-                        } catch (e) {
-                            this.outputChannel.appendLine(`[ContextAssembler] Section E batch ${i} error: ${e}`);
-                        }
-                    }
-                } else {
-                    this.outputChannel.appendLine(
-                        `[ContextAssembler] Section E skipped: remainingBudget=${remainingBudgetForFill}, middleSize=${middleRegionEnd - middleRegionStart}`
-                    );
-                }
-
-                // --- Gap map: tell the model exactly which frame ranges it hasn't seen ---
-                const uncoveredRanges = this.computeUncoveredRanges(coveredRanges, totalPackets);
-                if (uncoveredRanges.length > 0) {
-                    packetData += `\n#### ⚠️ Uncovered frame ranges — use nettrace-getPacketRange to review these\n`;
-                    packetData += 'These sections have NOT been examined yet. Page through them with getPacketRange (max 500 per call):\n\n';
-                    for (const [start, end] of uncoveredRanges) {
-                        const count = end - start + 1;
-                        packetData += `- Frames **${start}–${end}** (${count.toLocaleString()} packets)\n`;
-                    }
-                    packetData += '\n';
-                }
+                const uncoveredRanges = this.computeUncoveredRanges(state.coveredRanges, captureContext.totalPackets);
+                state.packetData += this.buildUncoveredRangesSection(uncoveredRanges);
 
                 this.outputChannel.appendLine(
                     `[ContextAssembler] Sampled packets from ${capture.name}: ` +
-                    `~${captureBudgetUsed} tokens used of ${budgetPerCapture} budget ` +
-                    `(${totalPackets} total packets, ${uncoveredRanges.length} uncovered ranges)`
+                    `~${state.captureBudgetUsed} tokens used of ${budgetPerCapture} budget ` +
+                    `(${captureContext.totalPackets} total packets, ${uncoveredRanges.length} uncovered ranges)`
                 );
 
+                packetData += state.packetData;
                 allUncoveredRanges.push(...uncoveredRanges);
-                // Estimate included packets from covered ranges
-                for (const [s, e] of coveredRanges) {
-                    totalIncluded += (e - s + 1);
-                }
+                totalIncluded += this.countCoveredPackets(state.coveredRanges);
 
             } catch (e) {
                 packetData += `*Error reading packets: ${e}*\n\n`;
@@ -554,6 +477,184 @@ ${followed}
         }
 
         return { data: packetData, packetsIncluded: totalIncluded, uncoveredRanges: allUncoveredRanges };
+    }
+
+    private async appendInitialPacketSections(context: SampledCaptureContext, state: SampledCaptureBuildState): Promise<void> {
+        const firstN = Math.min(200, context.totalPackets);
+        const firstPackets = await this.tsharkRunner.getPacketRange(
+            context.capture.filePath,
+            1,
+            firstN,
+            context.agentDisplayFilter
+        );
+        if (firstPackets && firstPackets.trim()) {
+            state.packetData += `\n#### First ${firstN} packets (of ${context.totalPackets} total)\n`;
+            state.packetData += '```\n' + firstPackets + '\n```\n\n';
+            state.captureBudgetUsed += this.estimateTokens(firstPackets);
+            state.coveredRanges.push([1, firstN]);
+        }
+
+        if (context.totalPackets > firstN + 100) {
+            const lastStart = Math.max(context.totalPackets - 99, firstN + 1);
+            const lastPackets = await this.tsharkRunner.getPacketRange(
+                context.capture.filePath,
+                lastStart,
+                context.totalPackets,
+                context.agentDisplayFilter
+            );
+            if (lastPackets && lastPackets.trim()) {
+                state.packetData += `#### Last 100 packets\n`;
+                state.packetData += '```\n' + lastPackets + '\n```\n\n';
+                state.captureBudgetUsed += this.estimateTokens(lastPackets);
+                state.coveredRanges.push([lastStart, context.totalPackets]);
+            }
+        }
+    }
+
+    private async appendScenarioFilteredSection(context: SampledCaptureContext, state: SampledCaptureBuildState): Promise<void> {
+        if (!context.scenarioFilter || state.captureBudgetUsed >= context.budgetPerCapture * 0.6) {
+            return;
+        }
+
+        try {
+            const maxScenarioPackets = Math.min(500, Math.floor((context.budgetPerCapture * 0.2) / 30));
+            const filteredSample = await this.tsharkRunner.applyFilter(
+                context.capture.filePath,
+                context.scenarioFilter,
+                maxScenarioPackets
+            );
+            if (filteredSample && filteredSample.trim()) {
+                const lineCount = filteredSample.trim().split('\n').filter(l => l.trim()).length;
+                state.packetData += `#### Scenario-relevant packets (filter: \`${context.scenarioFilter}\`) — ${lineCount} shown\n`;
+                state.packetData += '```\n' + filteredSample + '\n```\n\n';
+                state.captureBudgetUsed += this.estimateTokens(filteredSample);
+            }
+        } catch (e) {
+            this.outputChannel.appendLine(`[ContextAssembler] Scenario filter error: ${e}`);
+        }
+    }
+
+    private async appendAnomalousStreamSections(context: SampledCaptureContext, state: SampledCaptureBuildState): Promise<void> {
+        const captureStreams = context.streams
+            .filter(s => s.captureFile === context.capture.filePath && s.anomalyScore > 0)
+            .sort((a, b) => b.anomalyScore - a.anomalyScore);
+
+        if (captureStreams.length === 0 || state.captureBudgetUsed >= context.budgetPerCapture * 0.8) {
+            return;
+        }
+
+        state.packetData += `#### Packets from ${captureStreams.length} anomalous stream(s) (sorted by severity)\n\n`;
+
+        for (const stream of captureStreams) {
+            if (state.captureBudgetUsed >= context.budgetPerCapture * 0.9) {
+                break;
+            }
+
+            try {
+                const streamSample = await this.tsharkRunner.applyFilter(
+                    context.capture.filePath,
+                    `tcp.stream eq ${stream.index}`,
+                    100
+                );
+                if (streamSample && streamSample.trim()) {
+                    const sampleTokens = this.estimateTokens(streamSample);
+                    if (state.captureBudgetUsed + sampleTokens > context.budgetPerCapture * 0.95) {
+                        break;
+                    }
+
+                    const anomalyList = stream.anomalies.map(a => a.type).join(', ');
+                    state.packetData += `**Stream ${stream.index}** (score: ${stream.anomalyScore}, anomalies: ${anomalyList}) — ` +
+                        `${stream.source} ↔ ${stream.destination} | ${stream.packetCount} pkts\n`;
+                    state.packetData += '```\n' + streamSample + '\n```\n\n';
+                    state.captureBudgetUsed += sampleTokens;
+                }
+            } catch (e) {
+                this.outputChannel.appendLine(`[ContextAssembler] Error sampling stream ${stream.index}: ${e}`);
+            }
+        }
+    }
+
+    private async appendMiddleFillSections(context: SampledCaptureContext, state: SampledCaptureBuildState): Promise<void> {
+        const firstN = Math.min(200, context.totalPackets);
+        const TOKENS_PER_PACKET_EST = 30;
+        const MAX_FILL_BATCHES = 6;
+        const FILL_BATCH_SIZE = 500;
+        const lastStartForMiddle = Math.max(context.totalPackets - 99, firstN + 1);
+        const middleRegionStart = firstN + 1;
+        const middleRegionEnd = lastStartForMiddle - 1;
+        const remainingBudgetForFill = context.budgetPerCapture - state.captureBudgetUsed;
+
+        if (!(remainingBudgetForFill > 10000 && middleRegionEnd > middleRegionStart + FILL_BATCH_SIZE)) {
+            this.outputChannel.appendLine(
+                `[ContextAssembler] Section E skipped: remainingBudget=${remainingBudgetForFill}, middleSize=${middleRegionEnd - middleRegionStart}`
+            );
+            return;
+        }
+
+        const packetsCanFit = Math.floor((remainingBudgetForFill * 0.85) / TOKENS_PER_PACKET_EST);
+        const numFillBatches = Math.min(
+            Math.max(1, Math.floor(packetsCanFit / FILL_BATCH_SIZE)),
+            MAX_FILL_BATCHES
+        );
+        const middleSize = middleRegionEnd - middleRegionStart;
+        const fillStep = Math.floor(middleSize / (numFillBatches + 1));
+
+        this.outputChannel.appendLine(
+            `[ContextAssembler] Section E: ${remainingBudgetForFill} tokens remaining, ` +
+            `can fit ~${packetsCanFit} packets → ${numFillBatches} evenly-spaced batch(es) of ${FILL_BATCH_SIZE} through frames ${middleRegionStart}–${middleRegionEnd}`
+        );
+
+        state.packetData += `\n#### Representative mid-capture samples (${numFillBatches} batch${numFillBatches > 1 ? 'es' : ''} of up to ${FILL_BATCH_SIZE} packets, evenly spaced)\n\n`;
+
+        for (let i = 1; i <= numFillBatches && state.captureBudgetUsed < context.budgetPerCapture * 0.92; i++) {
+            const batchStart = middleRegionStart + (i * fillStep);
+            const batchEnd = Math.min(batchStart + FILL_BATCH_SIZE - 1, middleRegionEnd);
+            if (batchStart > middleRegionEnd) {
+                break;
+            }
+
+            try {
+                const batchPackets = await this.tsharkRunner.getPacketRange(
+                    context.capture.filePath,
+                    batchStart,
+                    batchEnd,
+                    context.agentDisplayFilter
+                );
+                if (batchPackets && batchPackets.trim()) {
+                    const batchTokens = this.estimateTokens(batchPackets);
+                    if (state.captureBudgetUsed + batchTokens > context.budgetPerCapture * 0.95) {
+                        break;
+                    }
+
+                    const pct = Math.round((batchStart / context.totalPackets) * 100);
+                    state.packetData += `##### Frames ${batchStart.toLocaleString()}–${batchEnd.toLocaleString()} (~${pct}% through capture)\n`;
+                    state.packetData += '```\n' + batchPackets + '\n```\n\n';
+                    state.captureBudgetUsed += batchTokens;
+                    state.coveredRanges.push([batchStart, batchEnd]);
+                }
+            } catch (e) {
+                this.outputChannel.appendLine(`[ContextAssembler] Section E batch ${i} error: ${e}`);
+            }
+        }
+    }
+
+    private buildUncoveredRangesSection(uncoveredRanges: Array<[number, number]>): string {
+        if (uncoveredRanges.length === 0) {
+            return '';
+        }
+
+        let section = `\n#### ⚠️ Uncovered frame ranges — use nettrace-getPacketRange to review these\n`;
+        section += 'These sections have NOT been examined yet. Page through them with getPacketRange (max 500 per call):\n\n';
+        for (const [start, end] of uncoveredRanges) {
+            const count = end - start + 1;
+            section += `- Frames **${start}–${end}** (${count.toLocaleString()} packets)\n`;
+        }
+        section += '\n';
+        return section;
+    }
+
+    private countCoveredPackets(coveredRanges: Array<[number, number]>): number {
+        return coveredRanges.reduce((sum, [start, end]) => sum + (end - start + 1), 0);
     }
 
     /**

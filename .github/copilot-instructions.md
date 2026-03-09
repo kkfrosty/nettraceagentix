@@ -32,6 +32,36 @@ Users create JSON files, hit "Reload Config" or restart, and get new capabilitie
 - **Agentic tool calling** — The LLM can autonomously call tools (getStreamDetail, applyFilter, followStream, etc.) to gather more data during analysis. It starts with a summary and drills into specific streams on its own.
 - **Client/server capture comparison** — First-class feature. Users can mark captures as client-side or server-side, and the extension correlates packets between them to find what's missing.
 
+## Architecture Guardrails
+
+These rules are intended to prevent new duplicate logic, split ownership, and UI drift as features are added.
+
+### Shared-Code First
+- Before adding logic to a panel, participant, command, or tool, check whether a shared helper or existing owner already exists.
+- If the same behavior is needed in both saved-capture and live-capture flows, extract or extend a shared module instead of implementing two separate versions.
+- Prefer extending existing shared modules such as `src/views/sharedCaptureView.ts`, `src/captureRouting.ts`, and `src/contextAssembler.ts` before adding new parallel code paths.
+
+### Single Owner Per Responsibility
+- `src/contextAssembler.ts` owns context construction for first-turn, follow-up, and tool-only analysis modes. Do not rebuild prompt sections manually inside `nettraceParticipant.ts` or elsewhere.
+- `src/captureRouting.ts` owns active/open capture resolution, panel rehydration, and shared routing decisions. Do not recreate capture-selection or default-capture logic inside tools, commands, or participants.
+- `src/parsing/tsharkRunner.ts` owns tshark execution and parsing-facing command wrappers. New tshark access patterns should be added there or exposed through existing tools instead of shelling out ad hoc from multiple files.
+
+### Viewer Parity Rules
+- `captureWebviewPanel.ts` and `liveCaptureWebviewPanel.ts` should behave the same for viewing, inspecting, and filtering packets unless the feature is inherently live-session-specific.
+- Live-only differences should be limited to capture session lifecycle, status, and recording controls.
+- Packet parsing, packet detail loading, hex loading, protocol-tree parsing, and externally-applied display-filter behavior should remain shared whenever possible.
+
+### Tool and Chat Consistency
+- Generic "Analyze" actions should describe the current open capture context and allow the participant to choose single vs dual mode. Only packet-specific or stream-specific actions should hard-bind a specific capture file.
+- User-visible chat status should match the actual initial analysis mode. If dual-capture intent is supported, the participant should enter dual mode before rendering first-turn status rather than relying on tools to discover the second trace later.
+- If a tool can act on either the active capture or an explicitly specified capture, keep that behavior explicit in the tool contract instead of hiding alternate routing in unrelated UI code.
+
+### Refactoring Expectations For New Work
+- When adding functionality, look for nearby duplicated logic first and collapse it if the new change touches both paths anyway.
+- Avoid copy/pasting prompt assembly, filter application, capture-selection logic, or tshark argument handling between `extension.ts`, `nettraceParticipant.ts`, webview panels, and LM tools.
+- Keep behavior changes narrowly scoped. Prefer reusing shared helpers with small extensions over introducing new one-off conditionals in multiple files.
+- If a new feature requires an exception to these guardrails, document the reason in code comments or in this instruction file so the divergence is intentional and reviewable.
+
 ## File Structure
 
 ```

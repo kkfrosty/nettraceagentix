@@ -8,6 +8,7 @@ import { AgentsTreeProvider } from '../views/agentsTreeProvider';
 import { StreamsTreeProvider } from '../views/streamsTreeProvider';
 import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
 import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
+import { resolveOpenCaptures } from '../captureRouting';
 import { AgentDefinition, AssembledContext, CaptureFile } from '../types';
 
 /**
@@ -38,7 +39,6 @@ export class NetTraceParticipant {
         );
 
         this.participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'nettrace-icon.svg');
-
         this.participant.followupProvider = {
             provideFollowups: this.provideFollowups.bind(this),
         };
@@ -56,6 +56,7 @@ export class NetTraceParticipant {
         token: vscode.CancellationToken
     ): Promise<vscode.ChatResult> {
         this.outputChannel.appendLine(`[ChatParticipant] Request: "${request.prompt}"`);
+
         let { prompt: userPrompt, captureFileOverride } = this.extractCaptureOverride(request.prompt);
         if (captureFileOverride) {
             this.outputChannel.appendLine(`[ChatParticipant] Capture override from prompt: ${captureFileOverride}`);
@@ -84,10 +85,15 @@ export class NetTraceParticipant {
             if (controlResult) {
                 return controlResult;
             }
+
+            const filterResult = await this.tryHandleFilterIntent(request, context, stream, token, userPrompt);
+            if (filterResult) {
+                return filterResult;
+            }
         }
 
         // Determine which captures to analyze — dual-capture mode if both roles assigned
-        const { captures: capturesToAnalyze, mode: captureMode } = await this.getCapturesToAnalyze(captureFileOverride);
+        const { captures: capturesToAnalyze, mode: captureMode } = await this.getCapturesToAnalyze(userPrompt, captureFileOverride);
 
         if (capturesToAnalyze.length === 0) {
             // No capture is currently open in a viewer panel.
@@ -177,44 +183,19 @@ export class NetTraceParticipant {
             let assembledContext;
 
             if (isFollowUp) {
-                // ── Follow-up turn: lightweight context ───────────────────
-                // The conversation history already contains the model's previous analysis.
-                // Don't re-send all packet data — just provide the capture summary + expert info
-                // so the model remembers what capture it's looking at. If the user asks about
-                // specific packets, the model can use tools to fetch them on demand.
+                // Follow-up turn: lightweight context.
                 const followUpLabel = captureMode === 'dual'
                     ? capturesToAnalyze.map(c => `${c.name} [${c.role}]`).join(' + ')
                     : primaryCapture.name;
                 stream.progress(`Follow-up on ${followUpLabel}...`);
-                this.outputChannel.appendLine(`[ChatParticipant] Follow-up turn — using lightweight context (no packet data re-send)`);
-
-                const systemPrompt = this.contextAssembler.buildSystemPromptPublic(agent);
-                const captureSummary = await this.contextAssembler.buildCaptureSummaryPublic(capturesToAnalyze);
-                const scenarioContext = this.contextAssembler.buildScenarioContextPublic();
-                const knowledgeContext = await this.contextAssembler.buildKnowledgeContextPublic(capturesToAnalyze, captureStreams, agent);
-
-                const cpt = NetTraceParticipant.CHARS_PER_TOKEN;
-                const lightweightTokens =
-                    Math.ceil(systemPrompt.length / cpt) +
-                    Math.ceil(captureSummary.length / cpt) +
-                    Math.ceil(scenarioContext.length / cpt) +
-                    Math.ceil(knowledgeContext.length / cpt);
-
-                const totalPacketsFollowUp = capturesToAnalyze.reduce(
-                    (sum, c) => sum + (c.summary?.packetCount || 0), 0
+                this.outputChannel.appendLine('[ChatParticipant] Follow-up turn — using lightweight context (no packet data re-send)');
+                assembledContext = await this.contextAssembler.assembleFollowUpContext(
+                    capturesToAnalyze,
+                    captureStreams,
+                    agent
                 );
-                assembledContext = {
-                    systemPrompt,
-                    captureSummary,
-                    streamDetails: '', // Not needed — model has this from previous turn
-                    scenarioContext,
-                    packetData: '',    // Not needed — model has its analysis. Use tools if it needs to revisit.
-                    knowledgeContext,
-                    estimatedTokens: lightweightTokens,
-                    coverage: { mode: 'complete' as const, totalPackets: totalPacketsFollowUp, packetsIncluded: totalPacketsFollowUp },
-                };
             } else {
-                // ── First turn: full context with all packets ─────────────
+                // First turn: full context with all packets.
                 const firstTurnLabel = captureMode === 'dual'
                     ? capturesToAnalyze.map(c => `${c.name} [${c.role}]`).join(' + ')
                     : primaryCapture.name;
@@ -282,6 +263,16 @@ export class NetTraceParticipant {
         }
 
         return resolved;
+    }
+
+    private isDisplayFilterIntent(prompt: string): boolean {
+        const p = prompt.trim().toLowerCase();
+        if (!p) { return false; }
+        if (this.isAnalyzeIntent(p)) { return false; }
+
+        return /^(?:please\s+)?(?:apply|set|change|update|use|clear|remove)\s+(?:the\s+|a\s+)?(?:(?:wireshark|display)\s+)?filter\b/.test(p)
+            || /^(?:please\s+)?(?:(?:wireshark|display)\s+)?filter\b/.test(p)
+            || /^show\s+only\b/.test(p);
     }
 
     // ── Message Sanitization ──────────────────────────────────────────────
@@ -508,6 +499,304 @@ export class NetTraceParticipant {
         return model.sendRequest(messages, options, token);
     }
 
+    private renderAnalysisHeader(
+        stream: vscode.ChatResponseStream,
+        context: AssembledContext,
+        captures: CaptureFile[],
+        agent: AgentDefinition,
+        model: vscode.LanguageModelChat,
+        modelMax: number,
+        liveStatus: ReturnType<(typeof LiveCaptureWebviewPanel.prototype)['getStatusSnapshot']> | undefined,
+        isFirstTurn: boolean
+    ): void {
+        const pct = modelMax > 0 ? Math.round((context.estimatedTokens / modelMax) * 100) : 0;
+        const coverageInfo = this.buildCoverageInfo(context, captures, liveStatus);
+        const captureLabel = this.buildCaptureLabel(captures, liveStatus);
+        const statsLine = `*Using **${model.name}** — ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) · ${coverageInfo} · analyzing ${captureLabel}*`;
+
+        if (!isFirstTurn) {
+            stream.markdown(`${statsLine}\n\n`);
+            return;
+        }
+
+        const agentLabel = agent.displayName || agent.name;
+        const agentDesc = agent.description ? ` — *${agent.description}*` : '';
+        const knowledgeLine = this.buildKnowledgeHeaderLine(context);
+
+        stream.markdown(`**Agent:** ${agentLabel}${agentDesc}${knowledgeLine}\n${statsLine}\n\n---\n\n`);
+        if (captures.length > 1) {
+            stream.markdown(
+                `> 🔄 **Dual-capture mode** — analyzing CLIENT and SERVER traces simultaneously. ` +
+                `Tools can target either capture using the \`captureFile\` parameter shown in each capture's summary below.\n\n`
+            );
+        }
+    }
+
+    private buildKnowledgeHeaderLine(context: AssembledContext): string {
+        const manifest = context.knowledgeManifest;
+        if (!manifest) {
+            return '';
+        }
+
+        const allFiles = [...manifest.wisdomFiles, ...manifest.securityFiles];
+        if (allFiles.length === 0) {
+            return `\n*No knowledge documents — using model's built-in expertise*`;
+        }
+
+        const fileLinks = allFiles.map(f => `\`${f}\``).join(' · ');
+        const securityNote = manifest.securityTriggered ? ' · ⚠️ *Security heuristics activated by capture signals*' : '';
+        return `\n**Knowledge:** ${fileLinks}${securityNote}`;
+    }
+
+    private buildCoverageInfo(
+        context: AssembledContext,
+        captures: CaptureFile[],
+        liveStatus: ReturnType<(typeof LiveCaptureWebviewPanel.prototype)['getStatusSnapshot']> | undefined
+    ): string {
+        if (!context.coverage) {
+            return '';
+        }
+
+        if (captures.length === 0) {
+            if (!liveStatus?.hasSession) {
+                return '🧠 No capture preloaded yet (tool-driven mode)';
+            }
+
+            const livePackets = liveStatus.packetCount || 0;
+            const status = liveStatus.sessionStatus;
+            if ((status === 'starting' || status === 'capturing') && livePackets === 0) {
+                return '⏳ Live capture is running — waiting for first packets';
+            }
+            if (status === 'stopping') {
+                return '⏳ Live capture is stopping — finalizing capture file';
+            }
+            if (livePackets > 0) {
+                return `📡 Live capture has ${livePackets.toLocaleString()} packet${livePackets === 1 ? '' : 's'} available`;
+            }
+            return '📡 Live capture session is ready';
+        }
+
+        if (context.coverage.mode === 'complete') {
+            return `✅ All ${context.coverage.totalPackets.toLocaleString()} packets loaded`;
+        }
+
+        const numRanges = context.coverage.uncoveredRanges?.length || 0;
+        const uncoveredPct = context.coverage.totalPackets > 0
+            ? Math.round(((context.coverage.totalPackets - context.coverage.packetsIncluded) / context.coverage.totalPackets) * 100)
+            : 0;
+        const rangeNote = numRanges > 0
+            ? ` · 🔍 tools scanning remaining ${uncoveredPct}% via ${numRanges} range pass${numRanges > 1 ? 'es' : ''}`
+            : '';
+        return `📊 Pre-loaded ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${rangeNote}`;
+    }
+
+    private buildCaptureLabel(
+        captures: CaptureFile[],
+        liveStatus: ReturnType<(typeof LiveCaptureWebviewPanel.prototype)['getStatusSnapshot']> | undefined
+    ): string {
+        if (captures.length > 1) {
+            return captures.map(c => `${c.name}${c.role ? ` [${c.role}]` : ''}`).join(' + ');
+        }
+        if (captures.length === 1) {
+            return captures[0].name;
+        }
+        if (!liveStatus?.hasSession) {
+            return 'no capture selected yet';
+        }
+
+        const livePackets = liveStatus.packetCount || 0;
+        const liveFile = liveStatus.captureFile ? path.basename(liveStatus.captureFile) : undefined;
+        if (livePackets === 0 && (liveStatus.sessionStatus === 'starting' || liveStatus.sessionStatus === 'capturing')) {
+            return 'active live capture (collecting packets)';
+        }
+        if (liveFile) {
+            return `live capture (${liveFile})`;
+        }
+        return 'active live capture';
+    }
+
+    private buildInitialMessages(
+        chatContext: vscode.ChatContext,
+        context: AssembledContext,
+        userMessage: string
+    ): vscode.LanguageModelChatMessage[] {
+        const contextParts = [context.systemPrompt];
+        const metaContent = [context.scenarioContext, context.captureSummary, context.streamDetails]
+            .filter(s => s.length > 0)
+            .join('\n');
+        if (metaContent) {
+            contextParts.push(metaContent);
+        }
+        if (context.knowledgeContext && context.knowledgeContext.length > 0) {
+            contextParts.push(context.knowledgeContext);
+        }
+        if (context.packetData && context.packetData.length > 0) {
+            contextParts.push(context.packetData);
+        }
+
+        const contextBlock = contextParts.join('\n\n---\n\n');
+        const messages: vscode.LanguageModelChatMessage[] = [];
+
+        if (chatContext.history.length === 0) {
+            messages.push(vscode.LanguageModelChatMessage.User(
+                contextBlock + '\n\n---\n\n## User Query\n\n' + userMessage
+            ));
+            return messages;
+        }
+
+        messages.push(vscode.LanguageModelChatMessage.User(contextBlock));
+        for (const turn of chatContext.history) {
+            if (turn instanceof vscode.ChatRequestTurn) {
+                messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
+            } else if (turn instanceof vscode.ChatResponseTurn) {
+                let responseText = '';
+                for (const part of turn.response) {
+                    if (part instanceof vscode.ChatResponseMarkdownPart) {
+                        responseText += part.value.value;
+                    }
+                }
+                messages.push(vscode.LanguageModelChatMessage.Assistant(
+                    responseText || '(Analysis performed using tool calls)'
+                ));
+            }
+        }
+
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg && lastMsg.role === vscode.LanguageModelChatMessageRole.User) {
+            messages.push(vscode.LanguageModelChatMessage.Assistant(
+                'Understood. What would you like me to analyze?'
+            ));
+        }
+
+        messages.push(vscode.LanguageModelChatMessage.User(userMessage));
+        return messages;
+    }
+
+    private resolveToolsForAgent(agent: AgentDefinition): vscode.LanguageModelChatTool[] {
+        const toolNames = agent.tools || [];
+        const requiredTools = ['nettrace-startCapture', 'nettrace-stopCapture', 'nettrace-getLiveCaptureStatus'];
+        const allToolNames = [...toolNames];
+        for (const required of requiredTools) {
+            if (!allToolNames.includes(required)) {
+                allToolNames.push(required);
+            }
+        }
+        return this.resolveTools(allToolNames);
+    }
+
+    private logMessageStructure(messages: vscode.LanguageModelChatMessage[], label: string): void {
+        this.outputChannel.appendLine(`[ChatParticipant] ${label} (${messages.length} messages):`);
+        for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
+            const role = msg.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant';
+            const contentDesc = Array.isArray(msg.content)
+                ? msg.content.map(p => {
+                    if (p instanceof vscode.LanguageModelTextPart) { return `Text(${p.value.length} chars)`; }
+                    if (p instanceof vscode.LanguageModelToolResultPart) { return `ToolResult(${p.callId})`; }
+                    if (p instanceof vscode.LanguageModelToolCallPart) { return `ToolCall(${p.name})`; }
+                    return 'Unknown';
+                }).join(', ')
+                : 'string';
+            this.outputChannel.appendLine(`  [${i}] ${role}: ${contentDesc}`);
+        }
+    }
+
+    private getToolReserveFraction(isSampled: boolean, modelMax: number): number {
+        if (!isSampled) {
+            return 0.10;
+        }
+        if (modelMax < 200000) {
+            return 0.35;
+        }
+        if (modelMax > 500000) {
+            return 0.15;
+        }
+        return 0.20;
+    }
+
+    private async executeToolCalls(
+        toolCallParts: vscode.LanguageModelToolCallPart[],
+        perToolBudget: number,
+        toolInvocationToken: vscode.ChatRequest['toolInvocationToken'],
+        stream: vscode.ChatResponseStream,
+        token: vscode.CancellationToken
+    ): Promise<vscode.LanguageModelToolResultPart[]> {
+        const toolResultParts: vscode.LanguageModelToolResultPart[] = [];
+
+        for (const toolCall of toolCallParts) {
+            if (token.isCancellationRequested) {
+                break;
+            }
+
+            stream.progress(`Querying: ${toolCall.name}...`);
+            this.outputChannel.appendLine(`[ChatParticipant] Tool "${toolCall.name}" input=${JSON.stringify(toolCall.input)}`);
+
+            try {
+                const toolResult = await vscode.lm.invokeTool(toolCall.name, {
+                    input: toolCall.input,
+                    toolInvocationToken,
+                }, token);
+
+                const resultContent: (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[] = [];
+                for (const contentPart of toolResult.content) {
+                    if (contentPart instanceof vscode.LanguageModelTextPart) {
+                        let text = contentPart.value;
+                        if (text.length > perToolBudget) {
+                            text = text.substring(0, perToolBudget) +
+                                `\n\n... (truncated to fit context budget — ${text.length} chars total, showing first ${perToolBudget})`;
+                            this.outputChannel.appendLine(
+                                `[ChatParticipant] Truncated ${toolCall.name} response from ${contentPart.value.length} to ${perToolBudget} chars`
+                            );
+                        }
+                        resultContent.push(new vscode.LanguageModelTextPart(text));
+                    }
+                }
+                toolResultParts.push(new vscode.LanguageModelToolResultPart(toolCall.callId, resultContent));
+            } catch (err) {
+                this.outputChannel.appendLine(`[ChatParticipant] Tool error: ${err}`);
+                toolResultParts.push(new vscode.LanguageModelToolResultPart(toolCall.callId, [
+                    new vscode.LanguageModelTextPart(`Error: ${err instanceof Error ? err.message : String(err)}`),
+                ]));
+            }
+        }
+
+        return toolResultParts;
+    }
+
+    private logApiErrorDump(errMsg: string, roundTrip: number, messages: vscode.LanguageModelChatMessage[]): void {
+        this.outputChannel.appendLine(
+            `[ChatParticipant] ═══ API ERROR (round ${roundTrip}) ═══\n` +
+            `  Error: ${errMsg}\n` +
+            `  Messages array (${messages.length} items) at time of failure:`
+        );
+        for (let i = 0; i < messages.length; i++) {
+            const m = messages[i];
+            const role = m.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant';
+            const parts = Array.isArray(m.content) ? m.content : [];
+            const desc = parts.map(p => {
+                if (p instanceof vscode.LanguageModelTextPart) { return `Text(${p.value.length})`; }
+                if (p instanceof vscode.LanguageModelToolResultPart) { return `ToolResult(id=${p.callId})`; }
+                if (p instanceof vscode.LanguageModelToolCallPart) { return `ToolCall(${p.name},id=${p.callId})`; }
+                return `Unknown(${(p as any)?.constructor?.name || typeof p})`;
+            }).join(', ');
+            this.outputChannel.appendLine(`    [${i}] ${role}: [${desc}]`);
+        }
+        this.outputChannel.appendLine('  ═══ END ERROR DUMP ═══');
+    }
+
+    private buildTextOnlyFallbackMessages(messages: vscode.LanguageModelChatMessage[]): vscode.LanguageModelChatMessage[] {
+        const textOnlyMessages = messages.filter(m => {
+            if (!Array.isArray(m.content)) {
+                return true;
+            }
+            return !m.content.some(p =>
+                p instanceof vscode.LanguageModelToolResultPart ||
+                p instanceof vscode.LanguageModelToolCallPart
+            );
+        });
+        return this.sanitizeMessagesForApi(textOnlyMessages);
+    }
+
     private async sendToModel(
         request: vscode.ChatRequest,
         chatContext: vscode.ChatContext,
@@ -524,95 +813,6 @@ export class NetTraceParticipant {
         this.outputChannel.appendLine(`[ChatParticipant] Model: ${model.name}, maxInput: ${modelMax}, context: ~${context.estimatedTokens} tokens`);
 
         const liveStatus = LiveCaptureWebviewPanel.getActivePanel()?.getStatusSnapshot();
-
-        // Build coverage string and stats line
-        const pct = modelMax > 0 ? Math.round((context.estimatedTokens / modelMax) * 100) : 0;
-        const coverageInfo = context.coverage
-            ? captures.length === 0
-                ? (() => {
-                    if (!liveStatus?.hasSession) {
-                        return '\ud83e\uddf0 No capture preloaded yet (tool-driven mode)';
-                    }
-
-                    const livePackets = liveStatus.packetCount || 0;
-                    const status = liveStatus.sessionStatus;
-                    if ((status === 'starting' || status === 'capturing') && livePackets === 0) {
-                        return '\u23f3 Live capture is running — waiting for first packets';
-                    }
-                    if (status === 'stopping') {
-                        return '\u23f3 Live capture is stopping — finalizing capture file';
-                    }
-                    if (livePackets > 0) {
-                        return `\ud83d\udce1 Live capture has ${livePackets.toLocaleString()} packet${livePackets === 1 ? '' : 's'} available`;
-                    }
-                    return '\ud83d\udce1 Live capture session is ready';
-                })()
-                : context.coverage.mode === 'complete'
-                    ? `\u2705 All ${context.coverage.totalPackets.toLocaleString()} packets loaded`
-                    : (() => {
-                        // Sampled mode: the initial load is intentionally sized to leave room in the
-                        // tool loop for range-paging calls. Surface this as a coverage plan, not a
-                        // limitation — "pre-loaded X%, tools will cover the rest" is more accurate
-                        // than implying only X% of the capture will be analyzed.
-                        const numRanges = context.coverage.uncoveredRanges?.length || 0;
-                        const uncoveredPct = context.coverage.totalPackets > 0
-                            ? Math.round(((context.coverage.totalPackets - context.coverage.packetsIncluded) / context.coverage.totalPackets) * 100)
-                            : 0;
-                        const rangeNote = numRanges > 0
-                            ? ` \u00b7 \ud83d\udd0d tools scanning remaining ${uncoveredPct}% via ${numRanges} range pass${numRanges > 1 ? 'es' : ''}`
-                            : '';
-                        return `\ud83d\udcca Pre-loaded ${context.coverage.packetsIncluded.toLocaleString()} of ${context.coverage.totalPackets.toLocaleString()} packets${rangeNote}`;
-                    })()
-            : '';
-        const captureLabel = captures.length > 1
-            ? captures.map(c => `${c.name}${c.role ? ` [${c.role}]` : ''}`).join(' + ')
-            : captures.length === 1
-                ? captures[0].name
-                : (() => {
-                    if (!liveStatus?.hasSession) {
-                        return 'no capture selected yet';
-                    }
-                    const livePackets = liveStatus.packetCount || 0;
-                    const liveFile = liveStatus.captureFile ? path.basename(liveStatus.captureFile) : undefined;
-                    if (livePackets === 0 && (liveStatus.sessionStatus === 'starting' || liveStatus.sessionStatus === 'capturing')) {
-                        return 'active live capture (collecting packets)';
-                    }
-                    if (liveFile) {
-                        return `live capture (${liveFile})`;
-                    }
-                    return 'active live capture';
-                })();
-        const statsLine = `*Using **${model.name}** \u2014 ~${Math.round(context.estimatedTokens / 1000)}K of ${Math.round(modelMax / 1000)}K tokens (${pct}%) \u00b7 ${coverageInfo} \u00b7 analyzing ${captureLabel}*`;
-
-        if (isFirstTurn) {
-            // \u2500\u2500 First-turn header: agent identity + knowledge documents in use \u2500\u2500
-            const agentLabel = agent.displayName || agent.name;
-            const agentDesc = agent.description ? ` \u2014 *${agent.description}*` : '';
-
-            const manifest = context.knowledgeManifest;
-            let knowledgeLine = '';
-            if (manifest) {
-                const allFiles = [...manifest.wisdomFiles, ...manifest.securityFiles];
-                if (allFiles.length > 0) {
-                    const fileLinks = allFiles.map(f => `\`${f}\``).join(' \u00b7 ');
-                    const securityNote = manifest.securityTriggered ? ' \u00b7 \u26a0\ufe0f *Security heuristics activated by capture signals*' : '';
-                    knowledgeLine = `\n**Knowledge:** ${fileLinks}${securityNote}`;
-                } else {
-                    knowledgeLine = `\n*No knowledge documents \u2014 using model\'s built-in expertise*`;
-                }
-            }
-
-            stream.markdown(`**Agent:** ${agentLabel}${agentDesc}${knowledgeLine}\n${statsLine}\n\n---\n\n`);
-            if (captures.length > 1) {
-                stream.markdown(
-                    `> 🔄 **Dual-capture mode** — analyzing CLIENT and SERVER traces simultaneously. ` +
-                    `Tools can target either capture using the \`captureFile\` parameter shown in each capture's summary below.\n\n`
-                );
-            }
-        } else {
-            // Follow-up turns: compact status line only
-            stream.markdown(`${statsLine}\n\n`);
-        }
 
         // ── Build messages with strict role alternation ─────────────────────
         // The Claude API requires:
@@ -631,105 +831,17 @@ export class NetTraceParticipant {
         //   - Build clean history with proper alternation
         //   - After all construction, sanitize in-place before the tool loop starts
 
-        const contextParts = [context.systemPrompt];
+        this.renderAnalysisHeader(stream, context, captures, agent, model, modelMax, liveStatus, isFirstTurn);
 
-        // Include scenario context and capture summary metadata
-        const metaContent = [context.scenarioContext, context.captureSummary, context.streamDetails]
-            .filter(s => s.length > 0)
-            .join('\n');
-        if (metaContent) { contextParts.push(metaContent); }
-
-        // Include knowledge context (analysis wisdom, conditional security heuristics)
-        if (context.knowledgeContext && context.knowledgeContext.length > 0) {
-            contextParts.push(context.knowledgeContext);
-        }
-
-        // Include actual packet data — this is the real trace content
-        if (context.packetData && context.packetData.length > 0) {
-            contextParts.push(context.packetData);
-        }
-
-        // Build the initial messages array — context is ALWAYS the first message
-        // and must be a text-only User message. We add a separator to keep the
-        // context distinct from the user's actual question.
-        const contextBlock = contextParts.join('\n\n---\n\n');
-
-        let messages: vscode.LanguageModelChatMessage[] = [];
-
-        if (chatContext.history.length === 0) {
-            // ── First turn: combine context + user query in ONE User message ──
-            // This ensures messages[0] is a single text-only User message.
-            // No consecutive Users. No merge needed. Clean for any proxy behavior.
-            messages.push(vscode.LanguageModelChatMessage.User(
-                contextBlock + '\n\n---\n\n## User Query\n\n' + userMessage
-            ));
-        } else {
-            // ── Follow-up turn: context, then history, then user query ────────
-            messages.push(vscode.LanguageModelChatMessage.User(contextBlock));
-
-            // Conversation history for multi-turn — extract text-only content.
-            // Drop any tool_use/tool_result artifacts from previous turns to prevent
-            // orphaned tool blocks in the API request.
-            // ALWAYS insert an Assistant message for every response turn — skipping
-            // empty responses would create consecutive User messages.
-            for (const turn of chatContext.history) {
-                if (turn instanceof vscode.ChatRequestTurn) {
-                    messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
-                } else if (turn instanceof vscode.ChatResponseTurn) {
-                    let responseText = '';
-                    for (const part of turn.response) {
-                        if (part instanceof vscode.ChatResponseMarkdownPart) {
-                            responseText += part.value.value;
-                        }
-                    }
-                    messages.push(vscode.LanguageModelChatMessage.Assistant(
-                        responseText || '(Analysis performed using tool calls)'
-                    ));
-                }
-            }
-
-            // Ensure the last message before the user's prompt is not also User role
-            const lastMsg = messages[messages.length - 1];
-            if (lastMsg && lastMsg.role === vscode.LanguageModelChatMessageRole.User) {
-                messages.push(vscode.LanguageModelChatMessage.Assistant(
-                    'Understood. What would you like me to analyze?'
-                ));
-            }
-
-            messages.push(vscode.LanguageModelChatMessage.User(userMessage));
-        }
+        let messages = this.buildInitialMessages(chatContext, context, userMessage);
 
         // ── Sanitize in-place BEFORE the tool loop starts ─────────────────
         // This ensures the working messages array is always clean. The tool loop
         // pushes new entries to THIS sanitized array, keeping it consistent.
         messages = this.sanitizeMessagesForApi(messages);
 
-        const toolNames = this.agentsTree.getActiveAgent().tools || [];
-        // Always include live-capture control tools regardless of active agent.
-        const requiredTools = ['nettrace-startCapture', 'nettrace-stopCapture', 'nettrace-getLiveCaptureStatus'];
-        const allToolNames = [...toolNames];
-        for (const required of requiredTools) {
-            if (!allToolNames.includes(required)) {
-                allToolNames.push(required);
-            }
-        }
-        const tools = this.resolveTools(allToolNames);
-
-        // Log message structure for debugging API errors
-        this.outputChannel.appendLine(`[ChatParticipant] Message structure after sanitize (${messages.length} messages):`);
-        for (let i = 0; i < messages.length; i++) {
-            const msg = messages[i];
-            const role = msg.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant';
-            const contentDesc = Array.isArray(msg.content)
-                ? msg.content.map(p => {
-                    if (p instanceof vscode.LanguageModelTextPart) { return `Text(${p.value.length} chars)`; }
-                    if (p instanceof vscode.LanguageModelToolResultPart) { return `ToolResult(${p.callId})`; }
-                    if (p instanceof vscode.LanguageModelToolCallPart) { return `ToolCall(${p.name})`; }
-                    return 'Unknown';
-                }).join(', ')
-                : 'string';
-            this.outputChannel.appendLine(`  [${i}] ${role}: ${contentDesc}`);
-        }
+        const tools = this.resolveToolsForAgent(agent);
+        this.logMessageStructure(messages, 'Message structure after sanitize');
 
         // ── Agentic tool-calling loop with token budget tracking ──────────
         // Track accumulated tokens to prevent exceeding the model's context limit.
@@ -743,16 +855,7 @@ export class NetTraceParticipant {
         //
         // We derive the fraction from the coverage mode already in the assembled context.
         const isSampled = context.coverage?.mode === 'sampled';
-        let toolReserveFraction: number;
-        if (!isSampled) {
-            toolReserveFraction = 0.10;
-        } else if (modelMax < 200000) {
-            toolReserveFraction = 0.35;
-        } else if (modelMax > 500000) {
-            toolReserveFraction = 0.15;
-        } else {
-            toolReserveFraction = 0.20;
-        }
+        const toolReserveFraction = this.getToolReserveFraction(isSampled, modelMax);
         // Subtract the assembler's reserve from the model max — that's our hard ceiling.
         // Then add a small margin (half the reserve) for the tool responses themselves.
         // Net effect: tool loop gets headroom WITHOUT exceeding what the assembler planned.
@@ -847,36 +950,10 @@ export class NetTraceParticipant {
                 // retry WITHOUT tools as a fallback so the user still gets analysis
                 const errMsg = sendError?.message || String(sendError);
                 if (errMsg.includes('400') || errMsg.includes('invalid_request_error') || errMsg.includes('tool_use_id')) {
-                    // Log the FULL message structure that caused the error for diagnosis
-                    this.outputChannel.appendLine(
-                        `[ChatParticipant] ═══ API ERROR (round ${roundTrip}) ═══\n` +
-                        `  Error: ${errMsg}\n` +
-                        `  Messages array (${messages.length} items) at time of failure:`
-                    );
-                    for (let i = 0; i < messages.length; i++) {
-                        const m = messages[i];
-                        const role = m.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant';
-                        const parts = Array.isArray(m.content) ? m.content : [];
-                        const desc = parts.map(p => {
-                            if (p instanceof vscode.LanguageModelTextPart) { return `Text(${p.value.length})`; }
-                            if (p instanceof vscode.LanguageModelToolResultPart) { return `ToolResult(id=${p.callId})`; }
-                            if (p instanceof vscode.LanguageModelToolCallPart) { return `ToolCall(${p.name},id=${p.callId})`; }
-                            return `Unknown(${(p as any)?.constructor?.name || typeof p})`;
-                        }).join(', ');
-                        this.outputChannel.appendLine(`    [${i}] ${role}: [${desc}]`);
-                    }
-                    this.outputChannel.appendLine(`  ═══ END ERROR DUMP ═══`);
+                    this.logApiErrorDump(errMsg, roundTrip, messages);
 
                     stream.markdown('\n\n*Tool calling encountered an API error — analyzing without tools.*\n\n');
-                    // Strip messages containing tool result/call parts, then sanitize
-                    const textOnlyMessages = messages.filter(m => {
-                        if (!Array.isArray(m.content)) { return true; }
-                        return !m.content.some(p =>
-                            p instanceof vscode.LanguageModelToolResultPart ||
-                            p instanceof vscode.LanguageModelToolCallPart
-                        );
-                    });
-                    const sanitizedFallback = this.sanitizeMessagesForApi(textOnlyMessages);
+                    const sanitizedFallback = this.buildTextOnlyFallbackMessages(messages);
                     const fallbackResponse = await this.logAndSend(
                         model, sanitizedFallback, {}, token, 'error fallback'
                     );
@@ -931,43 +1008,13 @@ export class NetTraceParticipant {
                 `[ChatParticipant] Tool response budget: ~${budgetForTools} tokens total, ~${Math.floor(perToolBudget / NetTraceParticipant.CHARS_PER_TOKEN)} tokens per tool`
             );
 
-            const toolResultParts: vscode.LanguageModelToolResultPart[] = [];
-
-            for (const toolCall of toolCallParts) {
-                if (token.isCancellationRequested) { break; }
-
-                stream.progress(`Querying: ${toolCall.name}...`);
-                this.outputChannel.appendLine(`[ChatParticipant] Tool "${toolCall.name}" input=${JSON.stringify(toolCall.input)}`);
-
-                try {
-                    const toolResult = await vscode.lm.invokeTool(toolCall.name, {
-                        input: toolCall.input,
-                        toolInvocationToken: request.toolInvocationToken,
-                    }, token);
-
-                    const resultContent: (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[] = [];
-                    for (const contentPart of toolResult.content) {
-                        if (contentPart instanceof vscode.LanguageModelTextPart) {
-                            // Apply dynamic cap to prevent blowing the budget
-                            let text = contentPart.value;
-                            if (text.length > perToolBudget) {
-                                text = text.substring(0, perToolBudget) +
-                                    `\n\n... (truncated to fit context budget — ${text.length} chars total, showing first ${perToolBudget})`;
-                                this.outputChannel.appendLine(
-                                    `[ChatParticipant] Truncated ${toolCall.name} response from ${contentPart.value.length} to ${perToolBudget} chars`
-                                );
-                            }
-                            resultContent.push(new vscode.LanguageModelTextPart(text));
-                        }
-                    }
-                    toolResultParts.push(new vscode.LanguageModelToolResultPart(toolCall.callId, resultContent));
-                } catch (err) {
-                    this.outputChannel.appendLine(`[ChatParticipant] Tool error: ${err}`);
-                    toolResultParts.push(new vscode.LanguageModelToolResultPart(toolCall.callId, [
-                        new vscode.LanguageModelTextPart(`Error: ${err instanceof Error ? err.message : String(err)}`),
-                    ]));
-                }
-            }
+            const toolResultParts = await this.executeToolCalls(
+                toolCallParts,
+                perToolBudget,
+                request.toolInvocationToken,
+                stream,
+                token
+            );
 
             // ── Ensure every tool_call has a matching tool_result ─────────
             // If cancellation broke the inner loop, some tool calls won't have
@@ -1032,9 +1079,6 @@ export class NetTraceParticipant {
 
         const agent = this.agentsTree.getActiveAgent();
 
-        const systemPrompt = this.contextAssembler.buildSystemPromptPublic(agent);
-        const scenarioContext = this.contextAssembler.buildScenarioContextPublic();
-
         const noCaptureNote = [
             '## No Capture Currently Open',
             '',
@@ -1055,26 +1099,76 @@ export class NetTraceParticipant {
             'If the user is asking to analyze an existing file, instruct them to open it first.',
         ].join('\n');
 
-        const estimatedTokens =
-            Math.ceil(systemPrompt.length / 4) +
-            Math.ceil(scenarioContext.length / 4) +
-            Math.ceil(noCaptureNote.length / 4);
-
-        const assembledContext: import('../types').AssembledContext = {
-            systemPrompt,
-            captureSummary: noCaptureNote,
-            streamDetails: '',
-            scenarioContext,
-            packetData: '',
-            knowledgeContext: '',
-            estimatedTokens,
-            coverage: { mode: 'complete', totalPackets: 0, packetsIncluded: 0 },
-        };
+        const assembledContext = this.contextAssembler.assembleToolOnlyContext(agent, noCaptureNote);
 
         return await this.sendToModel(
             request, chatContext, stream, token,
             assembledContext, userPrompt,
             /*captures=*/[], agent, /*isFirstTurn=*/true
+        );
+    }
+
+    private async tryHandleFilterIntent(
+        request: vscode.ChatRequest,
+        chatContext: vscode.ChatContext,
+        stream: vscode.ChatResponseStream,
+        token: vscode.CancellationToken,
+        userPrompt: string
+    ): Promise<vscode.ChatResult | undefined> {
+        if (!this.isDisplayFilterIntent(userPrompt)) {
+            return undefined;
+        }
+
+        this.outputChannel.appendLine(`[ChatParticipant] Filter intent detected — using lightweight tool-only path`);
+        stream.progress('Applying display filter...');
+
+        const activeAgent = this.agentsTree.getActiveAgent();
+        const filterAgent: AgentDefinition = {
+            ...activeAgent,
+            tools: ['nettrace-setDisplayFilter', 'nettrace-applyFilter'],
+        };
+
+        const filterModePrompt = [
+            'You are handling a display-filter request for the active NetTrace capture panel.',
+            'Do NOT analyze the whole capture and do NOT request full packet context.',
+            'If the user wants to change what is shown in the viewer, call `nettrace-setDisplayFilter`.',
+            'If the user explicitly asks for matching packets or filtered data returned in chat, call `nettrace-applyFilter` with `applyToPanel: true`.',
+            'Translate natural-language requests into valid Wireshark display filter syntax when possible.',
+            'After applying the filter, respond briefly with the filter that was used.',
+        ].join('\n');
+
+        const filterModeNote = [
+            '## Filter Request Mode',
+            '',
+            'The user is asking to set or clear a Wireshark display filter in the active capture panel.',
+            '',
+            'Rules:',
+            '- Prefer `nettrace-setDisplayFilter` for panel-only filter changes',
+            '- Use `nettrace-applyFilter` only when the user explicitly wants filtered packet data back in chat',
+            '- Do not load or summarize the whole trace for this request',
+            '- If no capture panel is open, explain that clearly',
+        ].join('\n');
+
+        const assembledContext = this.contextAssembler.assembleToolOnlyContext(
+            filterAgent,
+            filterModeNote,
+            {
+                scenarioContext: '',
+            }
+        );
+
+        assembledContext.systemPrompt = filterModePrompt;
+
+        return await this.sendToModel(
+            request,
+            chatContext,
+            stream,
+            token,
+            assembledContext,
+            userPrompt,
+            /*captures=*/[],
+            filterAgent,
+            /*isFirstTurn=*/true
         );
     }
 
@@ -1384,12 +1478,12 @@ export class NetTraceParticipant {
      * 1. Both client + server role captures assigned → dual-capture mode
      * 2. Unambiguous active capture (live > single viewer) from the tree
     * 3. Open panels fallback:
+    *    - exactly 2 open panels with dual-capture intent -> dual-capture mode
     *    - exactly 1 open panel  -> single-capture mode
-    *    - exactly 2 open panels -> dual-capture mode
     *    - 3+ open panels        -> QuickPick (with safe fallback)
     * 4. Empty -> no-capture mode (handled by handleNoCaptureRequest)
      */
-    private async getCapturesToAnalyze(captureFileOverride?: string): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
+    private async getCapturesToAnalyze(userPrompt: string, captureFileOverride?: string): Promise<{ captures: CaptureFile[]; mode: 'single' | 'dual' }> {
         const allCaptures = this.capturesTree.getCaptures();
 
         // Explicit capture binding from panel-originated action always wins.
@@ -1423,35 +1517,18 @@ export class NetTraceParticipant {
             return { captures: [clientCapture, serverCapture], mode: 'dual' };
         }
 
-        // Ask the tree — it knows which captures are open and in which panel
-        const active = this.capturesTree.getActiveCapture();
-        if (active) {
-            this.outputChannel.appendLine(`[ChatParticipant] Active capture (${active.openInPanel ?? 'tree'}): ${active.filePath}`);
-            return { captures: [active], mode: 'single' };
+        const routing = resolveOpenCaptures(this.capturesTree, this.outputChannel, 'ChatParticipant');
+        const openCaptures = routing.openCaptures;
+
+        if (openCaptures.length === 2 && this.shouldPreferDualOpenCaptureMode(userPrompt, openCaptures)) {
+            this.outputChannel.appendLine(
+                `[ChatParticipant] Dual-capture intent detected -> using two open panels: ${openCaptures[0].name}, ${openCaptures[1].name}`
+            );
+            return { captures: [openCaptures[0], openCaptures[1]], mode: 'dual' };
         }
 
-        let openCaptures = this.capturesTree.getOpenCaptures();
-
-        // Safety-net rehydration: if tree says nothing is open but panel registries
-        // clearly have open captures (e.g., after extension reload edge cases),
-        // repopulate panel state into the tree before deciding.
-        if (openCaptures.length === 0) {
-            const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
-            if (livePath) {
-                this.capturesTree.markOpenInPanel(livePath, 'live');
-            }
-
-            const viewerPanels = CaptureWebviewPanel.getOpenCapturePanels();
-            for (const p of viewerPanels) {
-                this.capturesTree.markOpenInPanel(p.filePath, 'viewer');
-            }
-
-            openCaptures = this.capturesTree.getOpenCaptures();
-            if (openCaptures.length > 0) {
-                this.outputChannel.appendLine(
-                    `[ChatParticipant] Rehydrated ${openCaptures.length} open capture(s) from panel registries`
-                );
-            }
+        if (routing.activeCapture) {
+            return { captures: [routing.activeCapture], mode: 'single' };
         }
 
         // Deterministic open-panel fallback: avoid dropping to no-capture when
@@ -1502,6 +1579,58 @@ export class NetTraceParticipant {
 
         // No panel open — return empty so handleRequest delegates to handleNoCaptureRequest
         return { captures: [], mode: 'single' };
+    }
+
+    private shouldPreferDualOpenCaptureMode(userPrompt: string, openCaptures: CaptureFile[]): boolean {
+        const prompt = userPrompt.toLowerCase();
+        const normalizedPrompt = this.normalizeCaptureIntentText(prompt);
+
+        const explicitDualPhrases = [
+            'open capture context',
+            'open captures',
+            'both captures',
+            'these captures',
+            'client and server',
+            'server and client',
+            'compare',
+            'correlate both',
+            'match the traffic',
+            'match traffic',
+            'analyze both',
+            'evaluate both',
+            'look at both',
+            'as well',
+        ];
+
+        if (explicitDualPhrases.some(phrase => normalizedPrompt.includes(phrase))) {
+            return true;
+        }
+
+        const namedCapturesMentioned = openCaptures.filter(capture => {
+            const normalizedName = this.normalizeCaptureIntentText(capture.name.replace(/\.[^.]+$/, ''));
+            return normalizedName.length > 0 && normalizedPrompt.includes(normalizedName);
+        }).length;
+
+        if (namedCapturesMentioned >= 2) {
+            return true;
+        }
+
+        const mentionsClient = /\bclient\b/.test(normalizedPrompt);
+        const mentionsServer = /\bserver\b/.test(normalizedPrompt);
+        if (mentionsClient && mentionsServer) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private normalizeCaptureIntentText(value: string): string {
+        return value
+            .toLowerCase()
+            .replace(/\.[a-z0-9]+\b/g, ' ')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
     // ─── Followup Suggestions ─────────────────────────────────────────────

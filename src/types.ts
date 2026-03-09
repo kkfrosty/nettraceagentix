@@ -287,8 +287,8 @@ export interface ToolDefinition {
     name: string;
     displayName: string;
     description: string;
-    type: 'tshark-filter' | 'tshark-stats' | 'script' | 'composite';
-    config: TsharkToolConfig | ScriptToolConfig | CompositeToolConfig;
+    type: 'tshark-filter' | 'tshark-stats' | 'script';
+    config: TsharkToolConfig | ScriptToolConfig;
 }
 
 export interface TsharkToolConfig {
@@ -304,13 +304,6 @@ export interface ScriptToolConfig {
     script: string;
     args?: string[];
     outputFormat?: 'json' | 'text';
-}
-
-export interface CompositeToolConfig {
-    steps: Array<{
-        tool: string;
-        inputMapping?: Record<string, string>;
-    }>;
 }
 
 // ─── Prompt / Context Assembly ────────────────────────────────────────────

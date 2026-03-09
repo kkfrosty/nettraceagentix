@@ -4,6 +4,7 @@ import { CapturesTreeProvider } from '../views/capturesTreeProvider';
 import { CaptureWebviewPanel } from '../views/captureWebviewPanel';
 import { LiveCaptureWebviewPanel } from '../views/liveCaptureWebviewPanel';
 import { ConfigLoader } from '../configLoader';
+import { applyFilterToActiveCapturePanel, resolveDefaultCaptureFile } from '../captureRouting';
 
 /**
  * Registers Language Model Tools that the LLM can call during analysis.
@@ -859,58 +860,7 @@ function buildNoCaptureError(capturesTree: CapturesTreeProvider): string {
  * 5. Ambiguous or none → undefined (caller emits buildNoCaptureError)
  */
 function getDefaultCaptureFile(capturesTree: CapturesTreeProvider, outputChannel: vscode.OutputChannel): string | undefined {
-    // Ask the tree — it's the single source of truth for what's open
-    const active = capturesTree.getActiveCapture();
-    if (active) {
-        outputChannel.appendLine(`[Tool] Using active capture (${active.openInPanel ?? 'tree'}): ${active.filePath}`);
-        return active.filePath;
-    }
-
-    // Safety-net rehydration: if tree says nothing is open but panel registries
-    // do have open captures, sync them back into tree state first.
-    let openCaptures = capturesTree.getOpenCaptures();
-    if (openCaptures.length === 0) {
-        const livePath = LiveCaptureWebviewPanel.getActiveCaptureFile();
-        if (livePath) {
-            capturesTree.markOpenInPanel(livePath, 'live');
-        }
-
-        const viewerPanels = CaptureWebviewPanel.getOpenCapturePanels();
-        for (const p of viewerPanels) {
-            capturesTree.markOpenInPanel(p.filePath, 'viewer');
-        }
-
-        openCaptures = capturesTree.getOpenCaptures();
-        if (openCaptures.length > 0) {
-            outputChannel.appendLine(`[Tool] Rehydrated ${openCaptures.length} open capture(s) from panel registries`);
-        }
-    }
-
-    // Multiple panels open but none unambiguously active
-    if (openCaptures.length > 1) {
-        outputChannel.appendLine(
-            `[Tool] ${openCaptures.length} captures open but none unambiguous — returning undefined`
-        );
-        return undefined;
-    }
-
-    const captures = capturesTree.getCaptures();
-
-    // Dual-capture mode fallback: default to client-role capture
-    const clientCapture = captures.find(c => c.role === 'client');
-    if (clientCapture) {
-        outputChannel.appendLine(`[Tool] No active panel — using client-role capture: ${clientCapture.filePath}`);
-        return clientCapture.filePath;
-    }
-
-    // Single capture in tree with no panel open — only safe fallback
-    if (captures.length === 1) {
-        outputChannel.appendLine(`[Tool] Single capture in tree (no panel): ${captures[0].filePath}`);
-        return captures[0].filePath;
-    }
-
-    outputChannel.appendLine(`[Tool] No unambiguous capture file — returning undefined`);
-    return undefined;
+    return resolveDefaultCaptureFile(capturesTree, outputChannel, 'Tool');
 }
 
 /**
@@ -919,18 +869,5 @@ function getDefaultCaptureFile(capturesTree: CapturesTreeProvider, outputChannel
  * and dispatches to the correct panel type.
  */
 function applyFilterToAnyPanel(filter: string, capturesTree: CapturesTreeProvider, outputChannel: vscode.OutputChannel): boolean {
-    const active = capturesTree.getActiveCapture();
-    if (!active?.openInPanel) {
-        outputChannel.appendLine(`[Tool] applyFilterToAnyPanel: no active panel to push filter to`);
-        return false;
-    }
-    if (active.openInPanel === 'live') {
-        const ok = LiveCaptureWebviewPanel.applyFilterToActive(filter);
-        outputChannel.appendLine(`[Tool] applyFilterToAnyPanel: dispatched to live panel → ${ok}`);
-        return ok;
-    }
-    // 'viewer' panel
-    CaptureWebviewPanel.applyFilterToActive(filter);
-    outputChannel.appendLine(`[Tool] applyFilterToAnyPanel: dispatched to viewer panel`);
-    return true;
+    return applyFilterToActiveCapturePanel(filter, capturesTree, outputChannel, 'Tool');
 }

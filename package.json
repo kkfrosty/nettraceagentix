@@ -2,7 +2,7 @@
   "name": "nettrace-agentix",
   "displayName": "NetTrace Agentix",
   "description": "AI-powered network trace and packet capture analysis for VS Code. Uses tshark (Wireshark CLI) to parse pcap and pcapng files, then drives GitHub Copilot to deliver expert network diagnosis, protocol-level troubleshooting, and anomaly detection — like having a network engineer in your editor.",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "publisher": "CognitiveAgentics-KrisFrost",
   "license": "MIT",
   "icon": "media/nettrace-icon.png",
@@ -815,6 +815,13 @@
           "type": "number",
           "default": 1000,
           "description": "Maximum number of packets to include per stream in LLM context.",
+          "scope": "resource"
+        },
+        "nettrace.captureViewerVirtualizationThreshold": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 1000,
+          "description": "Packet-count threshold above which the saved capture viewer switches to a virtualized packet list. Smaller captures keep the normal full table render.",
           "scope": "resource"
         },
         "nettrace.excludeProtocols": {

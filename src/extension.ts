@@ -18,6 +18,7 @@ import { CaptureWebviewPanel } from './views/captureWebviewPanel';
 import { CaptureEditorProvider } from './views/captureEditorProvider';
 import { LiveCaptureWebviewPanel } from './views/liveCaptureWebviewPanel';
 import { CaptureFile } from './types';
+import { applyFilterToActiveCapturePanel } from './captureRouting';
 import { Logger } from './logger';
 import { getNetTraceRootUri, ensureDefaultFiles, validateCustomStoragePath, cleanupGlobalStorage } from './storage';
 
@@ -833,7 +834,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
                 });
             }
             if (filter !== undefined) {
-                CaptureWebviewPanel.applyFilterToActive(filter);
+                applyFilterToActiveCapturePanel(filter, capturesTree, outputChannel, 'Command');
             }
         })
     );

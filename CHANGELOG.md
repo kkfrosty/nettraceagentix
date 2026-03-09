@@ -2,6 +2,17 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
+## [0.1.10] - 2026-03-09
+
+### Fixed
+- **Saved capture viewer large-trace loading** — Large saved captures now page packet windows on demand instead of trying to push the full packet list through the webview in one shot
+- **Saved packet tab responsiveness** — Returning to the Packets tab now reuses cached packet windows and shows an explicit busy indicator while visible rows are being fetched
+- **Live capture packet ceiling** — Removed the 3000-packet live-view cap so completed and in-progress live captures can load the full packet list
+
+### Improved
+- **Saved capture side tabs remain lazy** — Conversations, Protocol Hierarchy, and Expert Info stay deferred until first use and then cache their rendered content
+- **Saved capture virtualization threshold setting** — Added `nettrace.captureViewerVirtualizationThreshold` so large-viewer paging behavior is configurable per workspace
+
 ## [0.1.9] - 2026-03-05
 
 ### Fixed
