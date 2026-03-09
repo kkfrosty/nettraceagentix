@@ -629,8 +629,7 @@ export class LiveCaptureWebviewPanel {
             try {
                 const packetData = await this.tsharkRunner.getPacketsForDisplay(
                     this.session.outputFilePath,
-                    this.lastDisplayFilter,
-                    3000  // cap at 3000 packets while live — keeps UI responsive
+                    this.lastDisplayFilter
                 );
                 const packets = this.parsePacketOutput(packetData);
                 if (packets.length > 0) {
@@ -824,8 +823,7 @@ export class LiveCaptureWebviewPanel {
             this.postMessage({ command: 'applyFilterExt', filter: this.lastDisplayFilter });
             const packetData = await this.tsharkRunner.getPacketsForDisplay(
                 this.session.outputFilePath,
-                this.lastDisplayFilter,
-                this.session.status === 'capturing' ? 3000 : undefined
+                this.lastDisplayFilter
             );
             const packets = this.parsePacketOutput(packetData);
             const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
