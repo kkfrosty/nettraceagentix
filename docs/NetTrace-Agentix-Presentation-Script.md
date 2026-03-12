@@ -10,6 +10,11 @@
    4. AI analysis + manual self-inspection.
    5. Live capture and suspicious traffic detection.
 
+Current limitations
+1 - Large captures in the 100k packet range can load slowly.
+2 - On larger captures with models with smaller contexts, we can run into tool calling issues.  Please create an issue with details if you encounter this.
+
+
 ## 2. Installation Walkthrough (3-5 minutes)
 1. State prerequisites:
    1. VS Code.

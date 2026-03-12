@@ -2,6 +2,20 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
+## [0.1.11] - 2026-03-11
+
+### Added
+- **Go to Packet context menu** — Right-click any packet row and use the inline "Go to Packet #" input to jump directly to a specific packet by number. Works in both saved and live capture viewers.
+
+### Fixed
+- **Live capture minimize gap** — Collapsing the packet detail/hex pane in the live viewer left a visible gap below the packet list. The base `min-height` was overriding the collapsed flex size.
+- **Saved capture scroll on packet select** — Selecting a packet in non-virtual (small capture) mode now scrolls the packet list to center the selected row instead of only highlighting it off-screen.
+
+### Improved
+- **Shared webview utilities** — Extracted duplicated CSS, JS helpers, context menu, and bottom-pane resizer logic from both viewer panels into a single shared module (`webviewSharedUtils.ts`), reducing combined viewer code by ~480 lines.
+- **Unified packet field arguments** — Consolidated repeated tshark field-argument construction in `tsharkRunner.ts` into `buildPacketFieldArgs()` and added `getPacketRangeForDisplay()` / `getMaxPacketNumber()` helpers.
+- **Removed dead types** — Removed unused `LivePreviewPacket` interface and `livePreviewPackets` session field.
+
 ## [0.1.10] - 2026-03-09
 
 ### Fixed
