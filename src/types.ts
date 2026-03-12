@@ -43,17 +43,6 @@ export interface NetworkInterface {
     isLoopback: boolean;
 }
 
-export interface LivePreviewPacket {
-    num: number;
-    time: string;
-    src: string;
-    dst: string;
-    proto: string;
-    len: string;
-    info: string;
-    stream?: string;
-}
-
 /**
  * A live packet capture session managed by the extension.
  * The ChildProcess handle is kept inside TsharkRunner — this type
@@ -84,8 +73,6 @@ export interface LiveCaptureSession {
     stopTime?: Date;
     /** Error message if status === 'error' */
     errorMessage?: string;
-    /** Optional rolling live packet preview parsed from tshark stdout while capture is running */
-    livePreviewPackets?: LivePreviewPacket[];
 }
 
 export interface CaptureSummary {

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
-import { CaptureSummary, TcpStream, StreamAnomaly, ExpertInfoSummary, ExpertInfoEntry, CaptureSignals, NetworkInterface, LiveCaptureSession, LivePreviewPacket } from '../types';
+import { CaptureSummary, TcpStream, StreamAnomaly, ExpertInfoSummary, ExpertInfoEntry, CaptureSignals, NetworkInterface, LiveCaptureSession } from '../types';
 
 /**
  * Manages tshark execution and pcap file parsing.
@@ -250,25 +250,31 @@ export class TsharkRunner {
      * Returns pipe-separated fields: frame.number|time|src|dst|protocol|length|info
      */
     async getPacketRange(captureFile: string, startFrame: number, endFrame: number, filter?: string): Promise<string> {
-        const rangeFilter = `frame.number >= ${startFrame} && frame.number <= ${endFrame}`;
-        const combinedFilter = filter
-            ? `(${rangeFilter}) && (${filter})`
-            : rangeFilter;
+        const args = this.buildPacketFieldArgs({
+            captureFile,
+            filter,
+            startFrame,
+            endFrame,
+            includeStream: false,
+            includeHeader: true,
+        });
 
-        const args = [
-            '-r', captureFile,
-            '-Y', combinedFilter,
-            '-T', 'fields',
-            '-e', 'frame.number',
-            '-e', 'frame.time_relative',
-            '-e', '_ws.col.Source',
-            '-e', '_ws.col.Destination',
-            '-e', '_ws.col.Protocol',
-            '-e', 'frame.len',
-            '-e', '_ws.col.Info',
-            '-E', 'header=y',
-            '-E', 'separator=|',
-        ];
+        return this.runTshark(args);
+    }
+
+    /**
+     * Get packets within a frame number range using the same schema as getPacketsForDisplay().
+     * Returns pipe-separated fields: frame.number|time|src|dst|protocol|length|info|tcp.stream
+     */
+    async getPacketRangeForDisplay(captureFile: string, startFrame: number, endFrame: number, filter?: string): Promise<string> {
+        const args = this.buildPacketFieldArgs({
+            captureFile,
+            filter,
+            startFrame,
+            endFrame,
+            includeStream: true,
+            includeHeader: false,
+        });
 
         return this.runTshark(args);
     }
@@ -300,25 +306,13 @@ export class TsharkRunner {
      * Apply a Wireshark display filter and return matching packets.
      */
     async applyFilter(captureFile: string, filter: string, maxPackets: number = 100): Promise<string> {
-        const args = [
-            '-r', captureFile,
-            '-T', 'fields',
-            '-e', 'frame.number',
-            '-e', 'frame.time_relative',
-            '-e', '_ws.col.Source',
-            '-e', '_ws.col.Destination',
-            '-e', '_ws.col.Protocol',
-            '-e', 'frame.len',
-            '-e', '_ws.col.Info',
-            '-E', 'header=y',
-            '-E', 'separator=|',
-            '-c', maxPackets.toString(),
-        ];
-
-        // Only add filter if non-empty
-        if (filter && filter.trim()) {
-            args.splice(2, 0, '-Y', filter);
-        }
+        const args = this.buildPacketFieldArgs({
+            captureFile,
+            filter,
+            maxPackets,
+            includeStream: false,
+            includeHeader: true,
+        });
 
         const output = await this.runTshark(args);
         return output;
@@ -329,8 +323,42 @@ export class TsharkRunner {
      * Returns pipe-separated fields: frame.number|time|src|dst|protocol|length|info|tcp.stream
      */
     async getPacketsForDisplay(captureFile: string, filter: string = '', maxPackets?: number): Promise<string> {
-        const args = [
-            '-r', captureFile,
+        const args = this.buildPacketFieldArgs({
+            captureFile,
+            filter,
+            maxPackets,
+            includeStream: true,
+            includeHeader: false,
+        });
+
+        return this.runTshark(args);
+    }
+
+    private buildPacketFieldArgs(options: {
+        captureFile: string;
+        filter?: string;
+        startFrame?: number;
+        endFrame?: number;
+        maxPackets?: number;
+        includeStream: boolean;
+        includeHeader: boolean;
+    }): string[] {
+        const args = ['-r', options.captureFile];
+
+        const hasRange = typeof options.startFrame === 'number' && typeof options.endFrame === 'number';
+        const rangeFilter = hasRange
+            ? `frame.number >= ${options.startFrame} && frame.number <= ${options.endFrame}`
+            : '';
+        const trimmedFilter = options.filter?.trim() || '';
+        const combinedFilter = rangeFilter && trimmedFilter
+            ? `(${rangeFilter}) && (${trimmedFilter})`
+            : (rangeFilter || trimmedFilter);
+
+        if (combinedFilter) {
+            args.push('-Y', combinedFilter);
+        }
+
+        args.push(
             '-T', 'fields',
             '-e', 'frame.number',
             '-e', 'frame.time_relative',
@@ -338,22 +366,23 @@ export class TsharkRunner {
             '-e', '_ws.col.Destination',
             '-e', '_ws.col.Protocol',
             '-e', 'frame.len',
-            '-e', '_ws.col.Info',
-            '-e', 'tcp.stream',
-            '-E', 'header=n',
-            '-E', 'separator=|',
-        ];
+            '-e', '_ws.col.Info'
+        );
 
-        if (filter && filter.trim()) {
-            args.splice(2, 0, '-Y', filter);
+        if (options.includeStream) {
+            args.push('-e', 'tcp.stream');
         }
 
-        // Limit packet count during live capture to keep UI responsive.
-        if (maxPackets && maxPackets > 0) {
-            args.push('-c', String(maxPackets));
+        args.push(
+            '-E', `header=${options.includeHeader ? 'y' : 'n'}`,
+            '-E', 'separator=|'
+        );
+
+        if (options.maxPackets && options.maxPackets > 0) {
+            args.push('-c', String(options.maxPackets));
         }
 
-        return this.runTshark(args);
+        return args;
     }
 
     /**
@@ -694,67 +723,6 @@ export class TsharkRunner {
                 `tshark output: ${stderr.trim()}`
             );
         }
-    }
-
-    private parseLivePreviewPacket(line: string): LivePreviewPacket | undefined {
-        if (!line) {
-            return undefined;
-        }
-        const trimmed = line.trim();
-
-        // Preferred format: frame.number|time|src|dst|proto|len|info|stream
-        if (trimmed.includes('|')) {
-            const fields = trimmed.split('|');
-            if (fields.length >= 7) {
-                const num = parseInt((fields[0] || '').trim(), 10);
-                if (!Number.isNaN(num)) {
-                    return {
-                        num,
-                        time: (fields[1] || '').trim(),
-                        src: (fields[2] || '').trim(),
-                        dst: (fields[3] || '').trim(),
-                        proto: (fields[4] || '').trim(),
-                        len: (fields[5] || '').trim(),
-                        info: fields.slice(6, Math.max(7, fields.length - 1)).join('|').trim(),
-                        stream: (fields[fields.length - 1] || '').trim(),
-                    };
-                }
-            }
-        }
-
-        // Fallback A: tshark summary with explicit arrow
-        const m = trimmed.match(/^\s*(\d+)\s+([\d.]+)\s+(.+?)\s+(?:→|->)\s+(.+?)\s+([A-Za-z0-9_.-]+)\s+(\d+)\s+(.*)$/);
-        if (m) {
-            return {
-                num: parseInt(m[1], 10),
-                time: m[2] || '',
-                src: m[3] || '',
-                dst: m[4] || '',
-                proto: m[5] || '',
-                len: m[6] || '',
-                info: m[7] || '',
-                stream: '',
-            };
-        }
-
-        // Fallback B: default tshark columns separated by 2+ spaces:
-        // No.  Time  Source  Destination  Protocol  Length  Info
-        const cols = trimmed.split(/\s{2,}/).map(c => c.trim()).filter(Boolean);
-        if (cols.length >= 7 && /^\d+$/.test(cols[0])) {
-            const num = parseInt(cols[0], 10);
-            return {
-                num,
-                time: cols[1] || '',
-                src: cols[2] || '',
-                dst: cols[3] || '',
-                proto: cols[4] || '',
-                len: cols[5] || '',
-                info: cols.slice(6).join('  '),
-                stream: '',
-            };
-        }
-
-        return undefined;
     }
 
     // ─── Internal Execution ───────────────────────────────────────────────

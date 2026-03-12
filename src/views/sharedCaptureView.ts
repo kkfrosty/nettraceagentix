@@ -63,6 +63,16 @@ export function parsePacketOutput(rawOutput: string): ParsedPacketRow[] {
     return packets;
 }
 
+export function getMaxPacketNumber(packets: ParsedPacketRow[]): number {
+    let maxPacketNumber = 0;
+    for (const packet of packets) {
+        if (packet.number > maxPacketNumber) {
+            maxPacketNumber = packet.number;
+        }
+    }
+    return maxPacketNumber;
+}
+
 export function parseVerboseToTree(verbose: string): ProtoTreeNode[] {
     const nodes: ProtoTreeNode[] = [];
     if (!verbose || verbose.trim().length === 0) { return nodes; }

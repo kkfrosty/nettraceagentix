@@ -4,7 +4,8 @@ import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { TsharkRunner } from '../parsing/tsharkRunner';
 import { NetworkInterface, LiveCaptureSession } from '../types';
-import { ProtoTreeNode, loadPacketDetailIntoWebview, loadPacketHexIntoWebview, parsePacketOutput } from './sharedCaptureView';
+import { ParsedPacketRow, ProtoTreeNode, getMaxPacketNumber, loadPacketDetailIntoWebview, loadPacketHexIntoWebview, parsePacketOutput } from './sharedCaptureView';
+import { getSharedWebviewJs, getSharedCss } from './webviewSharedUtils';
 
 /** Options to pre-fill the panel when opened via AI or command. */
 export interface LiveCapturePrefill {
@@ -58,11 +59,12 @@ export class LiveCaptureWebviewPanel {
     private session: LiveCaptureSession | undefined;
     private refreshTimer: ReturnType<typeof setInterval> | undefined;
     private startTime: Date | undefined;
+    private refreshInFlight: boolean = false;
+    private lastRenderedFrameNumber: number = 0;
+    private lastRenderedDisplayFilter: string = '';
 
     /** Last display filter the user set — preserved across New Capture resets. */
     private lastDisplayFilter: string = '';
-    private lastPushedLivePreviewCount: number = 0;
-    private lastLoggedLivePreviewCount: number = 0;
     private autoStopTimer: ReturnType<typeof setTimeout> | undefined;
     private pendingAutoStopSeconds: number | undefined;
     private pendingAutoAnalyzeOnStop: boolean = false;
@@ -453,11 +455,9 @@ export class LiveCaptureWebviewPanel {
             status: 'starting',
             packetCount: 0,
             startTime: this.startTime,
-            livePreviewPackets: [],
         };
         this.session = session;
-        this.lastPushedLivePreviewCount = 0;
-        this.lastLoggedLivePreviewCount = 0;
+        this.resetRenderedPacketState();
         this.activeAutoAnalyzeOnStop = this.pendingAutoAnalyzeOnStop;
         this.activeTriggerDisplayFilter = this.pendingTriggerDisplayFilter;
         this.activePostTriggerSeconds = this.pendingPostTriggerSeconds;
@@ -534,6 +534,7 @@ export class LiveCaptureWebviewPanel {
         this.clearRefreshTimer();
         this.clearAutoStopTimer();
         this.clearTriggerMonitor();
+        this.resetRenderedPacketState();
         this.activeAutoAnalyzeOnStop = false;
         this.activeTriggerDisplayFilter = undefined;
         this.activePostTriggerSeconds = undefined;
@@ -574,6 +575,7 @@ export class LiveCaptureWebviewPanel {
         this.clearRefreshTimer();
         this.clearAutoStopTimer();
         this.clearTriggerMonitor();
+        this.refreshInFlight = false;
         vscode.commands.executeCommand('setContext', 'nettrace.isCapturing', false);
 
         const outputFile = this.session?.outputFilePath;
@@ -583,15 +585,14 @@ export class LiveCaptureWebviewPanel {
 
         // Do a final full parse so the packet table is fully populated.
         try {
-            const [packetData, conversations, expertInfo, protocolHierarchy] = await Promise.all([
-                this.tsharkRunner.getPacketsForDisplay(outputFile, this.lastDisplayFilter),
+            const [packets, conversations, expertInfo, protocolHierarchy] = await Promise.all([
+                this.readLivePackets({ forceFullReload: true }),
                 this.tsharkRunner.getConversations(outputFile).catch(() => []),
                 this.tsharkRunner.getExpertInfo(outputFile).catch(() => ''),
                 this.tsharkRunner.getProtocolHierarchy(outputFile).catch(() => ''),
             ]);
-            const packets = this.parsePacketOutput(packetData);
             const packetCount = packets.length > 0
-                ? Math.max(...packets.map((packet) => Number(packet.num) || 0))
+                ? getMaxPacketNumber(packets)
                 : (this.session?.packetCount ?? 0);
             if (this.session) {
                 this.session.packetCount = packetCount;
@@ -626,23 +627,22 @@ export class LiveCaptureWebviewPanel {
             if (!this.session?.outputFilePath) { return; }
             // The file may not exist yet if tshark hasn't written the first packet.
             if (!fs.existsSync(this.session.outputFilePath)) { return; }
+            if (this.refreshInFlight) { return; }
             try {
-                const packetData = await this.tsharkRunner.getPacketsForDisplay(
-                    this.session.outputFilePath,
-                    this.lastDisplayFilter
-                );
-                const packets = this.parsePacketOutput(packetData);
+                this.refreshInFlight = true;
+                const packets = await this.readLivePackets();
                 if (packets.length > 0) {
                     const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
-                    const packetCount = Math.max(...packets.map((packet) => Number(packet.num) || 0));
-                    if (this.session) {
-                        this.session.packetCount = packetCount;
-                    }
-                    this.postMessage({ command: 'updatePackets', packets, elapsed, isFinal: false });
-                    this.postMessage({ command: 'packetCountUpdate', count: packetCount, elapsed });
+                    this.postMessage({ command: 'appendPackets', packets, elapsed, isFinal: false });
+                }
+                if (this.session?.packetCount !== undefined) {
+                    const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
+                    this.postMessage({ command: 'packetCountUpdate', count: this.session.packetCount, elapsed });
                 }
             } catch (e) {
                 this.outputChannel.appendLine(`[LiveCapture] refresh read error: ${e}`);
+            } finally {
+                this.refreshInFlight = false;
             }
         }, 1500);
     }
@@ -821,17 +821,55 @@ export class LiveCaptureWebviewPanel {
 
         try {
             this.postMessage({ command: 'applyFilterExt', filter: this.lastDisplayFilter });
-            const packetData = await this.tsharkRunner.getPacketsForDisplay(
-                this.session.outputFilePath,
-                this.lastDisplayFilter
-            );
-            const packets = this.parsePacketOutput(packetData);
+            const packets = await this.readLivePackets({ forceFullReload: true });
             const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
             this.postMessage({ command: 'updatePackets', packets, elapsed, isFinal: this.session.status !== 'capturing' });
         } catch (e) {
             this.outputChannel.appendLine(`[LiveCapture] applyDisplayFilter error: ${e}`);
             this.postMessage({ command: 'filterError', message: `Invalid filter: ${e}` });
         }
+    }
+
+    private resetRenderedPacketState(): void {
+        this.refreshInFlight = false;
+        this.lastRenderedFrameNumber = 0;
+        this.lastRenderedDisplayFilter = this.lastDisplayFilter.trim();
+    }
+
+    private async readLivePackets(options?: { forceFullReload?: boolean }): Promise<ParsedPacketRow[]> {
+        if (!this.session?.outputFilePath) {
+            return [];
+        }
+
+        const captureFile = this.session.outputFilePath;
+        const displayFilter = this.lastDisplayFilter.trim();
+        const forceFullReload = options?.forceFullReload === true;
+        const currentFrameCount = Math.max(this.session.packetCount ?? 0, 0);
+        const canAppendRange = !forceFullReload
+            && this.lastRenderedDisplayFilter === displayFilter
+            && currentFrameCount > this.lastRenderedFrameNumber;
+
+        let packets: ParsedPacketRow[];
+
+        if (canAppendRange) {
+            const packetData = await this.tsharkRunner.getPacketRangeForDisplay(
+                captureFile,
+                this.lastRenderedFrameNumber + 1,
+                currentFrameCount,
+                displayFilter
+            );
+            packets = parsePacketOutput(packetData);
+            if (packets.length > 0) {
+                this.lastRenderedFrameNumber = Math.max(this.lastRenderedFrameNumber, getMaxPacketNumber(packets));
+            }
+        } else {
+            const packetData = await this.tsharkRunner.getPacketsForDisplay(captureFile, displayFilter);
+            packets = parsePacketOutput(packetData);
+            this.lastRenderedFrameNumber = packets.length > 0 ? getMaxPacketNumber(packets) : 0;
+        }
+
+        this.lastRenderedDisplayFilter = displayFilter;
+        return packets;
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────
@@ -872,19 +910,6 @@ export class LiveCaptureWebviewPanel {
         return path.join(baseDir, filename);
     }
 
-    private parsePacketOutput(raw: string): any[] {
-        return parsePacketOutput(raw).map((packet) => ({
-            num: packet.number,
-            time: packet.time,
-            src: packet.source,
-            dst: packet.destination,
-            proto: packet.protocol,
-            len: String(packet.length),
-            info: packet.info,
-            stream: packet.stream,
-        }));
-    }
-
     private postMessage(msg: object): void {
         try {
             this.panel.webview.postMessage(msg);
@@ -895,6 +920,7 @@ export class LiveCaptureWebviewPanel {
         this.clearRefreshTimer();
         this.clearAutoStopTimer();
         this.clearTriggerMonitor();
+        this.resetRenderedPacketState();
         this.activeAutoAnalyzeOnStop = false;
         this.activeTriggerDisplayFilter = undefined;
         this.activePostTriggerSeconds = undefined;
@@ -957,6 +983,7 @@ export class LiveCaptureWebviewPanel {
     --filter-h:        30px;
     --status-h:        24px;
 }
+${getSharedCss()}
 
 body {
     margin: 0;
@@ -1202,34 +1229,6 @@ body {
     display: flex;
     flex-direction: column;
 }
-.side-panel {
-    padding: 12px;
-    overflow: auto;
-}
-
-/* ── Packet context menu ─────────────────────────────── */
-.ctx-menu {
-    position: fixed;
-    z-index: 1000;
-    background: var(--toolbar-bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 4px 0;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-    min-width: 220px;
-    font-size: 12px;
-}
-.ctx-menu-item {
-    padding: 5px 16px;
-    cursor: pointer;
-    white-space: nowrap;
-}
-.ctx-menu-item:hover { background: var(--row-hover); }
-.ctx-menu-sep {
-    height: 1px;
-    background: var(--border);
-    margin: 4px 0;
-}
 
 /* ── Conversations / expert / protocols ─────────────── */
 .conv-table { table-layout: auto; }
@@ -1244,32 +1243,6 @@ body {
     height: 24px;
 }
 .btn-icon:hover { background: var(--row-hover); }
-.proto-item {
-    display: flex;
-    justify-content: space-between;
-    padding: 3px 8px;
-    border-bottom: 1px solid var(--border);
-}
-.proto-name { font-weight: 500; }
-.proto-count { color: var(--desc); }
-.expert-entry {
-    padding: 4px 8px;
-    font-family: var(--mono);
-    font-size: 12px;
-    border-left: 3px solid transparent;
-    margin-bottom: 2px;
-}
-.expert-error { border-left-color: #f44; background: rgba(255,0,0,0.05); }
-.expert-warning { border-left-color: #fa0; background: rgba(255,165,0,0.05); }
-.expert-note { border-left-color: #0af; background: rgba(0,170,255,0.05); }
-.badge {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 10px;
-    font-size: 11px;
-}
-.badge-warning { background: rgba(255,165,0,0.2); color: #fa0; }
-.badge-ok { color: #4c4; }
 .row-error > td { background: rgba(255, 0, 0, 0.08); }
 .row-warning > td { background: rgba(255, 165, 0, 0.08); }
 #protocol-raw {
@@ -1471,20 +1444,14 @@ col.c-info { width: auto; }
 .ws-hex.collapsed { flex: 0 0 26px !important; overflow: hidden; }
 .ws-hex.collapsed .ws-pane-body { display: none; }
 .ws-hex.collapsed .ws-pane-header span { display: none; }
-.ws-bottom.all-collapsed { flex: 0 0 26px !important; overflow: hidden; }
+.ws-bottom.all-collapsed { flex: 0 0 26px !important; min-height: 0 !important; overflow: hidden; }
 .ws-bottom.all-collapsed .ws-detail .ws-pane-body,
 .ws-bottom.all-collapsed #liveDetailContent,
 .ws-bottom.all-collapsed .ws-hex { display: none; }
 .ws-bottom.all-collapsed + .ws-splitter,
 .live-bottom-collapsed .ws-splitter { display: none !important; }
-/* Proto tree */
+/* ws-empty: keep viewer-specific padding */
 .ws-empty { color: var(--vscode-descriptionForeground); padding: 8px; font-size: 12px; }
-.proto-tree { font-family: var(--mono); font-size: 12px; padding: 4px 0; }
-.proto-node { padding: 1px 0; line-height: 1.5; white-space: nowrap; }
-.proto-toggle { cursor: pointer; display: inline-block; width: 16px; text-align: center; font-size: 10px; }
-.proto-header  { font-weight: 600; }
-.proto-field   { color: var(--fg); }
-.proto-label:hover { background: var(--hover-bg, rgba(255,255,255,0.07)); border-radius: 2px; }
 </style>
 </head>
 <body>
@@ -1619,6 +1586,8 @@ col.c-info { width: auto; }
 </div>
 
 <script>
+${getSharedWebviewJs()}
+var esc = escapeHtml;
 const vscode = acquireVsCodeApi();
 
 // ── Error trap ───────────────────────────────────────────────────
@@ -1791,51 +1760,13 @@ function openInterfaceMenu() {
     ifaceMenu.classList.add('visible');
 }
 
-function setBottomHeight(heightPx) {
-    if (!mainLayout) { return; }
-    const layoutHeight = mainLayout.getBoundingClientRect().height || 0;
-    const maxHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.floor(layoutHeight * 0.75));
-    const nextHeight = Math.max(MIN_BOTTOM_HEIGHT, Math.min(heightPx, maxHeight));
-    mainLayout.style.setProperty('--ws-bottom-height', nextHeight + 'px');
-    wsBottom.dataset.lastHeight = String(nextHeight);
-}
-
-function restoreBottomHeight() {
-    const lastHeight = parseInt(wsBottom.dataset.lastHeight || '', 10);
-    setBottomHeight(Number.isNaN(lastHeight) ? DEFAULT_BOTTOM_HEIGHT : lastHeight);
-}
-
-(function initializeBottomResizer() {
-    if (!wsBottomSplitter || !mainLayout) { return; }
-
-    let dragging = false;
-
-    function stopDragging() {
-        if (!dragging) { return; }
-        dragging = false;
-        wsBottomSplitter.classList.remove('dragging');
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-    }
-
-    wsBottomSplitter.addEventListener('mousedown', function(e) {
-        if (wsBottom.style.display === 'none' || wsBottom.classList.contains('all-collapsed')) { return; }
-        dragging = true;
-        wsBottomSplitter.classList.add('dragging');
-        document.body.style.cursor = 'row-resize';
-        document.body.style.userSelect = 'none';
-        e.preventDefault();
-    });
-
-    window.addEventListener('mousemove', function(e) {
-        if (!dragging || !mainLayout) { return; }
-        const layoutRect = mainLayout.getBoundingClientRect();
-        setBottomHeight(layoutRect.bottom - e.clientY);
-    });
-
-    window.addEventListener('mouseup', stopDragging);
-    window.addEventListener('mouseleave', stopDragging);
-})();
+var _bottomResizer = initBottomResizer(
+    mainLayout, wsBottomSplitter, wsBottom,
+    function() { return wsBottom.style.display === 'none' || wsBottom.classList.contains('all-collapsed'); },
+    MIN_BOTTOM_HEIGHT, DEFAULT_BOTTOM_HEIGHT
+);
+var setBottomHeight = _bottomResizer.setHeight;
+var restoreBottomHeight = _bottomResizer.restoreHeight;
 // Signal the script has started executing (fires before any DOM work)
 log('Script started — DOM ready, acquireVsCodeApi OK');
 
@@ -1977,7 +1908,7 @@ if (ifaceMenuSetDefault) {
 }
 
 document.addEventListener('click', (e) => {
-    closePacketContextMenu(e.target);
+    closeCtxMenu(e.target);
     if (!ifaceMenu || !btnIfaceMenu) { return; }
     if (!ifaceMenu.classList.contains('visible')) { return; }
     const target = e.target;
@@ -2021,7 +1952,25 @@ pktBody.addEventListener('contextmenu', e => {
     const tr = e.target.closest('tr[data-packet]');
     if (!tr) { return; }
     selectPacketRow(tr);
-    showPacketContextMenu(e.clientX, e.clientY, tr);
+    var menuItems = buildPacketMenuItems(tr);
+    showCtxMenu(e.clientX, e.clientY, menuItems, function(filter) {
+        applyDisplayFilter(filter);
+    }, function(action, item) {
+        if (action === 'analyzePacket') {
+            vscode.postMessage({ command: 'analyzePacket', packetNumber: item.packet });
+        } else if (action === 'analyzeStream') {
+            vscode.postMessage({ command: 'analyzeStream', streamIndex: parseInt(item.stream, 10) });
+        } else if (action === 'goToPacket') {
+            var gotoNum = parseInt(item.packet, 10);
+            if (!isNaN(gotoNum) && gotoNum > 0) {
+                var targetTr = pktBody.querySelector('tr[data-packet="' + gotoNum + '"]');
+                if (targetTr) {
+                    selectPacketRow(targetTr);
+                    targetTr.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                }
+            }
+        }
+    });
 });
 
 // ── Detail / hex pane collapse toggles ──────────────────────────────
@@ -2081,13 +2030,6 @@ pktBody.addEventListener('dblclick', e => {
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────
-function closePacketContextMenu(target) {
-    const menu = document.getElementById('ctxMenu');
-    if (menu && (!target || !menu.contains(target))) {
-        menu.remove();
-    }
-}
-
 function selectPacketRow(tr) {
     if (selectedTr) { selectedTr.classList.remove('selected'); }
     tr.classList.add('selected');
@@ -2110,72 +2052,6 @@ function applyDisplayFilter(filter) {
     displayFilter = filter.trim();
     hideBanner();
     vscode.postMessage({ command: 'updateDisplayFilter', filter: displayFilter });
-}
-
-function showPacketContextMenu(x, y, tr) {
-    closePacketContextMenu();
-
-    const src = tr.dataset.src || '';
-    const dst = tr.dataset.dst || '';
-    const proto = tr.dataset.proto || '';
-    const stream = tr.dataset.stream || '';
-    const packetNum = tr.dataset.packet || tr.dataset.f || '';
-
-    const items = [];
-    if (stream !== '') {
-        items.push({ label: 'Filter: TCP Conversation (stream ' + stream + ')', filter: 'tcp.stream == ' + stream });
-    }
-    if (src) {
-        items.push({ label: 'Filter: Source → ' + src, filter: 'ip.addr == ' + src });
-    }
-    if (dst) {
-        items.push({ label: 'Filter: Destination → ' + dst, filter: 'ip.addr == ' + dst });
-    }
-    if (src && dst) {
-        items.push({ label: 'Filter: Conversation ' + src + ' ↔ ' + dst, filter: 'ip.addr == ' + src + ' && ip.addr == ' + dst });
-    }
-    if (proto) {
-        items.push({ label: 'Filter: Protocol ' + proto, filter: proto.toLowerCase() });
-    }
-    items.push(null);
-    items.push({ label: 'Analyze Packet #' + packetNum + ' with AI', action: 'analyzePacket', packet: packetNum });
-    if (stream !== '') {
-        items.push({ label: 'Analyze TCP Stream ' + stream + ' with AI', action: 'analyzeStream', stream: stream });
-    }
-
-    const menu = document.createElement('div');
-    menu.id = 'ctxMenu';
-    menu.className = 'ctx-menu';
-    menu.style.left = x + 'px';
-    menu.style.top = y + 'px';
-
-    for (const item of items) {
-        if (item === null) {
-            const sep = document.createElement('div');
-            sep.className = 'ctx-menu-sep';
-            menu.appendChild(sep);
-            continue;
-        }
-        const mi = document.createElement('div');
-        mi.className = 'ctx-menu-item';
-        mi.textContent = item.label;
-        mi.addEventListener('click', () => {
-            menu.remove();
-            if (item.filter) {
-                applyDisplayFilter(item.filter);
-            } else if (item.action === 'analyzePacket') {
-                vscode.postMessage({ command: 'analyzePacket', packetNumber: item.packet });
-            } else if (item.action === 'analyzeStream') {
-                vscode.postMessage({ command: 'analyzeStream', streamIndex: parseInt(item.stream, 10) });
-            }
-        });
-        menu.appendChild(mi);
-    }
-
-    document.body.appendChild(menu);
-    const rect = menu.getBoundingClientRect();
-    if (rect.right > window.innerWidth) { menu.style.left = (window.innerWidth - rect.width - 4) + 'px'; }
-    if (rect.bottom > window.innerHeight) { menu.style.top = (window.innerHeight - rect.height - 4) + 'px'; }
 }
 
 function startCapture(iface, dispName) {
@@ -2272,15 +2148,6 @@ function protoClass(p) {
     return '';
 }
 
-function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-function formatBytes(bytes) {
-    const num = Number(bytes) || 0;
-    if (num < 1024) { return num + ' B'; }
-    if (num < 1024 * 1024) { return (num / 1024).toFixed(1) + ' KB'; }
-    return (num / (1024 * 1024)).toFixed(1) + ' MB';
-}
-
 function pad2(n) { return String(n).padStart(2,'0'); }
 function fmtElapsed(s) {
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
@@ -2298,84 +2165,57 @@ function shortFileLabel(value) {
     return fileName.slice(0, 24) + '…' + fileName.slice(-(max - 25));
 }
 
-// ── Proto tree rendering (mirrors captureWebviewPanel) ──────────────
-function renderProtoTree(nodes) {
-    if (!nodes || nodes.length === 0) {
-        return '<div class="ws-empty">No detail available.</div>';
-    }
-    var html = '<div class="proto-tree">';
-    for (var i = 0; i < nodes.length; i++) {
-        var isLast = (i === nodes.length - 1);
-        html += renderProtoNode(nodes[i], 0, isLast);
-    }
-    html += '</div>';
-    return html;
-}
-
-function renderProtoNode(node, depth, startExpanded) {
-    var hasChildren = node.children && node.children.length > 0;
-    var indent = depth * 16;
-    var id = 'pn_' + Math.random().toString(36).substr(2, 9);
-    var expanded = startExpanded === true;
-    var html = '<div class="proto-node" style="padding-left:' + indent + 'px;">';
-    if (hasChildren) {
-        var arrow = expanded ? '\u25bc' : '\u25ba';
-        var displayStyle = expanded ? 'block' : 'none';
-        html += '<span class="proto-toggle" data-toggle="' + id + '" id="toggle_' + id + '">' + arrow + '</span> ';
-        html += '<span class="proto-label ' + (depth === 0 ? 'proto-header' : 'proto-field') + '">' + esc(node.showname) + '</span>';
-        html += '<div class="proto-children" id="' + id + '" style="display:' + displayStyle + ';">';
-        for (var ci = 0; ci < node.children.length; ci++) {
-            html += renderProtoNode(node.children[ci], depth + 1, false);
-        }
-        html += '</div>';
-    } else {
-        html += '<span style="display:inline-block;width:16px;"></span> ';
-        html += '<span class="proto-field">' + esc(node.showname) + '</span>';
-    }
-    html += '</div>';
-    return html;
-}
-
 function renderPackets(packets) {
     if (!Array.isArray(packets) || packets.length === 0) {
         pktBody.innerHTML = '';
+        selectedTr = null;
         tableWrap.style.display = 'none';
         if (!isCapturing) {
             emptyState.style.display = 'flex';
         }
         return;
     }
+    pktBody.innerHTML = '';
+    appendPackets(packets);
+}
+
+function appendPackets(packets) {
+    if (!Array.isArray(packets) || packets.length === 0) {
+        return;
+    }
     const wasBottom = autoScroll;
     const frag = document.createDocumentFragment();
     for (const p of packets) {
-        const tr = document.createElement('tr');
-        tr.dataset.f = p.num;
-        tr.dataset.packet = p.num;
-        tr.dataset.src = p.src || '';
-        tr.dataset.dst = p.dst || '';
-        tr.dataset.proto = p.proto || '';
-        tr.dataset.stream = p.stream || '';
-        const pc = protoClass(p.proto);
-        if (pc) {
-            tr.classList.add(pc);
-        }
-        tr.innerHTML =
-            '<td>' + p.num + '</td>' +
-            '<td>' + esc(p.time || '') + '</td>' +
-            '<td>' + esc(p.src  || '') + '</td>' +
-            '<td>' + esc(p.dst  || '') + '</td>' +
-            '<td class="' + pc + '">' + esc(p.proto || '') + '</td>' +
-            '<td>' + esc(p.len  || '') + '</td>' +
-            '<td>' + esc(p.info || '') + '</td>';
-        frag.appendChild(tr);
+        frag.appendChild(createPacketRow(p));
     }
-    // Replace entire body on each refresh (tshark returns all packets from file start)
-    pktBody.innerHTML = '';
     pktBody.appendChild(frag);
     emptyState.style.display  = 'none';
     tableWrap.style.display   = 'block';
     hasData = true;
     if (wasBottom) { tableWrap.scrollTop = tableWrap.scrollHeight; }
+}
+
+function createPacketRow(p) {
+    const tr = document.createElement('tr');
+    tr.dataset.f = p.number;
+    tr.dataset.packet = p.number;
+    tr.dataset.src = p.source || '';
+    tr.dataset.dst = p.destination || '';
+    tr.dataset.proto = p.protocol || '';
+    tr.dataset.stream = p.stream || '';
+    const pc = protoClass(p.protocol);
+    if (pc) {
+        tr.classList.add(pc);
+    }
+    tr.innerHTML =
+        '<td>' + p.number + '</td>' +
+        '<td>' + esc(p.time || '') + '</td>' +
+        '<td>' + esc(p.source || '') + '</td>' +
+        '<td>' + esc(p.destination || '') + '</td>' +
+        '<td class="' + pc + '">' + esc(p.protocol || '') + '</td>' +
+        '<td>' + esc(String(p.length ?? '')) + '</td>' +
+        '<td>' + esc(p.info || '') + '</td>';
+    return tr;
 }
 
 function populateInterfaces(ifaces, suggested) {
@@ -2528,6 +2368,12 @@ window.addEventListener('message', e => {
             renderPackets(Array.isArray(msg.packets) ? msg.packets : []);
             if (msg.elapsed !== undefined) { elapsedSec = msg.elapsed; }
             if (msg.isFinal && clockTimer) { clearInterval(clockTimer); clockTimer = null; }
+            break;
+
+        case 'appendPackets':
+            if (isPausedMain || !isCapturing) { break; }
+            appendPackets(Array.isArray(msg.packets) ? msg.packets : []);
+            if (msg.elapsed !== undefined) { elapsedSec = msg.elapsed; }
             break;
 
         case 'captureComplete':
