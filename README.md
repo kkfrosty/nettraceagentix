@@ -131,7 +131,7 @@ You can also manually configure the path in VS Code settings (see [Configuration
 5. **Install the VSIX in VS Code:**
 
    ```bash
-   code --install-extension Release/nettrace-agentix-0.1.6.vsix
+   code --install-extension Release/nettrace-agentix-0.1.12.vsix
    ```
 
    Or in VS Code: **Extensions** sidebar → `...` menu → **Install from VSIX...** → select the `.vsix` file.

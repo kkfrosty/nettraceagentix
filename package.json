@@ -388,13 +388,13 @@
         "name": "nettrace-startCapture",
         "displayName": "Start Live Capture",
         "description": "Opens the Live Capture panel to capture network traffic in real-time",
-        "modelDescription": "Opens a Wireshark-style Live Capture panel that lets the user capture live network traffic via tshark. Use this when the user asks to capture, record, sniff, monitor, or start a trace. Resolves the best network interface from the hint provided. If autoStart=true, the capture begins immediately. If autoStart=false, the panel opens pre-filled and the user clicks Start. Optional durationSeconds schedules automatic stop after N seconds. Optional triggerDisplayFilter + postTriggerSeconds enables event-driven capture (continue N seconds after trigger match). Optional autoAnalyzeOnStop opens @nettrace diagnosis automatically when stop completes.",
+        "modelDescription": "Opens a Wireshark-style Live Capture panel that lets the user capture live network traffic via tshark. Use this when the user asks to capture, record, sniff, monitor, or start a trace. Resolves the best network interface from the hint provided. When the user asks to filter or limit captured traffic, set captureFilter to a BPF expression. Common BPF translations: DNS → 'port 53', TLS/HTTPS → 'port 443', HTTP → 'port 80', DHCP → 'port 67 or port 68', multiple protocols → combine with 'or' (e.g. 'port 53 or port 443'). If autoStart=true, the capture begins immediately. If autoStart=false, the panel opens pre-filled and the user clicks Start. Optional durationSeconds schedules automatic stop after N seconds. Optional triggerDisplayFilter + postTriggerSeconds enables event-driven capture (continue N seconds after trigger match). Optional autoAnalyzeOnStop opens @nettrace diagnosis automatically when stop completes.",
         "inputSchema": {
           "type": "object",
           "properties": {
             "captureFilter": {
               "type": "string",
-              "description": "BPF capture filter expression applied at the OS level (e.g. 'tcp port 443 and host 192.168.1.1'). Leave empty for all traffic."
+              "description": "BPF capture filter expression applied at the OS level. Common mappings: DNS → 'port 53', TLS/HTTPS/SSL → 'port 443', HTTP → 'port 80', DHCP → 'port 67 or port 68', ICMP → 'icmp', specific host → 'host 10.0.0.1', combine with 'or'/'and' (e.g. 'port 53 or port 443'). Leave empty for all traffic."
             },
             "interfaceHint": {
               "type": "string",

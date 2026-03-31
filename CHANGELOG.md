@@ -2,15 +2,20 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
-## [0.1.12] - 2026-03-12
+## [0.1.12] - 2026-03-30
 
 ### Added
 - **Packet field to bytes highlighting** — Clicking a protocol field in Packet Detail now highlights the corresponding byte range in Packet Bytes for both saved and live capture viewers.
 - **Chat packet navigation links** — Packet and frame references in single-capture AI analysis responses now link back to the analyzed capture panel and select that packet directly.
 - **Versioned roadmap docs** — Added `docs/roadmap/` with per-version planning files so implementation can continue in fresh threads without losing release scope.
 
+### Fixed
+- **Live capture packet count showing 0** — The live capture stat counter relied solely on parsing tshark stderr progress output, which is suppressed on Windows when stdio is piped. The refresh timer now derives the count from actual parsed packet data so the counter stays accurate regardless of platform.
+- **Capture filters not applied from AI requests** — When the AI started a live capture with a user-requested filter (e.g. "only DNS and TLS"), the BPF filter was not reliably generated. Improved model guidance with common protocol-to-BPF mappings (DNS → `port 53`, TLS → `port 443`, etc.) and explicit instructions in the tool description.
+
 ### Improved
 - **Packet detail hierarchy rendering** — Shared protocol-tree rendering now uses stronger visual indentation and row structure so nested fields read more like a real packet hierarchy.
+- **Protocol tree collapsed by default** — Packet Detail nodes now start collapsed instead of expanded, matching Wireshark's default behavior. Uses CSS-driven `data-expanded` attribute for reliable toggle state.
 - **PDML detail metadata preservation** — Shared packet-detail parsing now retains PDML byte offsets and field sizes, enabling viewer interactions without duplicating parsing logic.
 
 ## [0.1.11] - 2026-03-11

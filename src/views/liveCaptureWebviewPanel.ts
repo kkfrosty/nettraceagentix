@@ -640,6 +640,11 @@ export class LiveCaptureWebviewPanel {
                     const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
                     this.postMessage({ command: 'appendPackets', packets, elapsed, isFinal: false });
                 }
+                // Derive packet count from actual parsed data when stderr progress
+                // parsing doesn't report it (common on Windows with piped stdio).
+                if (this.session && this.lastRenderedFrameNumber > this.session.packetCount) {
+                    this.session.packetCount = this.lastRenderedFrameNumber;
+                }
                 if (this.session?.packetCount !== undefined) {
                     const elapsed = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
                     this.postMessage({ command: 'packetCountUpdate', count: this.session.packetCount, elapsed });
