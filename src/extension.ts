@@ -816,6 +816,70 @@ async function activateInternal(context: vscode.ExtensionContext) {
         })
     );
 
+    // Select Packet In Capture — used by chat links to reveal a capture and focus a packet.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nettrace.selectPacketInCapture', async (captureFile?: string, packetNumber?: number) => {
+            const targetPacket = Number(packetNumber);
+            if (!Number.isFinite(targetPacket) || targetPacket <= 0) {
+                return;
+            }
+
+            if (captureFile) {
+                const viewer = CaptureWebviewPanel.getPanel(captureFile);
+                if (viewer) {
+                    viewer.revealAndSelectPacket(targetPacket);
+                    return;
+                }
+
+                const livePanel = LiveCaptureWebviewPanel.getActivePanel();
+                if (livePanel && LiveCaptureWebviewPanel.getActiveCaptureFile() === captureFile) {
+                    livePanel.revealAndSelectPacket(targetPacket);
+                    return;
+                }
+
+                const capture = capturesTree.getCaptures().find(c => c.filePath === captureFile);
+                if (capture) {
+                    const reopened = CaptureWebviewPanel.createOrShow(context.extensionUri, capture, tsharkRunner, outputChannel);
+                    reopened.revealAndSelectPacket(targetPacket);
+                    return;
+                }
+
+                if (fs.existsSync(captureFile)) {
+                    const reopened = CaptureWebviewPanel.createOrShow(
+                        context.extensionUri,
+                        {
+                            filePath: captureFile,
+                            name: path.basename(captureFile),
+                            sizeBytes: 0,
+                            parsed: false,
+                        },
+                        tsharkRunner,
+                        outputChannel
+                    );
+                    reopened.revealAndSelectPacket(targetPacket);
+                    return;
+                }
+
+                vscode.window.showInformationMessage('Open the referenced capture panel to jump to that packet.');
+                return;
+            }
+
+            const livePanel = LiveCaptureWebviewPanel.getActivePanel();
+            if (livePanel && LiveCaptureWebviewPanel.getActiveCaptureFile()) {
+                livePanel.revealAndSelectPacket(targetPacket);
+                return;
+            }
+
+            const activeCaptureFile = CaptureWebviewPanel.getActiveCaptureFile();
+            if (activeCaptureFile) {
+                const viewer = CaptureWebviewPanel.getPanel(activeCaptureFile);
+                if (viewer) {
+                    viewer.revealAndSelectPacket(targetPacket);
+                }
+            }
+        })
+    );
+
     // Close Capture — closes the active webview panel so user can start fresh
     context.subscriptions.push(
         vscode.commands.registerCommand('nettrace.closeCapture', async () => {

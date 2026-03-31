@@ -865,6 +865,8 @@ export class NetTraceParticipant {
             `reserve=${Math.round(toolReserveFraction * 100)}%, tokenLimit=${tokenLimit}`
         );
         let roundTrip = 0;
+        const linkedCaptureFile = captures.length === 1 ? captures[0].filePath : undefined;
+        const writeModelMarkdown = this.createPacketLinkWriter(stream, linkedCaptureFile);
 
         while (roundTrip < NetTraceParticipant.MAX_TOOL_ROUNDTRIPS) {
             roundTrip++;
@@ -927,9 +929,10 @@ export class NetTraceParticipant {
                 const finalResponse = await this.logAndSend(model, messages, {}, token, 'budget-cap final');
                 for await (const part of finalResponse.stream) {
                     if (part instanceof vscode.LanguageModelTextPart) {
-                        stream.markdown(part.value);
+                        writeModelMarkdown(part.value);
                     }
                 }
+                writeModelMarkdown('', true);
                 this.outputChannel.appendLine(`[ChatParticipant] Done (${roundTrip} round trip(s), budget-capped)`);
                 break;
             }
@@ -959,9 +962,10 @@ export class NetTraceParticipant {
                     );
                     for await (const part of fallbackResponse.stream) {
                         if (part instanceof vscode.LanguageModelTextPart) {
-                            stream.markdown(part.value);
+                            writeModelMarkdown(part.value);
                         }
                     }
+                    writeModelMarkdown('', true);
                     this.outputChannel.appendLine(`[ChatParticipant] Done (fallback, no tools)`);
                     break;
                 }
@@ -973,12 +977,13 @@ export class NetTraceParticipant {
 
             for await (const part of chatResponse.stream) {
                 if (part instanceof vscode.LanguageModelTextPart) {
-                    stream.markdown(part.value);
+                    writeModelMarkdown(part.value);
                     textParts.push(part.value);
                 } else if (part instanceof vscode.LanguageModelToolCallPart) {
                     toolCallParts.push(part);
                 }
             }
+            writeModelMarkdown('', true);
 
             if (toolCallParts.length === 0) {
                 this.outputChannel.appendLine(`[ChatParticipant] Done (${roundTrip} round trip(s))`);
@@ -1464,6 +1469,51 @@ export class NetTraceParticipant {
 
         const cleanPrompt = prompt.replace(markerRe, '').replace(/\s{2,}/g, ' ').trim();
         return { prompt: cleanPrompt || 'Analyze this capture.', captureFileOverride: decoded };
+    }
+
+    private createPacketLinkWriter(
+        stream: vscode.ChatResponseStream,
+        captureFile?: string
+    ): (chunk: string, flushAll?: boolean) => void {
+        let pending = '';
+
+        return (chunk: string, flushAll: boolean = false) => {
+            if (chunk) {
+                pending += chunk;
+            }
+
+            const flushLength = flushAll ? pending.length : Math.max(0, pending.length - 48);
+            if (flushLength <= 0) {
+                return;
+            }
+
+            const output = pending.slice(0, flushLength);
+            pending = pending.slice(flushLength);
+            if (output.length > 0) {
+                stream.markdown(this.linkifyPacketReferences(output, captureFile));
+            }
+
+            if (flushAll && pending.length > 0) {
+                stream.markdown(this.linkifyPacketReferences(pending, captureFile));
+                pending = '';
+            }
+        };
+    }
+
+    private linkifyPacketReferences(markdown: string, captureFile?: string): string {
+        if (!captureFile) {
+            return markdown;
+        }
+
+        return markdown.replace(/\b(packet|frame)\s+#?(\d+)\b/gi, (match, _label, frameValue) => {
+            const frameNumber = Number.parseInt(frameValue, 10);
+            if (!Number.isFinite(frameNumber) || frameNumber <= 0) {
+                return match;
+            }
+
+            const args = encodeURIComponent(JSON.stringify([captureFile, frameNumber]));
+            return `[${match}](command:nettrace.selectPacketInCapture?${args})`;
+        });
     }
 
     // ─── Capture Selection ────────────────────────────────────────────────

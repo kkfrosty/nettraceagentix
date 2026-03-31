@@ -148,6 +148,11 @@ export class LiveCaptureWebviewPanel {
         return LiveCaptureWebviewPanel.instance;
     }
 
+    public revealAndSelectPacket(packetNumber: number): void {
+        this.panel.reveal(vscode.ViewColumn.One);
+        this.postMessage({ command: 'selectPacket', packetNumber });
+    }
+
     /**
      * Returns the output file path of the most recent live capture session.
      * Remains set after the user switches away to Copilot Chat, so the participant
@@ -1407,15 +1412,29 @@ col.c-info { width: auto; }
 }
 .ws-detail {
     flex: 1;
-    overflow: auto;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
     border-right: 2px solid var(--border);
+}
+.ws-detail > #liveDetailContent {
+    overflow: auto;
+    flex: 1;
+    min-height: 0;
 }
 .ws-hex {
     flex: 0 0 42%;
     max-width: 52%;
-    overflow: auto;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
     font-family: var(--mono);
     font-size: 11px;
+}
+.ws-hex > .ws-pane-body {
+    overflow: auto;
+    flex: 1;
+    min-height: 0;
 }
 .ws-pane-header {
     display: flex;
@@ -1575,7 +1594,7 @@ col.c-info { width: auto; }
                 <button class="pane-toggle" id="btnToggleHex" title="Minimize">&#9664;</button>
             </div>
             <div class="ws-pane-body">
-                <pre id="liveHexContent" style="padding: 4px 8px; margin: 0;">Click a packet above to see hex dump</pre>
+                <div id="liveHexContent" style="padding: 4px 8px; margin: 0;">Click a packet above to see hex dump</div>
             </div>
         </div>
     </div>
@@ -1657,6 +1676,7 @@ const liveHexContent    = document.getElementById('liveHexContent');
 const mainLayout        = document.getElementById('main');
 const MIN_BOTTOM_HEIGHT = 80;
 const DEFAULT_BOTTOM_HEIGHT = 220;
+let pendingHexHighlight = null;
 
 // ── Logging helper ──────────────────────────────────────────────────
 function log(text) { vscode.postMessage({ command: 'log', text: String(text) }); }
@@ -1681,6 +1701,7 @@ function initializeUiState() {
     elapsedSec = 0;
     autoScroll = true;
     selectedTr = null;
+    pendingHexHighlight = null;
     isPausedMain = false;
     pktBody.innerHTML = '';
     tableWrap.style.display = 'none';
@@ -1688,7 +1709,7 @@ function initializeUiState() {
     if (wsBottomSplitter) { wsBottomSplitter.style.display = 'none'; }
     wsBottom.style.display = 'none';
     liveDetailContent.innerHTML = '<div class="ws-empty">Click a packet row to inspect its fields.</div>';
-    liveHexContent.textContent = 'Click a packet above to see hex dump';
+    liveHexContent.innerHTML = '<div class="hex-empty">Click a packet above to see hex dump</div>';
     wsBottom.classList.remove('all-collapsed');
     if (mainLayout) { mainLayout.classList.remove('live-bottom-collapsed'); }
     document.getElementById('liveHexPane').classList.remove('collapsed');
@@ -2005,21 +2026,22 @@ document.getElementById('btnToggleHex').addEventListener('click', function() {
     }
 });
 
-// Protocol tree toggle — delegate from detail pane
+// Protocol tree toggle + label click — delegate from detail pane
+initProtoTreeToggle(liveDetailContent);
 liveDetailContent.addEventListener('click', function(e) {
-    var toggle = e.target.closest('.proto-toggle');
-    if (!toggle) { return; }
-    var targetId = toggle.getAttribute('data-toggle');
-    if (!targetId) { return; }
-    var el = document.getElementById(targetId);
-    if (!el) { return; }
-    if (el.style.display === 'none') {
-        el.style.display = 'block';
-        toggle.textContent = '\u25bc';
-    } else {
-        el.style.display = 'none';
-        toggle.textContent = '\u25ba';
+    var label = e.target.closest('.proto-label');
+    if (!label) { return; }
+    var offset = parseInt(label.getAttribute('data-offset') || '', 10);
+    var size = parseInt(label.getAttribute('data-size') || '', 10);
+    clearProtoSelection(liveDetailContent);
+    if (isNaN(offset) || isNaN(size) || size <= 0) {
+        pendingHexHighlight = null;
+        clearHexHighlight(liveHexContent);
+        return;
     }
+    label.classList.add('proto-selected');
+    pendingHexHighlight = { offset: offset, size: size };
+    highlightHexRange(liveHexContent, offset, size);
 });
 
 pktBody.addEventListener('dblclick', e => {
@@ -2030,15 +2052,35 @@ pktBody.addEventListener('dblclick', e => {
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────
+function resetPacketHighlightState() {
+    pendingHexHighlight = null;
+    clearProtoSelection(liveDetailContent);
+    clearHexHighlight(liveHexContent);
+}
+
+function applyPendingHexHighlight() {
+    if (!pendingHexHighlight) { return; }
+    highlightHexRange(liveHexContent, pendingHexHighlight.offset, pendingHexHighlight.size);
+}
+
+function selectPacketNumber(frame) {
+    var targetTr = pktBody.querySelector('tr[data-packet="' + frame + '"]');
+    if (!targetTr) { return false; }
+    selectPacketRow(targetTr);
+    targetTr.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    return true;
+}
+
 function selectPacketRow(tr) {
     if (selectedTr) { selectedTr.classList.remove('selected'); }
     tr.classList.add('selected');
     selectedTr = tr;
     const frame = parseInt(tr.dataset.packet || tr.dataset.f, 10);
     if (Number.isNaN(frame)) { return; }
+    resetPacketHighlightState();
     liveDetailTitle.textContent = 'Packet #' + frame + ' Detail';
     liveDetailContent.innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail...</div>';
-    liveHexContent.textContent = 'Loading hex dump...';
+    liveHexContent.innerHTML = '<div class="hex-empty">Loading hex dump...</div>';
     if (wsBottomSplitter) { wsBottomSplitter.style.display = 'block'; }
     wsBottom.style.display = 'flex';
     if (mainLayout) { mainLayout.classList.remove('live-bottom-collapsed'); }
@@ -2089,7 +2131,7 @@ function resetToConfigureState() {
     if (wsBottomSplitter) { wsBottomSplitter.style.display = 'none'; }
     wsBottom.style.display = 'none';
     liveDetailContent.innerHTML = '<div class="ws-empty">Click a packet row to inspect its fields.</div>';
-    liveHexContent.textContent = 'Click a packet above to see hex dump';
+    liveHexContent.innerHTML = '<div class="hex-empty">Click a packet above to see hex dump</div>';
     wsBottom.classList.remove('all-collapsed');
     if (mainLayout) { mainLayout.classList.remove('live-bottom-collapsed'); }
     document.getElementById('liveHexPane').classList.remove('collapsed');
@@ -2464,7 +2506,14 @@ window.addEventListener('message', e => {
             break;
 
         case 'packetHex':
-            liveHexContent.textContent = msg.hex || '';
+            setHexDump(liveHexContent, msg.hex || '');
+            applyPendingHexHighlight();
+            break;
+
+        case 'selectPacket':
+            if (typeof msg.packetNumber === 'number') {
+                selectPacketNumber(msg.packetNumber);
+            }
             break;
     }
 });

@@ -2,6 +2,17 @@
 
 All notable changes to **NetTrace Agentix** will be documented in this file.
 
+## [0.1.12] - 2026-03-12
+
+### Added
+- **Packet field to bytes highlighting** — Clicking a protocol field in Packet Detail now highlights the corresponding byte range in Packet Bytes for both saved and live capture viewers.
+- **Chat packet navigation links** — Packet and frame references in single-capture AI analysis responses now link back to the analyzed capture panel and select that packet directly.
+- **Versioned roadmap docs** — Added `docs/roadmap/` with per-version planning files so implementation can continue in fresh threads without losing release scope.
+
+### Improved
+- **Packet detail hierarchy rendering** — Shared protocol-tree rendering now uses stronger visual indentation and row structure so nested fields read more like a real packet hierarchy.
+- **PDML detail metadata preservation** — Shared packet-detail parsing now retains PDML byte offsets and field sizes, enabling viewer interactions without duplicating parsing logic.
+
 ## [0.1.11] - 2026-03-11
 
 ### Added

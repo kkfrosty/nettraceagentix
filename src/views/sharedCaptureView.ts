@@ -15,6 +15,8 @@ export interface ParsedPacketRow {
 export interface ProtoTreeNode {
     name: string;
     showname: string;
+    offset?: number;
+    size?: number;
     children: ProtoTreeNode[];
 }
 
@@ -178,6 +180,8 @@ export function parsePdmlToTree(pdml: string): ProtoTreeNode[] {
         const node: ProtoTreeNode = {
             name: attrs.name || '',
             showname: attrs.showname || attrs.name || 'Unknown',
+            offset: parseOptionalInt(attrs.pos),
+            size: parseOptionalInt(attrs.size),
             children: [],
         };
 
@@ -277,4 +281,13 @@ function parseXmlAttrs(attrString: string): Record<string, string> {
         attrs[match[1]] = match[2];
     }
     return attrs;
+}
+
+function parseOptionalInt(value: string | undefined): number | undefined {
+    if (!value) {
+        return undefined;
+    }
+
+    const parsed = Number.parseInt(value, 10);
+    return Number.isNaN(parsed) ? undefined : parsed;
 }

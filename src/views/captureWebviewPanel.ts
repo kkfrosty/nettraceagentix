@@ -387,7 +387,8 @@ export class CaptureWebviewPanel {
     /**
      * Load detailed protocol dissection for a single packet.
      * Uses tshark -V (verbose text) and parses indentation into a tree.
-     * This is more reliable than PDML XML parsing.
+     * Uses PDML format so protocol tree nodes include byte offset/size
+     * for click-to-highlight in the hex dump pane.
      */
     private async loadPacketDetail(frameNumber: number): Promise<void> {
         await loadPacketDetailIntoWebview({
@@ -397,7 +398,7 @@ export class CaptureWebviewPanel {
             postMessage: (message) => this.panel.webview.postMessage(message),
             outputChannel: this.outputChannel,
             logPrefix: 'WebviewPanel',
-            preferredFormat: 'verbose',
+            preferredFormat: 'pdml',
         });
     }
 
@@ -459,6 +460,15 @@ export class CaptureWebviewPanel {
             result.push({ filePath: viewer.currentCapture.filePath, name: viewer.currentCapture.name });
         }
         return result;
+    }
+
+    public static getPanel(filePath: string): CaptureWebviewPanel | undefined {
+        return CaptureWebviewPanel.panels.get(filePath);
+    }
+
+    public revealAndSelectPacket(packetNumber: number): void {
+        this.panel.reveal(vscode.ViewColumn.One);
+        this.panel.webview.postMessage({ command: 'selectPacket', packetNumber });
     }
 
     /**
@@ -827,8 +837,10 @@ export class CaptureWebviewPanel {
         .ws-splitter:hover,
         .ws-splitter.dragging { background: var(--hover-bg); }
         .ws-bottom { flex: 0 0 var(--ws-bottom-height); min-height: 80px; display: flex; flex-direction: row; overflow: hidden; }
-        .ws-detail { flex: 1; overflow: auto; border-right: 2px solid var(--border-color); }
-        .ws-hex { flex: 0 0 40%; max-width: 50%; overflow: auto; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
+        .ws-detail { flex: 1; overflow: hidden; display: flex; flex-direction: column; border-right: 2px solid var(--border-color); }
+        .ws-detail > #packetDetailContent { overflow: auto; flex: 1; min-height: 0; }
+        .ws-hex { flex: 0 0 40%; max-width: 50%; overflow: hidden; display: flex; flex-direction: column; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
+        .ws-hex > .ws-pane-body { overflow: auto; flex: 1; min-height: 0; }
         .ws-pane-header {
             display: flex; align-items: center; gap: 8px;
             padding: 3px 8px;
@@ -1038,7 +1050,7 @@ export class CaptureWebviewPanel {
                             <button class="pane-toggle" id="btnToggleHex" title="Minimize/Maximize">◀</button>
                         </div>
                         <div class="ws-pane-body">
-                            <pre id="packetHexContent" style="padding: 4px 8px; margin: 0; color: var(--vscode-descriptionForeground);">Click a packet above to see hex dump</pre>
+                            <div id="packetHexContent" style="padding: 4px 8px; margin: 0; color: var(--vscode-descriptionForeground);">Click a packet above to see hex dump</div>
                         </div>
                     </div>
                 </div>
@@ -1122,6 +1134,7 @@ export class CaptureWebviewPanel {
         let packetWindowEnd = 0;
         let packetWindowRequestKey = '';
         let packetWindowLoading = false;
+        let pendingHexHighlight = null;
 
         // ══════════════════════════════════════════════════════
         // EVENT DELEGATION — no inline onclick needed (CSP safe)
@@ -1457,21 +1470,22 @@ export class CaptureWebviewPanel {
             }
         });
 
-        // Protocol tree toggle — delegate from detail pane
+        // Protocol tree toggle + label click — delegate from detail pane
+        initProtoTreeToggle(document.getElementById('packetDetailContent'));
         document.getElementById('packetDetailContent').addEventListener('click', function(e) {
-            var toggle = e.target.closest('.proto-toggle');
-            if (!toggle) return;
-            var targetId = toggle.getAttribute('data-toggle');
-            if (!targetId) return;
-            var el = document.getElementById(targetId);
-            if (!el) return;
-            if (el.style.display === 'none') {
-                el.style.display = 'block';
-                toggle.textContent = '▼';
-            } else {
-                el.style.display = 'none';
-                toggle.textContent = '▶';
+            var label = e.target.closest('.proto-label');
+            if (!label) return;
+            var offset = parseInt(label.getAttribute('data-offset') || '', 10);
+            var size = parseInt(label.getAttribute('data-size') || '', 10);
+            clearProtoSelection(document.getElementById('packetDetailContent'));
+            if (isNaN(offset) || isNaN(size) || size <= 0) {
+                pendingHexHighlight = null;
+                clearHexHighlight(document.getElementById('packetHexContent'));
+                return;
             }
+            label.classList.add('proto-selected');
+            pendingHexHighlight = { offset: offset, size: size };
+            highlightHexRange(document.getElementById('packetHexContent'), offset, size);
         });
 
         // ══════════════════════════════════════════════════════
@@ -1513,12 +1527,30 @@ export class CaptureWebviewPanel {
 
         var selectedPacket = null;
 
+        function resetPacketHighlightState() {
+            pendingHexHighlight = null;
+            clearProtoSelection(document.getElementById('packetDetailContent'));
+            clearHexHighlight(document.getElementById('packetHexContent'));
+        }
+
+        function applyPendingHexHighlight() {
+            if (!pendingHexHighlight) {
+                return;
+            }
+            highlightHexRange(
+                document.getElementById('packetHexContent'),
+                pendingHexHighlight.offset,
+                pendingHexHighlight.size
+            );
+        }
+
         function selectPacket(num) {
             if (isLoadingPackets && !packetListLoaded) {
                 document.getElementById('statusSelected').textContent = 'Packet list is still loading';
                 return;
             }
             selectedPacket = num;
+            resetPacketHighlightState();
             if (usingVirtualPacketList) {
                 var packetIndex = isPagedPacketView
                     ? (num - 1)
@@ -1542,7 +1574,7 @@ export class CaptureWebviewPanel {
             document.getElementById('statusSelected').textContent = 'Packet #' + num + ' selected';
             document.getElementById('detailTitle').textContent = 'Packet #' + num + ' Detail';
             document.getElementById('packetDetailContent').innerHTML = '<div style="color:var(--vscode-descriptionForeground);padding:8px;">Loading packet detail...</div>';
-            document.getElementById('packetHexContent').textContent = 'Loading hex dump...';
+            document.getElementById('packetHexContent').innerHTML = '<div class="hex-empty">Loading hex dump...</div>';
             vscode.postMessage({ command: 'getPacketDetail', frameNumber: num });
             vscode.postMessage({ command: 'getPacketHex', frameNumber: num });
         }
@@ -1631,7 +1663,14 @@ export class CaptureWebviewPanel {
                     break;
                 }
                 case 'packetHex': {
-                    document.getElementById('packetHexContent').textContent = msg.hex;
+                    setHexDump(document.getElementById('packetHexContent'), msg.hex);
+                    applyPendingHexHighlight();
+                    break;
+                }
+                case 'selectPacket': {
+                    if (typeof msg.packetNumber === 'number') {
+                        selectPacket(msg.packetNumber);
+                    }
                     break;
                 }
                 case 'error': {

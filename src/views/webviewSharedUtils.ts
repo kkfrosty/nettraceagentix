@@ -64,8 +64,7 @@ function renderProtoTree(nodes) {
     if (!nodes || nodes.length === 0) return '<div style="padding:8px;color:var(--vscode-descriptionForeground);">No detail available.</div>';
     var html = '<div class="proto-tree">';
     for (var i = 0; i < nodes.length; i++) {
-        var isLast = (i === nodes.length - 1);
-        html += renderProtoNode(nodes[i], 0, isLast);
+        html += renderProtoNode(nodes[i], 0, false);
     }
     html += '</div>';
     return html;
@@ -73,26 +72,131 @@ function renderProtoTree(nodes) {
 
 function renderProtoNode(node, depth, startExpanded) {
     var hasChildren = node.children && node.children.length > 0;
-    var indent = depth * 16;
     var id = 'pn_' + Math.random().toString(36).substr(2, 9);
     var expanded = startExpanded === true;
-    var html = '<div class="proto-node" style="padding-left:' + indent + 'px;">';
+    var byteAttrs = '';
+    if (typeof node.offset === 'number' && typeof node.size === 'number' && node.size > 0) {
+        byteAttrs = ' data-offset="' + node.offset + '" data-size="' + node.size + '"';
+    }
+    var labelClass = depth === 0 ? 'proto-label proto-header' : 'proto-label proto-field';
+    if (byteAttrs) {
+        labelClass += ' proto-clickable';
+    }
+    var html = '<div class="proto-node" data-depth="' + depth + '" data-expanded="' + (expanded ? 'true' : 'false') + '">';
+    html += '<div class="proto-row">';
     if (hasChildren) {
         var arrow = expanded ? '\\u25bc' : '\\u25b6';
-        var displayStyle = expanded ? 'block' : 'none';
         html += '<span class="proto-toggle" data-toggle="' + id + '" id="toggle_' + id + '">' + arrow + '</span> ';
-        html += '<span class="proto-label ' + (depth === 0 ? 'proto-header' : 'proto-field') + '">' + escapeHtml(node.showname) + '</span>';
-        html += '<div class="proto-children" id="' + id + '" style="display:' + displayStyle + ';">';
+        html += '<span class="' + labelClass + '"' + byteAttrs + '>' + escapeHtml(node.showname) + '</span>';
+        html += '</div>';
+        html += '<div class="proto-children" id="' + id + '">';
         for (var ci = 0; ci < node.children.length; ci++) {
             html += renderProtoNode(node.children[ci], depth + 1, false);
         }
         html += '</div>';
     } else {
-        html += '<span style="display:inline-block;width:16px;"></span> ';
-        html += '<span class="proto-field">' + escapeHtml(node.showname) + '</span>';
+        html += '<span class="proto-spacer"></span> ';
+        html += '<span class="' + labelClass + '"' + byteAttrs + '>' + escapeHtml(node.showname) + '</span>';
+        html += '</div>';
     }
     html += '</div>';
     return html;
+}
+
+function renderHexDump(hexText) {
+    if (!hexText) {
+        return '<div class="hex-empty">No hex dump available.</div>';
+    }
+
+    var lines = String(hexText).replace(/\\r/g, '').split('\\n');
+    var html = '<div class="hex-dump">';
+    var runningIndex = 0;
+
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (!line || !line.trim()) {
+            continue;
+        }
+
+        var parts = line.trimEnd().split(/\\s{2,}/);
+        if (parts.length < 2) {
+            html += '<div class="hex-line"><span class="hex-raw">' + escapeHtml(line) + '</span></div>';
+            continue;
+        }
+
+        var offsetText = parts[0];
+        var bytesColumn = parts[1] || '';
+        var asciiColumn = parts.slice(2).join('  ');
+        var bytes = bytesColumn.match(/[0-9A-Fa-f]{2}/g) || [];
+        var parsedOffset = parseInt(offsetText, 16);
+        var baseIndex = Number.isNaN(parsedOffset) ? runningIndex : parsedOffset;
+        var byteHtml = '';
+
+        for (var byteIndex = 0; byteIndex < bytes.length; byteIndex++) {
+            var absoluteIndex = baseIndex + byteIndex;
+            byteHtml += '<span class="hex-byte" data-byte-index="' + absoluteIndex + '">' + bytes[byteIndex].toUpperCase() + '</span>';
+            if (byteIndex < bytes.length - 1) {
+                byteHtml += ' ';
+            }
+        }
+
+        runningIndex = baseIndex + bytes.length;
+        html += '<div class="hex-line">';
+        html += '<span class="hex-offset">' + escapeHtml(offsetText) + '</span>';
+        html += '<span class="hex-bytes">' + byteHtml + '</span>';
+        if (asciiColumn) {
+            html += '<span class="hex-ascii">' + escapeHtml(asciiColumn) + '</span>';
+        }
+        html += '</div>';
+    }
+
+    html += '</div>';
+    return html;
+}
+
+function setHexDump(container, hexText) {
+    if (!container) return;
+    container.innerHTML = renderHexDump(hexText);
+}
+
+function clearProtoSelection(container) {
+    if (!container) return;
+    container.querySelectorAll('.proto-selected').forEach(function(el) {
+        el.classList.remove('proto-selected');
+    });
+}
+
+function clearHexHighlight(container) {
+    if (!container) return;
+    container.querySelectorAll('.hex-highlight').forEach(function(el) {
+        el.classList.remove('hex-highlight');
+    });
+}
+
+function highlightHexRange(container, offset, size) {
+    if (!container || typeof offset !== 'number' || typeof size !== 'number' || size <= 0) {
+        return false;
+    }
+
+    clearHexHighlight(container);
+    var first = null;
+    for (var i = 0; i < size; i++) {
+        var el = container.querySelector('[data-byte-index="' + (offset + i) + '"]');
+        if (!el) {
+            continue;
+        }
+        if (!first) {
+            first = el;
+        }
+        el.classList.add('hex-highlight');
+    }
+
+    if (first) {
+        first.scrollIntoView({ block: 'center', behavior: 'smooth', inline: 'center' });
+        return true;
+    }
+
+    return false;
 }
 // ═══ Context menu ══════════════════════════════════════════════
 function closeCtxMenu(target) {
@@ -242,6 +346,33 @@ function initBottomResizer(layoutEl, splitterEl, bottomEl, isCollapsed, minH, de
     return { setHeight: setHeight, restoreHeight: restoreHeight };
 }
 
+// ═══ Proto tree toggle (self-initializing) ════════════════════
+function initProtoTreeToggle(container) {
+    if (!container) return;
+    container.addEventListener('click', function(e) {
+        var toggle = e.target.closest('.proto-toggle');
+        if (!toggle) return;
+        e.stopPropagation();
+        var targetId = toggle.getAttribute('data-toggle');
+        if (!targetId) return;
+        var el = document.getElementById(targetId);
+        if (!el) return;
+        var node = toggle.closest('.proto-node');
+        var isExpanded = node && node.getAttribute('data-expanded') === 'true';
+        if (isExpanded) {
+            if (node) {
+                node.setAttribute('data-expanded', 'false');
+            }
+            toggle.textContent = '\u25b6';
+        } else {
+            if (node) {
+                node.setAttribute('data-expanded', 'true');
+            }
+            toggle.textContent = '\u25bc';
+        }
+    });
+}
+
 // ═══ End shared webview utilities ══════════════════════════════`;
 }
 
@@ -257,14 +388,31 @@ export function getSharedCss(): string {
 /* ═══ Shared CSS (from webviewSharedUtils) ════════════════════ */
 
 /* ── Protocol Detail Tree ──────────────────────── */
-.proto-tree { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; padding: 4px 0; }
-.proto-node { padding: 1px 0; line-height: 1.5; white-space: nowrap; }
-.proto-toggle { cursor: pointer; display: inline-block; width: 16px; text-align: center; font-size: 10px; color: var(--vscode-descriptionForeground, #888); user-select: none; vertical-align: middle; }
+.proto-tree { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; padding: 4px 0; white-space: nowrap; min-width: min-content; }
+.proto-node { padding: 0; line-height: 1.5; }
+.proto-node[data-depth="0"] + .proto-node[data-depth="0"] { border-top: 1px solid var(--vscode-panel-border, #333); margin-top: 2px; padding-top: 2px; }
+.proto-row { display: flex; align-items: center; gap: 4px; min-height: 20px; padding-left: 4px; }
+.proto-children { display: none; margin-left: 8px; padding-left: 12px; border-left: 1px solid var(--vscode-panel-border, #444); }
+.proto-node[data-expanded="true"] > .proto-children { display: block; }
+.proto-toggle { cursor: pointer; display: inline-block; width: 16px; flex: 0 0 16px; text-align: center; font-size: 10px; color: var(--vscode-descriptionForeground, #888); user-select: none; vertical-align: middle; }
 .proto-toggle:hover { color: var(--vscode-foreground); }
+.proto-spacer { display: inline-block; width: 16px; flex: 0 0 16px; }
 .proto-header { font-weight: 600; color: var(--vscode-foreground); }
-.proto-field { color: var(--vscode-foreground); }
-.proto-label { cursor: pointer; }
-.proto-label:hover { background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.07)); border-radius: 2px; }
+.proto-field { color: var(--vscode-descriptionForeground, #bbb); }
+.proto-label { display: inline-block; flex: 0 0 auto; padding: 1px 4px; border-radius: 3px; cursor: default; }
+.proto-label:hover { background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.07)); }
+.proto-clickable { cursor: pointer; }
+.proto-selected { background: var(--vscode-list-activeSelectionBackground, rgba(0,122,204,0.28)); color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground)); }
+
+/* ── Packet bytes / hex dump ───────────────────── */
+.hex-dump { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; padding: 4px 8px; white-space: normal; }
+.hex-line { display: grid; grid-template-columns: 52px minmax(0, auto) 1fr; gap: 12px; align-items: start; }
+.hex-offset { color: var(--vscode-descriptionForeground, #888); user-select: none; }
+.hex-bytes { white-space: pre-wrap; }
+.hex-ascii { color: var(--vscode-descriptionForeground, #888); white-space: pre-wrap; }
+.hex-byte { display: inline-block; min-width: 1.5em; text-align: center; border-radius: 2px; }
+.hex-highlight { background: var(--vscode-editor-wordHighlightStrongBackground, rgba(255,200,0,0.35)); color: var(--vscode-editor-foreground, var(--vscode-foreground)); }
+.hex-raw, .hex-empty { color: var(--vscode-descriptionForeground, #888); white-space: pre-wrap; grid-column: 1 / -1; }
 
 /* ── Expert info entries ───────────────────────── */
 .expert-entry { padding: 4px 8px; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; border-left: 3px solid transparent; margin-bottom: 2px; }
